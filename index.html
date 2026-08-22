@@ -1,0 +1,173 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>CafeBot Café</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+
+  <header class="site-header">
+    <div class="container header-inner">
+      <a href="#" class="logo">☕ CafeBot Café</a>
+      <nav class="main-nav">
+        <ul>
+          <li><a href="#about">About</a></li>
+          <li><a href="#menu">Menu</a></li>
+          <li><a href="#hours">Hours &amp; Location</a></li>
+          <li><a href="#footer">Contact</a></li>
+        </ul>
+      </nav>
+    </div>
+  </header>
+
+  <main>
+
+    <section class="hero">
+      <div class="container hero-inner">
+        <h1>Great Coffee, Warm Welcome</h1>
+        <p>Freshly roasted beans, house-made pastries, and a cozy spot to slow down.</p>
+        <a href="#menu" class="btn btn-primary">View Our Menu</a>
+      </div>
+    </section>
+
+    <section id="about" class="about">
+      <div class="container about-inner">
+        <div class="about-image" aria-hidden="true"></div>
+        <div class="about-text">
+          <h2>About Us</h2>
+          <p>
+            CafeBot Café started as a small neighborhood counter with one goal: serve honest,
+            carefully made coffee in a place that feels like home. Today we still roast in
+            small batches, bake fresh every morning, and greet every regular by name.
+          </p>
+          <p>
+            Whether you're stopping in for a quick espresso or settling in with a book,
+            we're glad you're here.
+          </p>
+        </div>
+      </div>
+    </section>
+
+    <section id="menu" class="menu">
+      <div class="container">
+        <h2>Our Menu</h2>
+
+        <h3 class="menu-category">Coffee</h3>
+        <div class="menu-grid">
+          <article class="menu-card">
+            <h4 class="menu-card-name">Espresso</h4>
+            <p class="menu-card-price">$3.00</p>
+            <p class="menu-card-desc">A bold, concentrated shot pulled from our house blend.</p>
+          </article>
+          <article class="menu-card">
+            <h4 class="menu-card-name">Cappuccino</h4>
+            <p class="menu-card-price">$4.50</p>
+            <p class="menu-card-desc">Espresso topped with steamed milk and a thick layer of foam.</p>
+          </article>
+          <article class="menu-card">
+            <h4 class="menu-card-name">Caramel Latte</h4>
+            <p class="menu-card-price">$5.00</p>
+            <p class="menu-card-desc">Smooth espresso and steamed milk with house-made caramel.</p>
+          </article>
+          <article class="menu-card">
+            <h4 class="menu-card-name">Cold Brew</h4>
+            <p class="menu-card-price">$4.75</p>
+            <p class="menu-card-desc">Slow-steeped for 18 hours for a smooth, low-acid finish.</p>
+          </article>
+        </div>
+
+        <h3 class="menu-category">Pastries</h3>
+        <div class="menu-grid">
+          <article class="menu-card">
+            <h4 class="menu-card-name">Butter Croissant</h4>
+            <p class="menu-card-price">$3.50</p>
+            <p class="menu-card-desc">Flaky, buttery, and baked fresh every morning.</p>
+          </article>
+          <article class="menu-card">
+            <h4 class="menu-card-name">Blueberry Muffin</h4>
+            <p class="menu-card-price">$3.75</p>
+            <p class="menu-card-desc">Studded with fresh blueberries and topped with sugar crumble.</p>
+          </article>
+          <article class="menu-card">
+            <h4 class="menu-card-name">Cinnamon Roll</h4>
+            <p class="menu-card-price">$4.25</p>
+            <p class="menu-card-desc">Soft-baked and finished with a warm vanilla glaze.</p>
+          </article>
+          <article class="menu-card">
+            <h4 class="menu-card-name">Avocado Toast</h4>
+            <p class="menu-card-price">$7.50</p>
+            <p class="menu-card-desc">Sourdough, smashed avocado, chili flake, and a squeeze of lemon.</p>
+          </article>
+        </div>
+      </div>
+    </section>
+
+    <section id="hours" class="hours">
+      <div class="container hours-inner">
+        <div class="hours-block">
+          <h2>Hours</h2>
+          <table class="hours-table">
+            <tbody>
+              <tr><th>Monday – Friday</th><td>7:00 AM – 6:00 PM</td></tr>
+              <tr><th>Saturday</th><td>8:00 AM – 5:00 PM</td></tr>
+              <tr><th>Sunday</th><td>8:00 AM – 3:00 PM</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="location-block">
+          <h2>Location</h2>
+          <address>
+            123 Main Street<br>
+            Springfield, ST 12345
+          </address>
+          <p>Street parking available. Two blocks from the Central Station stop.</p>
+        </div>
+      </div>
+    </section>
+
+  </main>
+
+  <footer id="footer" class="site-footer">
+    <div class="container footer-inner">
+      <div class="footer-brand">
+        <p class="logo">☕ CafeBot Café</p>
+        <p>123 Main Street, Springfield, ST 12345</p>
+      </div>
+      <div class="footer-contact">
+        <p>Phone: (555) 123-4567</p>
+        <p>Email: hello@cafebotcafe.example</p>
+      </div>
+      <div class="footer-social">
+        <a href="#">Instagram</a>
+        <a href="#">Facebook</a>
+        <a href="#">Twitter</a>
+      </div>
+    </div>
+    <p class="footer-copy">&copy; 2026 CafeBot Café. All rights reserved.</p>
+  </footer>
+
+  <div class="cafebot-widget">
+    <button id="cafebot-toggle" class="cafebot-toggle" aria-expanded="false" aria-controls="cafebot-window" aria-label="Open chat with CafeBot">
+      💬
+    </button>
+
+    <div id="cafebot-window" class="cafebot-window" role="dialog" aria-label="CafeBot chat" hidden>
+      <div class="cafebot-header">
+        <span>☕ CafeBot</span>
+        <button id="cafebot-close" class="cafebot-close" aria-label="Close chat">&times;</button>
+      </div>
+
+      <div id="cafebot-messages" class="cafebot-messages" aria-live="polite"></div>
+
+      <form id="cafebot-form" class="cafebot-form">
+        <input id="cafebot-input" type="text" class="cafebot-input" placeholder="Type a message…" autocomplete="off" aria-label="Message">
+        <button type="submit" class="cafebot-send">Send</button>
+      </form>
+    </div>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>
