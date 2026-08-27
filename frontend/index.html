@@ -1,0 +1,39 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>YouTube Video Production Agent</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <main class="container">
+    <h1>YouTube Video Production Agent</h1>
+
+    <form id="generate-form">
+      <label for="topic">Video topic or story idea</label>
+      <textarea id="topic" name="topic" rows="3" required
+        placeholder="e.g. A lighthouse keeper who befriends a sea monster"></textarea>
+
+      <label for="duration">Desired duration (minutes)</label>
+      <input id="duration" name="duration" type="number" min="1" max="60" step="0.5" value="5" required />
+
+      <label for="language">Language</label>
+      <input id="language" name="language" type="text" value="English" required />
+
+      <label for="style">Video style</label>
+      <input id="style" name="style" type="text" value="cinematic" required />
+
+      <button type="submit" id="generate-btn">Generate Video</button>
+    </form>
+
+    <section id="progress" class="hidden">
+      <h2>Production Progress</h2>
+      <p id="project-name"></p>
+      <ol id="stage-list"></ol>
+    </section>
+  </main>
+
+  <script src="app.js"></script>
+</body>
+</html>

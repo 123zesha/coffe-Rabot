@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+.env
+
+# Generated video projects are large local artifacts, not source.
+projects/*
+!projects/.gitkeep

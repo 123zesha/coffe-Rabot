@@ -1,0 +1,131 @@
+:root {
+  --bg: #0f1115;
+  --panel: #171a21;
+  --text: #e8e9ec;
+  --muted: #9aa0ab;
+  --accent: #6c8cff;
+  --waiting: #4a4f5a;
+  --running: #d7a12b;
+  --completed: #2fa96a;
+  --failed: #d94b4b;
+  --retrying: #b06fd6;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  font-family: system-ui, -apple-system, sans-serif;
+  background: var(--bg);
+  color: var(--text);
+}
+
+.container {
+  max-width: 640px;
+  margin: 0 auto;
+  padding: 2.5rem 1.5rem;
+}
+
+h1 {
+  font-size: 1.5rem;
+  margin-bottom: 1.5rem;
+}
+
+form {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  background: var(--panel);
+  padding: 1.5rem;
+  border-radius: 10px;
+}
+
+label {
+  font-size: 0.85rem;
+  color: var(--muted);
+  margin-top: 0.75rem;
+}
+
+input,
+textarea {
+  background: #0f1115;
+  border: 1px solid #2a2f3a;
+  border-radius: 6px;
+  color: var(--text);
+  padding: 0.6rem;
+  font-size: 0.95rem;
+  font-family: inherit;
+  resize: vertical;
+}
+
+button {
+  margin-top: 1.5rem;
+  background: var(--accent);
+  color: #fff;
+  border: none;
+  border-radius: 6px;
+  padding: 0.75rem;
+  font-size: 1rem;
+  cursor: pointer;
+}
+
+button:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+#progress {
+  margin-top: 2rem;
+}
+
+#progress.hidden {
+  display: none;
+}
+
+#stage-list {
+  list-style: none;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.stage {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  background: var(--panel);
+  border-left: 4px solid var(--waiting);
+  border-radius: 6px;
+  padding: 0.6rem 0.9rem;
+  font-size: 0.9rem;
+}
+
+.stage-status {
+  font-size: 0.75rem;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  color: var(--muted);
+}
+
+.stage-running {
+  border-left-color: var(--running);
+}
+.stage-completed {
+  border-left-color: var(--completed);
+}
+.stage-failed {
+  border-left-color: var(--failed);
+}
+.stage-retrying {
+  border-left-color: var(--retrying);
+}
+
+.stage-error {
+  flex-basis: 100%;
+  color: var(--failed);
+  font-size: 0.8rem;
+  margin-top: 0.3rem;
+}
