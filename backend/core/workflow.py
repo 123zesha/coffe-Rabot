@@ -1,9 +1,8 @@
 """Runs a project's stages in order, tracking status and enabling resume.
 
-Stage 2 note: the handlers below are placeholders that just simulate work.
-Each one gets replaced with real logic in its dedicated later stage
-(script writing in Stage 3, images in Stage 5, etc.) without changing
-how the orchestrator itself works.
+Remaining stages still run as placeholders that just simulate work, and get
+replaced with real logic in their dedicated later stage (images in Stage 5,
+etc.) without changing how the orchestrator itself works.
 """
 import asyncio
 from datetime import datetime, timezone
@@ -18,6 +17,8 @@ from backend.core.stage_tracker import (
     STATUS_RUNNING,
     first_incomplete_stage,
 )
+from backend.modules import scene_breakdown, script_writer, story_developer
+from backend.providers.factory import get_llm_provider
 
 
 async def _placeholder_stage(project):
@@ -25,7 +26,22 @@ async def _placeholder_stage(project):
     await asyncio.sleep(1)
 
 
+async def _story_development_stage(project):
+    await story_developer.run(project, get_llm_provider())
+
+
+async def _script_writing_stage(project):
+    await script_writer.run(project, get_llm_provider())
+
+
+async def _scene_breakdown_stage(project):
+    await scene_breakdown.run(project, get_llm_provider())
+
+
 STAGE_HANDLERS = {key: _placeholder_stage for key, _ in STAGE_DEFINITIONS}
+STAGE_HANDLERS["story_development"] = _story_development_stage
+STAGE_HANDLERS["script_writing"] = _script_writing_stage
+STAGE_HANDLERS["scene_breakdown"] = _scene_breakdown_stage
 
 
 def _log_error(project_id, stage_key, message):

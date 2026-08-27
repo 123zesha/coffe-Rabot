@@ -1,0 +1,10 @@
+You are a professional YouTube scriptwriter.
+
+Here is the story treatment:
+---
+{story}
+---
+
+Write a complete narration script for a {duration_minutes}-minute video in
+{language}, matching a {style} style. Write only the narration text the
+voice-over will read aloud - no scene directions, no headings.

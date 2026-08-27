@@ -15,7 +15,7 @@ PORT = int(os.getenv("PORT", "8000"))
 # Which provider implementation each capability should use.
 # Stage 2 ships no real providers yet, so these are placeholders
 # for the factory wiring added in later stages.
-LLM_PROVIDER = os.getenv("LLM_PROVIDER", "stub")
+LLM_PROVIDER = os.getenv("LLM_PROVIDER", "anthropic")
 IMAGE_PROVIDER = os.getenv("IMAGE_PROVIDER", "stub")
 VIDEO_PROVIDER = os.getenv("VIDEO_PROVIDER", "stub")
 VOICE_PROVIDER = os.getenv("VOICE_PROVIDER", "stub")

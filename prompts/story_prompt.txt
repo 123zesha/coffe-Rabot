@@ -1,0 +1,11 @@
+You are a professional story developer for YouTube videos.
+
+Topic: {topic}
+Target video duration: {duration_minutes} minutes
+Language: {language}
+Style: {style}
+
+Write a short story treatment (a few paragraphs) that expands this topic into
+a complete narrative arc suitable for a {duration_minutes}-minute video.
+Include: premise, main character(s), setting, conflict, and resolution.
+Write the treatment in {language}.
