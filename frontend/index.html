@@ -221,6 +221,26 @@
     <p class="footer-copy">&copy; 2026 AI Agent. All rights reserved.</p>
   </footer>
 
+  <div class="chat-widget">
+    <button id="chat-toggle" class="chat-toggle" aria-expanded="false" aria-controls="chat-window" aria-label="Open chat with AI Agent">
+      💬
+    </button>
+
+    <div id="chat-window" class="chat-window" role="dialog" aria-label="AI Agent chat" hidden>
+      <div class="chat-header">
+        <span>🎬 AI Agent</span>
+        <button id="chat-close" class="chat-close" aria-label="Close chat">&times;</button>
+      </div>
+
+      <div id="chat-messages" class="chat-messages" aria-live="polite"></div>
+
+      <form id="chat-form" class="chat-form">
+        <input id="chat-input" type="text" class="chat-input" placeholder="Type a message…" autocomplete="off" aria-label="Message">
+        <button type="submit" class="chat-send">Send</button>
+      </form>
+    </div>
+  </div>
+
   <script src="app.js"></script>
 </body>
 </html>
