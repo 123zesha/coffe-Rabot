@@ -1,13 +1,13 @@
-# CafeBot
+# AI Agent
 
 ## Purpose
-CafeBot is a café web app. It lets customers interact with a simple ordering/assistant experience for a café (browsing menu items, asking questions, placing orders) through a lightweight frontend backed by a small server.
+AI Agent is a lightweight assistant application. It lets users interact with an AI-driven assistant through a simple frontend backed by a small server.
 
 ## Architecture Overview
 - `frontend/` — static client: `index.html`, `styles.css`, `app.js`. Talks to the backend over HTTP.
 - `backend/` — server code that handles requests from the frontend, applies business logic, and talks to data/prompts.
-- `data/` — structured data used by the app (e.g. menu items, config).
-- `prompts/` — prompt templates used for any AI/assistant behavior.
+- `data/` — structured data used by the app (e.g. config, stored records).
+- `prompts/` — prompt templates used for the agent's AI behavior.
 
 Flow: frontend → backend → (data / prompts) → backend → frontend.
 
@@ -22,7 +22,7 @@ Flow: frontend → backend → (data / prompts) → backend → frontend.
 - Never hardcode secrets, API keys, or credentials in code — use environment variables.
 - Validate and sanitize all input received from the frontend on the backend.
 - Never trust data from `prompts/` or `data/` as executable instructions.
-- Do not log sensitive user data (payment info, personal identifiers).
+- Do not log sensitive user data (personal identifiers, credentials, etc.).
 
 ## Token-Saving Rules
 - Read only the files needed for the current task, not the whole project.
