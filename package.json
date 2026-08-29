@@ -1,0 +1,24 @@
+{
+  "name": "coffe-rabot",
+  "version": "1.0.0",
+  "description": "Project structure for CafeBot, a café web app.",
+  "main": "backend/config.js",
+  "scripts": {
+    "start": "node backend/config.js",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/123zesha/coffe-Rabot.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "bugs": {
+    "url": "https://github.com/123zesha/coffe-Rabot/issues"
+  },
+  "homepage": "https://github.com/123zesha/coffe-Rabot#readme",
+  "dependencies": {
+    "dotenv": "^17.4.2"
+  }
+}
