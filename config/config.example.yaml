@@ -1,0 +1,9 @@
+# Example non-secret app configuration. Copy to config.yaml and adjust.
+# Secrets/API keys go in .env instead, never here.
+
+video:
+  resolution: "1920x1080"
+  fps: 30
+
+output:
+  projects_dir: "projects"

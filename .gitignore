@@ -1,0 +1,23 @@
+# Secrets
+.env
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Node (if ever used in frontend tooling)
+node_modules/
+
+# Logs
+logs/*.log
+
+# Generated project output
+projects/*/
+!projects/.gitkeep
+!projects/README.md
+
+# OS/editor
+.DS_Store
+.vscode/
