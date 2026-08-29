@@ -1,8 +1,8 @@
-# CafeBot
+# AI Agent
 
-Project structure for CafeBot, a café web app.
+Project structure for AI Agent.
 
-- `frontend/` — client code (HTML, CSS, JS)
+- `frontend/` — client code (`index.html`, `styles.css`, `app.js`)
 - `backend/` — server code
 - `data/` — data files
 - `prompts/` — prompt templates
