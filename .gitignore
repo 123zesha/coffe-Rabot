@@ -1,6 +1,10 @@
 # Secrets
 .env
 
+# Local (non-example) config — may hold local/machine-specific settings
+config/config.yaml
+config/config.yml
+
 # Python
 __pycache__/
 *.pyc
