@@ -3,10 +3,224 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>AI Agent</title>
+  <title>AI Agent — AI YouTube Video Production Agent</title>
   <link rel="stylesheet" href="styles.css">
 </head>
 <body>
 
+  <header class="site-header">
+    <div class="container header-inner">
+      <a href="#" class="logo">🎬 AI Agent</a>
+
+      <input type="checkbox" id="nav-toggle" class="nav-toggle" hidden>
+      <label for="nav-toggle" class="nav-toggle-label" aria-label="Toggle navigation">
+        <span></span>
+        <span></span>
+        <span></span>
+      </label>
+
+      <nav class="main-nav">
+        <ul>
+          <li><a href="#about">About</a></li>
+          <li><a href="#create">Create Video</a></li>
+          <li><a href="#progress">Progress</a></li>
+          <li><a href="#review">Final Review</a></li>
+        </ul>
+      </nav>
+    </div>
+  </header>
+
+  <main>
+
+    <section class="hero">
+      <div class="container hero-inner">
+        <h1>Turn Any Idea Into a Finished YouTube Video</h1>
+        <p>
+          The AI YouTube Video Production Agent writes the script, builds the scenes,
+          generates the visuals and voice, edits the footage, and renders a ready-to-publish
+          video — all from a single topic or story idea.
+        </p>
+        <a href="#create" class="btn btn-primary">Start Creating</a>
+      </div>
+    </section>
+
+    <section id="about" class="about">
+      <div class="container about-inner">
+        <div class="about-image" aria-hidden="true">🤖</div>
+        <div class="about-text">
+          <h2>About the Agent</h2>
+          <p>
+            AI Agent is an end-to-end AI YouTube Video Production Agent. Give it a topic,
+            a story idea, or a rough concept, and it takes care of the entire production
+            pipeline: scripting, scene planning, visual generation, voiceover, editing, and
+            final rendering.
+          </p>
+          <p>
+            Instead of juggling separate tools for writing, design, narration, and editing,
+            you describe what you want and the agent produces a complete video package —
+            footage, thumbnail, title, and description — ready for review before it ever
+            reaches your channel.
+          </p>
+        </div>
+      </div>
+    </section>
+
+    <section id="create" class="create">
+      <div class="container">
+        <h2>Create Your Video</h2>
+        <p class="section-intro">
+          Describe your video and set a few preferences. The agent will use these details
+          to generate your video from start to finish.
+        </p>
+
+        <div class="create-form">
+          <div class="form-field form-field-wide">
+            <label for="video-idea">Video topic or story idea</label>
+            <textarea id="video-idea" rows="4" placeholder="e.g. A beginner's guide to growing tomatoes at home"></textarea>
+          </div>
+
+          <div class="form-field">
+            <label for="video-duration">Desired video duration</label>
+            <select id="video-duration">
+              <option value="">Select duration</option>
+              <option value="short">Under 1 minute (Short)</option>
+              <option value="1-3">1 – 3 minutes</option>
+              <option value="3-5">3 – 5 minutes</option>
+              <option value="5-10">5 – 10 minutes</option>
+              <option value="10+">10+ minutes</option>
+            </select>
+          </div>
+
+          <div class="form-field">
+            <label for="video-language">Video language</label>
+            <select id="video-language">
+              <option value="">Select language</option>
+              <option value="en">English</option>
+              <option value="es">Spanish</option>
+              <option value="fr">French</option>
+              <option value="de">German</option>
+              <option value="hi">Hindi</option>
+              <option value="ar">Arabic</option>
+              <option value="zh">Chinese</option>
+              <option value="ja">Japanese</option>
+            </select>
+          </div>
+
+          <div class="form-field">
+            <label for="video-style">Video style</label>
+            <select id="video-style">
+              <option value="">Select style</option>
+              <option value="cinematic">Cinematic</option>
+              <option value="animated">Animated / Cartoon</option>
+              <option value="realistic">Realistic</option>
+              <option value="minimalist">Minimalist</option>
+              <option value="documentary">Documentary</option>
+              <option value="vlog">Vlog Style</option>
+            </select>
+          </div>
+
+          <div class="form-field form-field-action">
+            <button type="button" class="btn btn-primary btn-generate">Generate Video</button>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section id="progress" class="progress">
+      <div class="container">
+        <h2>Production Progress</h2>
+        <p class="section-intro">
+          Track your video as it moves through every stage of the production pipeline.
+        </p>
+
+        <ol class="progress-tracker">
+          <li class="progress-step">
+            <span class="step-icon">1</span>
+            <span class="step-label">Writing Script</span>
+          </li>
+          <li class="progress-step">
+            <span class="step-icon">2</span>
+            <span class="step-label">Creating Scenes</span>
+          </li>
+          <li class="progress-step">
+            <span class="step-icon">3</span>
+            <span class="step-label">Generating Visuals</span>
+          </li>
+          <li class="progress-step">
+            <span class="step-icon">4</span>
+            <span class="step-label">Creating Voice</span>
+          </li>
+          <li class="progress-step">
+            <span class="step-icon">5</span>
+            <span class="step-label">Editing</span>
+          </li>
+          <li class="progress-step">
+            <span class="step-icon">6</span>
+            <span class="step-label">Rendering</span>
+          </li>
+          <li class="progress-step">
+            <span class="step-icon">7</span>
+            <span class="step-label">Completed</span>
+          </li>
+        </ol>
+      </div>
+    </section>
+
+    <section id="review" class="review">
+      <div class="container">
+        <h2>Final Review</h2>
+        <p class="section-intro">
+          Review everything the agent produced before publishing to YouTube.
+        </p>
+
+        <div class="review-grid">
+          <article class="review-card">
+            <h3>Final MP4</h3>
+            <div class="review-placeholder video-placeholder" aria-hidden="true">▶</div>
+            <p class="review-note">Your rendered video will appear here.</p>
+          </article>
+
+          <article class="review-card">
+            <h3>Thumbnail</h3>
+            <div class="review-placeholder thumbnail-placeholder" aria-hidden="true">🖼️</div>
+            <p class="review-note">Your generated thumbnail will appear here.</p>
+          </article>
+
+          <article class="review-card">
+            <h3>YouTube Title</h3>
+            <div class="review-placeholder text-placeholder">
+              <p>Your generated video title will appear here.</p>
+            </div>
+          </article>
+
+          <article class="review-card">
+            <h3>YouTube Description</h3>
+            <div class="review-placeholder text-placeholder text-placeholder-tall">
+              <p>Your generated video description will appear here.</p>
+            </div>
+          </article>
+        </div>
+      </div>
+    </section>
+
+  </main>
+
+  <footer class="site-footer">
+    <div class="container footer-inner">
+      <div class="footer-brand">
+        <p class="logo">🎬 AI Agent</p>
+        <p>AI-powered YouTube video production, start to finish.</p>
+      </div>
+      <div class="footer-links">
+        <a href="#about">About</a>
+        <a href="#create">Create Video</a>
+        <a href="#progress">Progress</a>
+        <a href="#review">Final Review</a>
+      </div>
+    </div>
+    <p class="footer-copy">&copy; 2026 AI Agent. All rights reserved.</p>
+  </footer>
+
+  <script src="app.js"></script>
 </body>
 </html>
