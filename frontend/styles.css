@@ -71,6 +71,7 @@ a {
   display: flex;
   align-items: center;
   justify-content: space-between;
+  flex-wrap: wrap;
   gap: 12px;
   padding-top: 16px;
   padding-bottom: 16px;
