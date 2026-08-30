@@ -4,6 +4,7 @@ require('dotenv').config({ path: path.resolve(__dirname, '..', '.env'), quiet: t
 
 const express = require('express');
 const Anthropic = require('@anthropic-ai/sdk');
+const jobStore = require('./job-store');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -113,6 +114,31 @@ app.post('/api/agent', async (req, res) => {
       conversationHistory: history,
     });
   }
+});
+
+app.post('/api/jobs', (req, res) => {
+  const job = jobStore.createJob();
+  res.status(201).json(job);
+});
+
+app.get('/api/jobs/:id', (req, res) => {
+  const job = jobStore.getJob(req.params.id);
+
+  if (!job) {
+    return res.status(404).json({ error: 'job not found' });
+  }
+
+  res.json(job);
+});
+
+app.patch('/api/jobs/:id', (req, res) => {
+  const job = jobStore.updateJob(req.params.id, req.body || {});
+
+  if (!job) {
+    return res.status(404).json({ error: 'job not found' });
+  }
+
+  res.json(job);
 });
 
 app.listen(PORT, () => {
