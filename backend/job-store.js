@@ -1,3 +1,10 @@
+// This module stores video production jobs as JSON on the local filesystem.
+// It is intended for development/demo purposes only. Serverless platforms
+// like Vercel do not guarantee persistent file writes in production — the
+// filesystem there is ephemeral/read-only per invocation, so data written
+// here can be lost between requests or deployments. Replace with a real
+// database or persistent storage service before deploying to production.
+
 const fs = require('fs');
 const path = require('path');
 
