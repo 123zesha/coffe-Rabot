@@ -1,0 +1,59 @@
+{
+  "languages": [
+    { "value": "en", "label": "English" },
+    { "value": "es", "label": "Spanish" },
+    { "value": "fr", "label": "French" },
+    { "value": "de", "label": "German" },
+    { "value": "hi", "label": "Hindi" },
+    { "value": "ar", "label": "Arabic" },
+    { "value": "zh", "label": "Chinese" },
+    { "value": "ja", "label": "Japanese" }
+  ],
+  "durations": [
+    { "value": "short", "label": "Under 1 minute (Short)" },
+    { "value": "1-3", "label": "1 – 3 minutes" },
+    { "value": "3-5", "label": "3 – 5 minutes" },
+    { "value": "5-10", "label": "5 – 10 minutes" },
+    { "value": "10+", "label": "10+ minutes" }
+  ],
+  "videoStyles": [
+    { "value": "cinematic", "label": "Cinematic" },
+    { "value": "animated", "label": "Animated / Cartoon" },
+    { "value": "realistic", "label": "Realistic" },
+    { "value": "minimalist", "label": "Minimalist" },
+    { "value": "documentary", "label": "Documentary" },
+    { "value": "vlog", "label": "Vlog Style" }
+  ],
+  "storyTypes": [
+    { "value": "tutorial", "label": "Tutorial / How-To" },
+    { "value": "narrative", "label": "Story / Narrative" },
+    { "value": "explainer", "label": "Explainer" },
+    { "value": "product-review", "label": "Product Review" },
+    { "value": "vlog", "label": "Vlog / Personal Update" },
+    { "value": "news-update", "label": "News / Update" },
+    { "value": "documentary", "label": "Documentary" }
+  ],
+  "voiceOverOptions": [
+    { "value": "male-warm", "label": "Male – Warm" },
+    { "value": "male-energetic", "label": "Male – Energetic" },
+    { "value": "female-warm", "label": "Female – Warm" },
+    { "value": "female-professional", "label": "Female – Professional" },
+    { "value": "neutral-narrator", "label": "Neutral – Narrator" },
+    { "value": "none", "label": "No Voice-Over (Text Only)" }
+  ],
+  "visualStyles": [
+    { "value": "realistic", "label": "Realistic" },
+    { "value": "3d-animation", "label": "3D Animation" },
+    { "value": "2d-flat", "label": "2D / Flat Design" },
+    { "value": "anime", "label": "Anime" },
+    { "value": "watercolor", "label": "Watercolor" },
+    { "value": "stock-footage", "label": "Stock Footage Style" }
+  ],
+  "outputOptions": [
+    { "value": "mp4-1080p", "label": "MP4 (1080p)" },
+    { "value": "mp4-4k", "label": "MP4 (4K)" },
+    { "value": "horizontal", "label": "Horizontal (16:9 Standard)" },
+    { "value": "vertical", "label": "Vertical (9:16 Shorts)" },
+    { "value": "square", "label": "Square (1:1 Social)" }
+  ]
+}
