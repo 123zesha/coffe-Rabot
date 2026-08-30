@@ -1,0 +1,52 @@
+{
+  "presets": [
+    {
+      "id": "shorts-explainer",
+      "name": "YouTube Shorts Explainer",
+      "purpose": "Quick, high-retention explainer videos for YouTube Shorts",
+      "videoType": "explainer",
+      "targetDuration": "short",
+      "language": "en",
+      "visualStyle": "2d-flat",
+      "voiceStyle": "female-professional",
+      "productionRules": [
+        "Keep pacing fast with cuts under 3 seconds",
+        "Always include on-screen captions",
+        "End with a call-to-action to subscribe"
+      ],
+      "active": true
+    },
+    {
+      "id": "cinematic-narrative",
+      "name": "Cinematic Story Narrative",
+      "purpose": "Emotionally engaging story-driven videos with a cinematic look",
+      "videoType": "narrative",
+      "targetDuration": "5-10",
+      "language": "en",
+      "visualStyle": "realistic",
+      "voiceStyle": "male-warm",
+      "productionRules": [
+        "Use slow, deliberate pacing with wide establishing shots",
+        "Layer ambient background music under narration",
+        "Avoid on-screen text unless essential to the story"
+      ],
+      "active": true
+    },
+    {
+      "id": "product-review-vlog",
+      "name": "Product Review Vlog",
+      "purpose": "Casual, trustworthy product review and comparison videos",
+      "videoType": "product-review",
+      "targetDuration": "3-5",
+      "language": "en",
+      "visualStyle": "stock-footage",
+      "voiceStyle": "neutral-narrator",
+      "productionRules": [
+        "Show the product from multiple angles before narration begins",
+        "Include a pros/cons summary near the end",
+        "Disclose that the review is AI-generated"
+      ],
+      "active": false
+    }
+  ]
+}
