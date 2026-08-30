@@ -224,16 +224,18 @@ app.post('/api/agent', async (req, res) => {
       jobId,
     });
   } catch (error) {
-    if (error instanceof Anthropic.AuthenticationError) {
-      console.error('Claude API authentication failed.');
-    } else if (error instanceof Anthropic.RateLimitError) {
-      console.error('Claude API rate limited.');
-    } else if (error instanceof Anthropic.APIConnectionError) {
-      console.error('Claude API connection error.');
-    } else if (error instanceof Anthropic.APIError) {
-      console.error(`Claude API error ${error.status}: ${error.name}`);
+    if (error instanceof Anthropic.APIError) {
+      console.error('Claude API error:', {
+        name: error.constructor.name,
+        status: error.status,
+        type: error.type,
+        message: error.message,
+        error: error.error,
+        requestID: error.requestID,
+        cause: error.cause,
+      });
     } else {
-      console.error('Unexpected error calling Claude API:', error.message);
+      console.error('Unexpected error calling Claude API:', error);
     }
 
     res.json({
