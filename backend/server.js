@@ -9,10 +9,19 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 
 const client = new Anthropic();
-const SYSTEM_PROMPT = fs.readFileSync(
-  path.resolve(__dirname, '..', 'prompts', 'system-prompt.md'),
+
+const VIDEO_OPTIONS = fs.readFileSync(
+  path.resolve(__dirname, '..', 'data', 'video-options.json'),
   'utf8'
 );
+
+const SYSTEM_PROMPT =
+  fs.readFileSync(path.resolve(__dirname, '..', 'prompts', 'system-prompt.md'), 'utf8') +
+  '\n\n## Available Video Production Options\n' +
+  'These are the ONLY video production options you may offer, confirm, or use. ' +
+  'Do not invent, assume, or suggest any language, duration, video style, story/video type, ' +
+  'voice-over option, visual style, or output option that is not listed below.\n\n' +
+  VIDEO_OPTIONS;
 const FALLBACK_REPLY =
   "Sorry, I'm having trouble reaching the AI Agent right now. Please try again in a moment.";
 
