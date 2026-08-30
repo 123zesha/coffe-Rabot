@@ -194,9 +194,18 @@ app.post('/api/agent', async (req, res) => {
       messages,
     });
 
-    while (response.stop_reason === 'tool_use') {
-      const toolUseBlocks = response.content.filter((block) => block.type === 'tool_use');
+    let toolUseBlocks = response.content.filter((block) => block.type === 'tool_use');
 
+    // Drive this off the actual presence of tool_use blocks, not stop_reason.
+    // If a response hits max_tokens (Opus 5 runs adaptive thinking by
+    // default, which eats into the output budget) while a tool_use block
+    // is already complete, stop_reason won't be 'tool_use' even though an
+    // unresolved tool call is sitting in the content — sending that back
+    // to the API without its tool_result next produces a 400
+    // invalid_request_error ("tool_use ids were found without tool_result
+    // blocks immediately after"). Checking the blocks themselves guarantees
+    // every tool_use is always paired before the turn is treated as done.
+    while (toolUseBlocks.length > 0) {
       messages.push({ role: 'assistant', content: response.content });
       messages.push({
         role: 'user',
@@ -214,6 +223,7 @@ app.post('/api/agent', async (req, res) => {
         tools: TOOLS,
         messages,
       });
+      toolUseBlocks = response.content.filter((block) => block.type === 'tool_use');
     }
 
     const textBlock = response.content.find((block) => block.type === 'text');
