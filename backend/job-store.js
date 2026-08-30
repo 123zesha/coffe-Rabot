@@ -1,14 +1,20 @@
-// This module stores video production jobs as JSON on the local filesystem.
-// It is intended for development/demo purposes only. Serverless platforms
-// like Vercel do not guarantee persistent file writes in production — the
-// filesystem there is ephemeral/read-only per invocation, so data written
-// here can be lost between requests or deployments. Replace with a real
-// database or persistent storage service before deploying to production.
+// This module stores video production jobs in memory for the lifetime of
+// the running process, and mirrors that data to a local JSON file on a
+// best-effort basis. It is intended for development/demo purposes only.
+// Serverless platforms like Vercel run on a read-only filesystem in
+// production, so the file mirror is expected to fail there — that failure
+// is caught and ignored, and the in-memory copy keeps working for as long
+// as the serverless instance stays warm. Data is not guaranteed to persist
+// across requests, cold starts, or deployments. Replace with a real
+// database or persistent storage service before relying on this in
+// production.
 
 const fs = require('fs');
 const path = require('path');
 
 const JOBS_FILE = path.resolve(__dirname, '..', 'data', 'jobs.json');
+
+let cachedJobs = null;
 
 const STAGES = [
   'NEW',
@@ -41,25 +47,41 @@ const JOB_FIELDS = [
 ];
 
 function loadJobs() {
+  if (cachedJobs !== null) {
+    return cachedJobs;
+  }
+
   let raw;
 
   try {
     raw = fs.readFileSync(JOBS_FILE, 'utf8');
   } catch (error) {
-    return [];
+    cachedJobs = [];
+    return cachedJobs;
   }
 
   try {
     const jobs = JSON.parse(raw);
-    return Array.isArray(jobs) ? jobs : [];
+    cachedJobs = Array.isArray(jobs) ? jobs : [];
   } catch (error) {
     console.error('data/jobs.json contains invalid JSON; treating job list as empty.');
-    return [];
+    cachedJobs = [];
   }
+
+  return cachedJobs;
 }
 
 function saveJobs(jobs) {
-  fs.writeFileSync(JOBS_FILE, JSON.stringify(jobs, null, 2) + '\n');
+  cachedJobs = jobs;
+
+  try {
+    fs.writeFileSync(JOBS_FILE, JSON.stringify(jobs, null, 2) + '\n');
+  } catch (error) {
+    // Read-only filesystem (e.g. Vercel serverless in production) — the
+    // in-memory cache above is still updated, so the app keeps working for
+    // the lifetime of this instance even though the write didn't persist.
+    console.error('Could not write data/jobs.json (read-only filesystem?); continuing in-memory only.');
+  }
 }
 
 function createDefaultJob(id) {
