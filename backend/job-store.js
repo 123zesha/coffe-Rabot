@@ -43,6 +43,7 @@ const JOB_FIELDS = [
   'characters',
   'imagePrompts',
   'videoPrompts',
+  'images',
   'voiceover',
   'subtitles',
   'music',
@@ -109,6 +110,12 @@ function createDefaultJob(id) {
     characters: [],
     imagePrompts: [],
     videoPrompts: [],
+    // Populated by a future image-generation integration, one entry per
+    // imagePrompts item it has processed: { prompt, url, status }, where
+    // status is 'pending' | 'generating' | 'completed' | 'failed'. Not
+    // writable by the conversational agent (see UPDATABLE_JOB_FIELDS in
+    // server.js) — only a real generation call should ever populate this.
+    images: [],
     voiceover: '',
     subtitles: '',
     music: '',
