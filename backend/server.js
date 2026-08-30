@@ -25,6 +25,26 @@ const SYSTEM_PROMPT =
 const FALLBACK_REPLY =
   "Sorry, I'm having trouble reaching the AI Agent right now. Please try again in a moment.";
 
+const TOOLS = [
+  {
+    name: 'getVideoOptions',
+    description:
+      'Get the available active video production options: languages, durations, video styles, story/video types, voice-over options, visual styles, and output options.',
+    input_schema: {
+      type: 'object',
+      properties: {},
+      additionalProperties: false,
+    },
+  },
+];
+
+function executeTool(name) {
+  if (name === 'getVideoOptions') {
+    return VIDEO_OPTIONS;
+  }
+  return JSON.stringify({ error: `Unknown tool: ${name}` });
+}
+
 app.use(express.json());
 app.use(express.static(path.resolve(__dirname, '..', 'frontend')));
 
@@ -39,12 +59,35 @@ app.post('/api/agent', async (req, res) => {
   const messages = [...history, { role: 'user', content: message }];
 
   try {
-    const response = await client.messages.create({
+    let response = await client.messages.create({
       model: 'claude-opus-5',
       max_tokens: 1024,
       system: SYSTEM_PROMPT,
+      tools: TOOLS,
       messages,
     });
+
+    while (response.stop_reason === 'tool_use') {
+      const toolUseBlocks = response.content.filter((block) => block.type === 'tool_use');
+
+      messages.push({ role: 'assistant', content: response.content });
+      messages.push({
+        role: 'user',
+        content: toolUseBlocks.map((tool) => ({
+          type: 'tool_result',
+          tool_use_id: tool.id,
+          content: executeTool(tool.name),
+        })),
+      });
+
+      response = await client.messages.create({
+        model: 'claude-opus-5',
+        max_tokens: 1024,
+        system: SYSTEM_PROMPT,
+        tools: TOOLS,
+        messages,
+      });
+    }
 
     const textBlock = response.content.find((block) => block.type === 'text');
 
