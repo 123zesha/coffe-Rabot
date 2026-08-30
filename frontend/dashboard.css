@@ -108,6 +108,19 @@
   border: 1px solid #bfe9dc;
 }
 
+.dashboard-scroll-hint {
+  display: none;
+  color: var(--color-muted);
+  font-size: 0.8rem;
+  margin: 0 0 8px;
+}
+
+@media (max-width: 760px) {
+  .dashboard-scroll-hint {
+    display: block;
+  }
+}
+
 .dashboard-table-wrap {
   overflow-x: auto;
   background: var(--color-surface);
