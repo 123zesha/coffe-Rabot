@@ -14,6 +14,12 @@ const path = require('path');
 
 const JOBS_FILE = path.resolve(__dirname, '..', 'data', 'jobs.json');
 
+// Vercel sets VERCEL=1 in every deployed serverless invocation (production
+// and preview alike). Those filesystems are read-only, so don't even
+// attempt the write there — go straight to in-memory only. Local dev (no
+// VERCEL env var) keeps writing to data/jobs.json exactly as before.
+const IS_SERVERLESS_PRODUCTION = process.env.VERCEL === '1';
+
 let cachedJobs = null;
 
 const STAGES = [
@@ -74,13 +80,19 @@ function loadJobs() {
 function saveJobs(jobs) {
   cachedJobs = jobs;
 
+  if (IS_SERVERLESS_PRODUCTION) {
+    // Don't attempt to write into the deployed project filesystem at all —
+    // it's read-only there. The in-memory cache above is the source of
+    // truth for the lifetime of this serverless instance.
+    return;
+  }
+
   try {
     fs.writeFileSync(JOBS_FILE, JSON.stringify(jobs, null, 2) + '\n');
   } catch (error) {
-    // Read-only filesystem (e.g. Vercel serverless in production) — the
-    // in-memory cache above is still updated, so the app keeps working for
-    // the lifetime of this instance even though the write didn't persist.
-    console.error('Could not write data/jobs.json (read-only filesystem?); continuing in-memory only.');
+    // Defensive fallback for local environments where the write can still
+    // fail for other reasons (permissions, missing directory, etc.).
+    console.error('Could not write data/jobs.json; continuing in-memory only.');
   }
 }
 
