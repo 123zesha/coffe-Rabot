@@ -1,6 +1,12 @@
 const tableBody = document.getElementById('jobs-table-body');
 const newJobBtn = document.getElementById('new-job-btn');
 const messageEl = document.getElementById('dashboard-message');
+const newJobForm = document.getElementById('new-job-form');
+const newJobCancelBtn = document.getElementById('new-job-cancel');
+const newJobTopicInput = document.getElementById('new-job-topic');
+const newJobDurationInput = document.getElementById('new-job-duration');
+const newJobLanguageInput = document.getElementById('new-job-language');
+const newJobStyleInput = document.getElementById('new-job-style');
 
 function showMessage(text, type) {
   messageEl.textContent = text;
@@ -57,15 +63,55 @@ async function loadJobs() {
   }
 }
 
-async function createJob() {
-  newJobBtn.disabled = true;
+function openNewJobForm() {
+  newJobForm.hidden = false;
+  newJobTopicInput.focus();
+}
+
+function closeNewJobForm() {
+  newJobForm.reset();
+  newJobForm.hidden = true;
+}
+
+async function createJob(event) {
+  event.preventDefault();
+
+  const topic = newJobTopicInput.value.trim();
+  const duration = newJobDurationInput.value.trim();
+  const language = newJobLanguageInput.value.trim();
+  const style = newJobStyleInput.value.trim();
+
+  const submitBtn = newJobForm.querySelector('button[type="submit"]');
+  submitBtn.disabled = true;
+
   try {
-    await fetch('/api/jobs', { method: 'POST' });
+    const createRes = await fetch('/api/jobs', { method: 'POST' });
+    const job = await createRes.json();
+
+    if (!createRes.ok) {
+      showMessage('Could not create a new job. Please try again.', 'error');
+      return;
+    }
+
+    const patchRes = await fetch(`/api/jobs/${job.id}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ topic, duration, language, storyStyle: style }),
+    });
+    const patchData = await patchRes.json();
+
+    if (!patchRes.ok) {
+      showMessage(patchData.error || 'Job was created but its details could not be saved.', 'error');
+    } else {
+      clearMessage();
+    }
+
+    closeNewJobForm();
     await loadJobs();
   } catch (error) {
-    // ignore; table stays in its last known state
+    showMessage('Could not create a new job. Please try again.', 'error');
   } finally {
-    newJobBtn.disabled = false;
+    submitBtn.disabled = false;
   }
 }
 
@@ -119,7 +165,9 @@ async function confirmJob(id, button) {
   }
 }
 
-newJobBtn.addEventListener('click', createJob);
+newJobBtn.addEventListener('click', openNewJobForm);
+newJobCancelBtn.addEventListener('click', closeNewJobForm);
+newJobForm.addEventListener('submit', createJob);
 
 tableBody.addEventListener('click', (event) => {
   const advanceBtn = event.target.closest('.btn-advance');

@@ -31,6 +31,64 @@
   cursor: not-allowed;
 }
 
+.new-job-form {
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius);
+  padding: 20px;
+  margin-bottom: 16px;
+  display: grid;
+  gap: 14px;
+  max-width: 420px;
+}
+
+.new-job-form[hidden] {
+  display: none;
+}
+
+.new-job-form-title {
+  margin: 0;
+  font-size: 1.05rem;
+}
+
+.form-row {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.form-row label {
+  font-size: 0.85rem;
+  color: var(--color-muted);
+}
+
+.form-row input {
+  padding: 8px 10px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius);
+  font-size: 0.95rem;
+  font-family: inherit;
+}
+
+.form-actions {
+  display: flex;
+  gap: 10px;
+}
+
+.btn-secondary {
+  background: transparent;
+  color: var(--color-text);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius);
+  padding: 10px 18px;
+  font-size: 0.95rem;
+  cursor: pointer;
+}
+
+.btn-secondary:hover {
+  background: var(--color-bg);
+}
+
 .dashboard-message {
   border-radius: var(--radius);
   padding: 10px 16px;

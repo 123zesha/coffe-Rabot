@@ -29,6 +29,35 @@
       <button id="new-job-btn" type="button" class="btn-primary">+ New Job</button>
     </div>
 
+    <form id="new-job-form" class="new-job-form" hidden>
+      <h2 class="new-job-form-title">New Video Production Job</h2>
+
+      <div class="form-row">
+        <label for="new-job-topic">Topic / Title</label>
+        <input id="new-job-topic" type="text" placeholder="e.g. How black holes form">
+      </div>
+
+      <div class="form-row">
+        <label for="new-job-duration">Duration</label>
+        <input id="new-job-duration" type="text" placeholder="e.g. 5-10 minutes">
+      </div>
+
+      <div class="form-row">
+        <label for="new-job-language">Language</label>
+        <input id="new-job-language" type="text" placeholder="e.g. English">
+      </div>
+
+      <div class="form-row">
+        <label for="new-job-style">Style</label>
+        <input id="new-job-style" type="text" placeholder="e.g. Cinematic">
+      </div>
+
+      <div class="form-actions">
+        <button type="submit" class="btn-primary">Create Job</button>
+        <button type="button" id="new-job-cancel" class="btn-secondary">Cancel</button>
+      </div>
+    </form>
+
     <div id="dashboard-message" class="dashboard-message" hidden></div>
 
     <div class="dashboard-table-wrap">
