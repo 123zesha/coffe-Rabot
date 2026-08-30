@@ -165,6 +165,36 @@ function updateJob(id, updates) {
 
 const FINAL_STAGE = STAGES[STAGES.length - 1];
 
+// The output a stage must actually produce before the job can move past it.
+// Keyed by the stage the job is CURRENTLY in (i.e. the stage being left).
+const STAGE_OUTPUT_REQUIREMENTS = {
+  SCRIPTING: ['script'],
+  'SCENE PLANNING': ['scenes', 'characters'],
+  'ASSET GENERATION': ['imagePrompts', 'videoPrompts'],
+};
+
+function isNonEmptyString(value) {
+  return typeof value === 'string' && value.trim().length > 0;
+}
+
+function isNonEmptyArray(value) {
+  return (
+    Array.isArray(value) &&
+    value.length > 0 &&
+    value.every((item) => (typeof item === 'string' ? item.trim().length > 0 : item !== null && item !== undefined))
+  );
+}
+
+function hasRequiredOutput(job, field) {
+  const value = job[field];
+  return Array.isArray(value) ? isNonEmptyArray(value) : isNonEmptyString(value);
+}
+
+function getMissingOutputs(job) {
+  const required = STAGE_OUTPUT_REQUIREMENTS[job.status] || [];
+  return required.filter((field) => !hasRequiredOutput(job, field));
+}
+
 function advanceJob(id) {
   const jobs = loadJobs();
   const job = jobs.find((j) => j.id === id);
@@ -177,6 +207,12 @@ function advanceJob(id) {
 
   if (currentIndex === -1 || currentIndex === STAGES.length - 1) {
     return { error: 'no_next_stage', job };
+  }
+
+  const missingOutputs = getMissingOutputs(job);
+
+  if (missingOutputs.length > 0) {
+    return { error: 'missing_required_output', missingFields: missingOutputs, job };
   }
 
   const nextStage = STAGES[currentIndex + 1];

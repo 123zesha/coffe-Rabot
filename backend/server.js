@@ -86,7 +86,10 @@ const TOOLS = [
     description:
       'Move the current video production job to its next production stage ' +
       '(NEW -> SCRIPTING -> SCENE PLANNING -> ASSET GENERATION -> EDITING -> READY -> COMPLETED). ' +
-      'The job cannot advance into COMPLETED unless it has already been confirmed by the user.',
+      'The job cannot advance into COMPLETED unless it has already been confirmed by the user. ' +
+      'It also cannot leave SCRIPTING without a non-empty script, leave SCENE PLANNING without ' +
+      'non-empty scenes and characters, or leave ASSET GENERATION without non-empty imagePrompts ' +
+      'and videoPrompts — use updateVideoJob to fill those in first if this call reports them missing.',
     input_schema: {
       type: 'object',
       properties: {},
@@ -134,6 +137,15 @@ function executeTool(name, jobId, input) {
       return JSON.stringify({
         error:
           'The job cannot be completed until the user has explicitly confirmed the final production summary.',
+        job: result.job,
+      });
+    }
+    if (result.error === 'missing_required_output') {
+      return JSON.stringify({
+        error:
+          `The job cannot advance out of ${result.job.status} because the following required output is missing or empty: ` +
+          `${result.missingFields.join(', ')}. Use updateVideoJob to fill these in first.`,
+        missingFields: result.missingFields,
         job: result.job,
       });
     }
@@ -310,6 +322,16 @@ app.post('/api/jobs/:id/advance', (req, res) => {
     return res
       .status(403)
       .json({ error: 'job must be confirmed before it can be completed', job: result.job });
+  }
+
+  if (result.error === 'missing_required_output') {
+    return res.status(400).json({
+      error:
+        `Cannot advance: the current stage (${result.job.status}) is missing required output: ` +
+        `${result.missingFields.join(', ')}.`,
+      missingFields: result.missingFields,
+      job: result.job,
+    });
   }
 
   if (result.error === 'no_next_stage') {
