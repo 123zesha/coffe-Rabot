@@ -293,6 +293,14 @@ app.post('/api/jobs/:id/advance', (req, res) => {
   res.json(result.job);
 });
 
-app.listen(PORT, () => {
-  console.log(`Server running on http://localhost:${PORT}`);
-});
+// Only start a listening server when run directly (local dev / `npm start`).
+// When this file is imported instead (e.g. by Vercel's Node.js serverless
+// runtime), the exported `app` is invoked per-request and must not bind a
+// port itself.
+if (require.main === module) {
+  app.listen(PORT, () => {
+    console.log(`Server running on http://localhost:${PORT}`);
+  });
+}
+
+module.exports = app;
