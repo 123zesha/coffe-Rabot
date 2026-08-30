@@ -116,6 +116,10 @@ app.post('/api/agent', async (req, res) => {
   }
 });
 
+app.get('/api/jobs', (req, res) => {
+  res.json(jobStore.listJobs());
+});
+
 app.post('/api/jobs', (req, res) => {
   const job = jobStore.createJob();
   res.status(201).json(job);
@@ -139,6 +143,20 @@ app.patch('/api/jobs/:id', (req, res) => {
   }
 
   res.json(job);
+});
+
+app.post('/api/jobs/:id/advance', (req, res) => {
+  const result = jobStore.advanceJob(req.params.id);
+
+  if (result.error === 'not_found') {
+    return res.status(404).json({ error: 'job not found' });
+  }
+
+  if (result.error === 'no_next_stage') {
+    return res.status(400).json({ error: 'job has no next stage', job: result.job });
+  }
+
+  res.json(result.job);
 });
 
 app.listen(PORT, () => {

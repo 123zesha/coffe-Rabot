@@ -1,5 +1,17 @@
-const jobs = new Map();
-let nextId = 1;
+const fs = require('fs');
+const path = require('path');
+
+const JOBS_FILE = path.resolve(__dirname, '..', 'data', 'jobs.json');
+
+const STAGES = [
+  'NEW',
+  'SCRIPTING',
+  'SCENE PLANNING',
+  'ASSET GENERATION',
+  'EDITING',
+  'READY',
+  'COMPLETED',
+];
 
 const JOB_FIELDS = [
   'topic',
@@ -21,8 +33,23 @@ const JOB_FIELDS = [
   'confirmed',
 ];
 
-function createDefaultJob() {
+function loadJobs() {
+  try {
+    const raw = fs.readFileSync(JOBS_FILE, 'utf8');
+    const jobs = JSON.parse(raw);
+    return Array.isArray(jobs) ? jobs : [];
+  } catch (error) {
+    return [];
+  }
+}
+
+function saveJobs(jobs) {
+  fs.writeFileSync(JOBS_FILE, JSON.stringify(jobs, null, 2) + '\n');
+}
+
+function createDefaultJob(id) {
   return {
+    id,
     topic: '',
     videoTitle: '',
     duration: '',
@@ -38,24 +65,34 @@ function createDefaultJob() {
     music: '',
     thumbnail: '',
     description: '',
-    status: 'draft',
+    status: STAGES[0],
     confirmed: false,
   };
 }
 
+function listJobs() {
+  return loadJobs();
+}
+
 function createJob() {
-  const id = String(nextId++);
-  const job = { id, ...createDefaultJob() };
-  jobs.set(id, job);
+  const jobs = loadJobs();
+  const nextId = jobs.reduce((max, job) => Math.max(max, Number(job.id) || 0), 0) + 1;
+  const job = createDefaultJob(String(nextId));
+
+  jobs.push(job);
+  saveJobs(jobs);
+
   return job;
 }
 
 function getJob(id) {
-  return jobs.get(id) || null;
+  return loadJobs().find((job) => job.id === id) || null;
 }
 
 function updateJob(id, updates) {
-  const job = jobs.get(id);
+  const jobs = loadJobs();
+  const job = jobs.find((j) => j.id === id);
+
   if (!job) {
     return null;
   }
@@ -66,7 +103,29 @@ function updateJob(id, updates) {
     }
   }
 
+  saveJobs(jobs);
+
   return job;
 }
 
-module.exports = { JOB_FIELDS, createJob, getJob, updateJob };
+function advanceJob(id) {
+  const jobs = loadJobs();
+  const job = jobs.find((j) => j.id === id);
+
+  if (!job) {
+    return { error: 'not_found' };
+  }
+
+  const currentIndex = STAGES.indexOf(job.status);
+
+  if (currentIndex === -1 || currentIndex === STAGES.length - 1) {
+    return { error: 'no_next_stage', job };
+  }
+
+  job.status = STAGES[currentIndex + 1];
+  saveJobs(jobs);
+
+  return { job };
+}
+
+module.exports = { STAGES, JOB_FIELDS, listJobs, createJob, getJob, updateJob, advanceJob };
