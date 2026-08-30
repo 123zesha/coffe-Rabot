@@ -1,11 +1,20 @@
 const tableBody = document.getElementById('jobs-table-body');
 const newJobBtn = document.getElementById('new-job-btn');
+const messageEl = document.getElementById('dashboard-message');
 
-function statusLabel(job) {
-  if (job.status === 'COMPLETED') {
-    return 'Completed';
-  }
-  return job.confirmed ? 'Confirmed' : 'In Progress';
+function showMessage(text, type) {
+  messageEl.textContent = text;
+  messageEl.className = 'dashboard-message ' + (type || '');
+  messageEl.hidden = false;
+}
+
+function clearMessage() {
+  messageEl.hidden = true;
+  messageEl.textContent = '';
+}
+
+function confirmationLabel(job) {
+  return job.confirmed ? 'Confirmed' : 'Not Confirmed';
 }
 
 function renderJobs(jobs) {
@@ -25,8 +34,9 @@ function renderJobs(jobs) {
           <td>${job.language || '—'}</td>
           <td>${job.storyStyle || '—'}</td>
           <td><span class="stage-badge">${job.status}</span></td>
-          <td>${statusLabel(job)}</td>
-          <td>
+          <td><span class="confirm-badge ${job.confirmed ? 'confirmed' : 'unconfirmed'}">${confirmationLabel(job)}</span></td>
+          <td class="actions-cell">
+            ${job.confirmed ? '' : `<button type="button" class="btn-confirm" data-id="${job.id}">Confirm</button>`}
             <button type="button" class="btn-advance" data-id="${job.id}" ${isLastStage ? 'disabled' : ''}>
               ${isLastStage ? 'Completed' : 'Advance →'}
             </button>
@@ -62,9 +72,49 @@ async function createJob() {
 async function advanceJob(id, button) {
   button.disabled = true;
   try {
-    await fetch(`/api/jobs/${id}/advance`, { method: 'POST' });
+    const res = await fetch(`/api/jobs/${id}/advance`, { method: 'POST' });
+    const data = await res.json();
+
+    if (!res.ok) {
+      showMessage(data.error || 'Could not advance this job.', 'error');
+    } else {
+      clearMessage();
+    }
+
     await loadJobs();
   } catch (error) {
+    showMessage('Could not advance this job. Please try again.', 'error');
+    button.disabled = false;
+  }
+}
+
+async function confirmJob(id, button) {
+  const confirmedByUser = window.confirm(
+    'Confirm this video job? This records that the user has explicitly approved the final production details.'
+  );
+
+  if (!confirmedByUser) {
+    return;
+  }
+
+  button.disabled = true;
+  try {
+    const res = await fetch(`/api/jobs/${id}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ confirmed: true }),
+    });
+    const data = await res.json();
+
+    if (!res.ok) {
+      showMessage(data.error || 'Could not confirm this job.', 'error');
+    } else {
+      clearMessage();
+    }
+
+    await loadJobs();
+  } catch (error) {
+    showMessage('Could not confirm this job. Please try again.', 'error');
     button.disabled = false;
   }
 }
@@ -72,9 +122,15 @@ async function advanceJob(id, button) {
 newJobBtn.addEventListener('click', createJob);
 
 tableBody.addEventListener('click', (event) => {
-  const button = event.target.closest('.btn-advance');
-  if (button && !button.disabled) {
-    advanceJob(button.dataset.id, button);
+  const advanceBtn = event.target.closest('.btn-advance');
+  if (advanceBtn && !advanceBtn.disabled) {
+    advanceJob(advanceBtn.dataset.id, advanceBtn);
+    return;
+  }
+
+  const confirmBtn = event.target.closest('.btn-confirm');
+  if (confirmBtn && !confirmBtn.disabled) {
+    confirmJob(confirmBtn.dataset.id, confirmBtn);
   }
 });
 
