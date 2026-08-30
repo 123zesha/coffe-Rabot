@@ -225,17 +225,31 @@ app.post('/api/agent', async (req, res) => {
     });
   } catch (error) {
     if (error instanceof Anthropic.APIError) {
-      console.error('Claude API error:', {
-        name: error.constructor.name,
-        status: error.status,
-        type: error.type,
-        message: error.message,
-        error: error.error,
-        requestID: error.requestID,
-        cause: error.cause,
-      });
+      console.error(
+        'Claude API error:',
+        JSON.stringify(
+          {
+            name: error.constructor.name,
+            status: error.status,
+            type: error.type,
+            message: error.message,
+            error: error.error,
+            request_id: error.requestID,
+            cause: error.cause instanceof Error ? error.cause.message : error.cause,
+          },
+          null,
+          2
+        )
+      );
     } else {
-      console.error('Unexpected error calling Claude API:', error);
+      console.error(
+        'Unexpected error calling Claude API:',
+        JSON.stringify(
+          { name: error?.name, message: error?.message, stack: error?.stack },
+          null,
+          2
+        )
+      );
     }
 
     res.json({
