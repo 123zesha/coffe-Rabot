@@ -34,11 +34,19 @@ const JOB_FIELDS = [
 ];
 
 function loadJobs() {
+  let raw;
+
   try {
-    const raw = fs.readFileSync(JOBS_FILE, 'utf8');
+    raw = fs.readFileSync(JOBS_FILE, 'utf8');
+  } catch (error) {
+    return [];
+  }
+
+  try {
     const jobs = JSON.parse(raw);
     return Array.isArray(jobs) ? jobs : [];
   } catch (error) {
+    console.error('data/jobs.json contains invalid JSON; treating job list as empty.');
     return [];
   }
 }
@@ -98,9 +106,15 @@ function updateJob(id, updates) {
   }
 
   for (const field of JOB_FIELDS) {
-    if (Object.prototype.hasOwnProperty.call(updates, field)) {
-      job[field] = updates[field];
+    if (!Object.prototype.hasOwnProperty.call(updates, field)) {
+      continue;
     }
+
+    if (field === 'status' && !STAGES.includes(updates.status)) {
+      continue;
+    }
+
+    job[field] = updates[field];
   }
 
   saveJobs(jobs);

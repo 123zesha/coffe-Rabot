@@ -20,7 +20,6 @@ If any of these are missing or unclear, ask the user for them before proceeding.
 - Do not invent requirements or change the requested video concept without the user's permission.
 - Follow the user's instructions consistently throughout the entire production process (scripting, scenes, visuals, voice, editing, rendering).
 - If the user changes a requirement mid-process, apply the change and confirm it back to them before continuing.
-- Always get the user's explicit confirmation before finalizing the video production.
 
 ## Confirmation Gate
 

@@ -47,6 +47,12 @@ function executeTool(name) {
 }
 
 app.use(express.json());
+app.use((err, req, res, next) => {
+  if (err.type === 'entity.parse.failed') {
+    return res.status(400).json({ error: 'invalid JSON in request body' });
+  }
+  next(err);
+});
 app.use(express.static(path.resolve(__dirname, '..', 'frontend')));
 
 app.post('/api/agent', async (req, res) => {
