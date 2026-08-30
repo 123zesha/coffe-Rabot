@@ -257,6 +257,26 @@ a {
   width: 100%;
 }
 
+.generate-status {
+  margin-top: 24px;
+  padding: 14px 16px;
+  border-radius: var(--radius);
+  border: 1px solid var(--color-border);
+  background: var(--color-bg);
+  color: var(--color-text);
+  white-space: pre-line;
+}
+
+.generate-status.loading {
+  color: var(--color-muted);
+}
+
+.generate-status.error {
+  background: #fdecea;
+  color: #9a2f2f;
+  border-color: #f3c6c2;
+}
+
 /* ---------- Production Progress ---------- */
 .progress {
   padding: 80px 0;
