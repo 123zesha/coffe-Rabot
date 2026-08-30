@@ -10,6 +10,7 @@
   const messages = document.getElementById('chat-messages');
 
   let conversationHistory = [];
+  let jobId = null;
 
   function addMessage(text, sender) {
     const bubble = document.createElement('div');
@@ -71,7 +72,7 @@
       const response = await fetch('/api/agent', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ message: text, conversationHistory }),
+        body: JSON.stringify({ message: text, conversationHistory, jobId }),
       });
 
       if (!response.ok) {
@@ -85,6 +86,7 @@
       conversationHistory = Array.isArray(data.conversationHistory)
         ? data.conversationHistory
         : conversationHistory;
+      jobId = data.jobId || jobId;
     } catch (error) {
       typingBubble.remove();
       addMessage(ERROR_REPLY, 'bot');

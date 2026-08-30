@@ -122,6 +122,8 @@ function updateJob(id, updates) {
   return job;
 }
 
+const FINAL_STAGE = STAGES[STAGES.length - 1];
+
 function advanceJob(id) {
   const jobs = loadJobs();
   const job = jobs.find((j) => j.id === id);
@@ -136,7 +138,13 @@ function advanceJob(id) {
     return { error: 'no_next_stage', job };
   }
 
-  job.status = STAGES[currentIndex + 1];
+  const nextStage = STAGES[currentIndex + 1];
+
+  if (nextStage === FINAL_STAGE && job.confirmed !== true) {
+    return { error: 'confirmation_required', job };
+  }
+
+  job.status = nextStage;
   saveJobs(jobs);
 
   return { job };
