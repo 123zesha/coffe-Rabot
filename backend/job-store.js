@@ -43,6 +43,7 @@ const JOB_FIELDS = [
   'characters',
   'imagePrompts',
   'videoPrompts',
+  'images',
   'voiceover',
   'subtitles',
   'music',
@@ -109,6 +110,14 @@ function createDefaultJob(id) {
     characters: [],
     imagePrompts: [],
     videoPrompts: [],
+    // Populated by the OpenAI image-generation integration (see
+    // backend/image-generation.js), one entry per imagePrompts item it has
+    // processed: { prompt, url, status, error? }, where status is
+    // 'completed' | 'failed' and error is only present on failure. url is
+    // only set when the API actually returned image data. Not writable by
+    // the conversational agent (see UPDATABLE_JOB_FIELDS in server.js) —
+    // only the real generation call populates this.
+    images: [],
     voiceover: '',
     subtitles: '',
     music: '',

@@ -5,6 +5,7 @@ require('dotenv').config({ path: path.resolve(__dirname, '..', '.env'), quiet: t
 const express = require('express');
 const Anthropic = require('@anthropic-ai/sdk');
 const jobStore = require('./job-store');
+const imageGeneration = require('./image-generation');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -309,6 +310,39 @@ app.patch('/api/jobs/:id', (req, res) => {
   }
 
   res.json(job);
+});
+
+app.post('/api/jobs/:id/generate-images', async (req, res) => {
+  const job = jobStore.getJob(req.params.id);
+
+  if (!job) {
+    return res.status(404).json({ error: 'job not found' });
+  }
+
+  if (!Array.isArray(job.imagePrompts) || job.imagePrompts.length === 0) {
+    return res.status(400).json({ error: 'job has no imagePrompts to generate images from' });
+  }
+
+  if (!process.env.OPENAI_API_KEY) {
+    return res.status(500).json({ error: 'OPENAI_API_KEY is not configured' });
+  }
+
+  try {
+    const images = await imageGeneration.generateImagesForPrompts({
+      imagePrompts: job.imagePrompts,
+      characters: job.characters,
+      existingImages: job.images,
+    });
+
+    const updatedJob = jobStore.updateJob(job.id, { images });
+    res.json(updatedJob);
+  } catch (error) {
+    console.error(
+      'Unexpected error generating images:',
+      JSON.stringify({ name: error?.name, message: error?.message }, null, 2)
+    );
+    res.status(502).json({ error: 'Image generation failed unexpectedly.' });
+  }
 });
 
 app.post('/api/jobs/:id/advance', (req, res) => {
