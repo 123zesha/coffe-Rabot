@@ -88,9 +88,10 @@ const TOOLS = [
       'Move the current video production job to its next production stage ' +
       '(NEW -> SCRIPTING -> SCENE PLANNING -> ASSET GENERATION -> EDITING -> READY -> COMPLETED). ' +
       'The job cannot advance into COMPLETED unless it has already been confirmed by the user. ' +
-      'It also cannot leave SCRIPTING without a non-empty script, leave SCENE PLANNING without ' +
-      'non-empty scenes and characters, or leave ASSET GENERATION without non-empty imagePrompts ' +
-      'and videoPrompts — use updateVideoJob to fill those in first if this call reports them missing.',
+      'It also cannot leave SCRIPTING without a complete script (a short fragment is not enough), ' +
+      'leave SCENE PLANNING without non-empty scenes and characters, or leave ASSET GENERATION ' +
+      'without non-empty imagePrompts and videoPrompts — use updateVideoJob to fill those in first ' +
+      'if this call reports them missing.',
     input_schema: {
       type: 'object',
       properties: {},
@@ -199,9 +200,15 @@ app.post('/api/agent', async (req, res) => {
   }
 
   try {
+    // 16000 (not the previous 1024) so a full video script — or any other
+    // large field — can fit inside a single updateVideoJob tool call
+    // without hitting the cap mid-argument. A script cut off by max_tokens
+    // either saves as a truncated fragment or drops out of the tool call
+    // entirely, which is what caused SCRIPTING's stage gate to report the
+    // script as missing/incomplete.
     let response = await client.messages.create({
       model: 'claude-opus-5',
-      max_tokens: 1024,
+      max_tokens: 16000,
       system: buildSystemPrompt(),
       tools: TOOLS,
       messages,
@@ -231,7 +238,7 @@ app.post('/api/agent', async (req, res) => {
 
       response = await client.messages.create({
         model: 'claude-opus-5',
-        max_tokens: 1024,
+        max_tokens: 16000,
         system: buildSystemPrompt(),
         tools: TOOLS,
         messages,

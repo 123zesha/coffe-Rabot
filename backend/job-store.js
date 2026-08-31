@@ -194,9 +194,25 @@ function isNonEmptyArray(value) {
   );
 }
 
+// A truncated script (e.g. a tool call cut off mid-argument) can still be a
+// non-empty string, so plain non-emptiness isn't enough to call it
+// "complete". Even the shortest offered duration (under 1 minute) narrates
+// well over this many characters, so this only rejects obviously-incomplete
+// fragments, not legitimately short scripts.
+const MIN_SCRIPT_LENGTH = 200;
+
 function hasRequiredOutput(job, field) {
   const value = job[field];
-  return Array.isArray(value) ? isNonEmptyArray(value) : isNonEmptyString(value);
+
+  if (Array.isArray(value)) {
+    return isNonEmptyArray(value);
+  }
+
+  if (field === 'script') {
+    return isNonEmptyString(value) && value.trim().length >= MIN_SCRIPT_LENGTH;
+  }
+
+  return isNonEmptyString(value);
 }
 
 function getMissingOutputs(job) {
