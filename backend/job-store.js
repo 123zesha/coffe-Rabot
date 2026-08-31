@@ -1,26 +1,44 @@
-// This module stores video production jobs in memory for the lifetime of
-// the running process, and mirrors that data to a local JSON file on a
-// best-effort basis. It is intended for development/demo purposes only.
-// Serverless platforms like Vercel run on a read-only filesystem in
-// production, so the file mirror is expected to fail there — that failure
-// is caught and ignored, and the in-memory copy keeps working for as long
-// as the serverless instance stays warm. Data is not guaranteed to persist
-// across requests, cold starts, or deployments. Replace with a real
-// database or persistent storage service before relying on this in
-// production.
+// This module stores video production jobs. When a Redis database is
+// configured (UPSTASH_REDIS_REST_URL/TOKEN, or the equivalent KV_REST_API_*
+// names some providers use), that Redis instance is the durable source of
+// truth and every job read/write goes through it — this is required for
+// correctness on serverless platforms like Vercel, where a function
+// invocation can land on any instance and process memory is never shared
+// or guaranteed to survive between requests. Without Redis configured, this
+// falls back to an in-memory cache mirrored to a local JSON file, exactly as
+// before — fine for local development, but on Vercel that fallback loses
+// job data (including a completed script) the moment a different instance
+// or a cold start handles the next request, since the deployed filesystem
+// is read-only and process memory isn't shared. Set the Redis environment
+// variables in production to avoid that.
 
 const fs = require('fs');
 const path = require('path');
+const { Redis } = require('@upstash/redis');
 
 const JOBS_FILE = path.resolve(__dirname, '..', 'data', 'jobs.json');
+const JOBS_KEY = 'video-jobs';
 
 // Vercel sets VERCEL=1 in every deployed serverless invocation (production
 // and preview alike). Those filesystems are read-only, so don't even
-// attempt the write there — go straight to in-memory only. Local dev (no
-// VERCEL env var) keeps writing to data/jobs.json exactly as before.
+// attempt the local-file write there — go straight to in-memory only (used
+// solely as the no-Redis fallback below). Local dev (no VERCEL env var)
+// keeps writing to data/jobs.json exactly as before.
 const IS_SERVERLESS_PRODUCTION = process.env.VERCEL === '1';
 
-let cachedJobs = null;
+const REDIS_URL = process.env.UPSTASH_REDIS_REST_URL || process.env.KV_REST_API_URL;
+const REDIS_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN || process.env.KV_REST_API_TOKEN;
+// enableAutoPipelining is an SDK-level optimization that batches multiple
+// commands issued in the same tick into one pipelined HTTP request. This
+// store only ever issues one command at a time, so it's disabled to keep
+// every request a plain single-command REST call.
+const redis =
+  REDIS_URL && REDIS_TOKEN
+    ? new Redis({ url: REDIS_URL, token: REDIS_TOKEN, enableAutoPipelining: false })
+    : null;
+
+let loggedMissingRedisWarning = false;
+let cachedJobs = null; // Only used by the no-Redis fallback path below.
 
 const STAGES = [
   'NEW',
@@ -53,7 +71,23 @@ const JOB_FIELDS = [
   'confirmed',
 ];
 
-function loadJobs() {
+async function loadJobs() {
+  if (redis) {
+    const jobs = await redis.get(JOBS_KEY);
+    return Array.isArray(jobs) ? jobs : [];
+  }
+
+  if (IS_SERVERLESS_PRODUCTION && !loggedMissingRedisWarning) {
+    loggedMissingRedisWarning = true;
+    console.error(
+      'No Redis configured (UPSTASH_REDIS_REST_URL/UPSTASH_REDIS_REST_TOKEN, or ' +
+        'KV_REST_API_URL/KV_REST_API_TOKEN): job data is only kept in this ' +
+        'instance\'s memory and will be lost — including a completed script — as ' +
+        'soon as a different serverless instance or a cold start handles the next ' +
+        'request. Provision a Redis database and set those environment variables.'
+    );
+  }
+
   if (cachedJobs !== null) {
     return cachedJobs;
   }
@@ -78,13 +112,19 @@ function loadJobs() {
   return cachedJobs;
 }
 
-function saveJobs(jobs) {
+async function saveJobs(jobs) {
+  if (redis) {
+    await redis.set(JOBS_KEY, jobs);
+    return;
+  }
+
   cachedJobs = jobs;
 
   if (IS_SERVERLESS_PRODUCTION) {
     // Don't attempt to write into the deployed project filesystem at all —
-    // it's read-only there. The in-memory cache above is the source of
-    // truth for the lifetime of this serverless instance.
+    // it's read-only there. The in-memory cache above is the best available
+    // fallback for the lifetime of this serverless instance, but it is not
+    // shared across instances — see the warning in loadJobs().
     return;
   }
 
@@ -128,27 +168,28 @@ function createDefaultJob(id) {
   };
 }
 
-function listJobs() {
+async function listJobs() {
   return loadJobs();
 }
 
-function createJob() {
-  const jobs = loadJobs();
+async function createJob() {
+  const jobs = await loadJobs();
   const nextId = jobs.reduce((max, job) => Math.max(max, Number(job.id) || 0), 0) + 1;
   const job = createDefaultJob(String(nextId));
 
   jobs.push(job);
-  saveJobs(jobs);
+  await saveJobs(jobs);
 
   return job;
 }
 
-function getJob(id) {
-  return loadJobs().find((job) => job.id === id) || null;
+async function getJob(id) {
+  const jobs = await loadJobs();
+  return jobs.find((job) => job.id === id) || null;
 }
 
-function updateJob(id, updates) {
-  const jobs = loadJobs();
+async function updateJob(id, updates) {
+  const jobs = await loadJobs();
   const job = jobs.find((j) => j.id === id);
 
   if (!job) {
@@ -167,7 +208,7 @@ function updateJob(id, updates) {
     job[field] = updates[field];
   }
 
-  saveJobs(jobs);
+  await saveJobs(jobs);
 
   return job;
 }
@@ -194,9 +235,25 @@ function isNonEmptyArray(value) {
   );
 }
 
+// A truncated script (e.g. a tool call cut off mid-argument) can still be a
+// non-empty string, so plain non-emptiness isn't enough to call it
+// "complete". Even the shortest offered duration (under 1 minute) narrates
+// well over this many characters, so this only rejects obviously-incomplete
+// fragments, not legitimately short scripts.
+const MIN_SCRIPT_LENGTH = 200;
+
 function hasRequiredOutput(job, field) {
   const value = job[field];
-  return Array.isArray(value) ? isNonEmptyArray(value) : isNonEmptyString(value);
+
+  if (Array.isArray(value)) {
+    return isNonEmptyArray(value);
+  }
+
+  if (field === 'script') {
+    return isNonEmptyString(value) && value.trim().length >= MIN_SCRIPT_LENGTH;
+  }
+
+  return isNonEmptyString(value);
 }
 
 function getMissingOutputs(job) {
@@ -204,8 +261,8 @@ function getMissingOutputs(job) {
   return required.filter((field) => !hasRequiredOutput(job, field));
 }
 
-function advanceJob(id) {
-  const jobs = loadJobs();
+async function advanceJob(id) {
+  const jobs = await loadJobs();
   const job = jobs.find((j) => j.id === id);
 
   if (!job) {
@@ -231,7 +288,7 @@ function advanceJob(id) {
   }
 
   job.status = nextStage;
-  saveJobs(jobs);
+  await saveJobs(jobs);
 
   return { job };
 }

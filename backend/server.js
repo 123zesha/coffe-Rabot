@@ -88,9 +88,10 @@ const TOOLS = [
       'Move the current video production job to its next production stage ' +
       '(NEW -> SCRIPTING -> SCENE PLANNING -> ASSET GENERATION -> EDITING -> READY -> COMPLETED). ' +
       'The job cannot advance into COMPLETED unless it has already been confirmed by the user. ' +
-      'It also cannot leave SCRIPTING without a non-empty script, leave SCENE PLANNING without ' +
-      'non-empty scenes and characters, or leave ASSET GENERATION without non-empty imagePrompts ' +
-      'and videoPrompts — use updateVideoJob to fill those in first if this call reports them missing.',
+      'It also cannot leave SCRIPTING without a complete script (a short fragment is not enough), ' +
+      'leave SCENE PLANNING without non-empty scenes and characters, or leave ASSET GENERATION ' +
+      'without non-empty imagePrompts and videoPrompts — use updateVideoJob to fill those in first ' +
+      'if this call reports them missing.',
     input_schema: {
       type: 'object',
       properties: {},
@@ -112,7 +113,7 @@ const TOOLS = [
   },
 ];
 
-function executeTool(name, jobId, input) {
+async function executeTool(name, jobId, input) {
   if (name === 'getVideoOptions') {
     return VIDEO_OPTIONS;
   }
@@ -124,12 +125,12 @@ function executeTool(name, jobId, input) {
         updates[field] = input[field];
       }
     }
-    const job = jobStore.updateJob(jobId, updates);
+    const job = await jobStore.updateJob(jobId, updates);
     return JSON.stringify(job || { error: 'job not found' });
   }
 
   if (name === 'advanceVideoJobStage') {
-    const result = jobStore.advanceJob(jobId);
+    const result = await jobStore.advanceJob(jobId);
 
     if (result.error === 'not_found') {
       return JSON.stringify({ error: 'job not found' });
@@ -158,7 +159,7 @@ function executeTool(name, jobId, input) {
   }
 
   if (name === 'confirmVideoJob') {
-    const job = jobStore.updateJob(jobId, { confirmed: true });
+    const job = await jobStore.updateJob(jobId, { confirmed: true });
     return JSON.stringify(job || { error: 'job not found' });
   }
 
@@ -181,14 +182,14 @@ app.post('/api/agent', async (req, res) => {
     return res.status(400).json({ error: 'message is required' });
   }
 
-  const existingJob = requestedJobId ? jobStore.getJob(requestedJobId) : null;
-  const jobId = existingJob ? existingJob.id : jobStore.createJob().id;
+  const existingJob = requestedJobId ? await jobStore.getJob(requestedJobId) : null;
+  const jobId = existingJob ? existingJob.id : (await jobStore.createJob()).id;
 
   const history = Array.isArray(conversationHistory) ? conversationHistory : [];
   const messages = [...history, { role: 'user', content: message }];
 
-  function buildSystemPrompt() {
-    const currentJob = jobStore.getJob(jobId);
+  async function buildSystemPrompt() {
+    const currentJob = await jobStore.getJob(jobId);
     return (
       SYSTEM_PROMPT_BASE +
       '\n\n## Current Video Production Job\n' +
@@ -199,10 +200,16 @@ app.post('/api/agent', async (req, res) => {
   }
 
   try {
+    // 16000 (not the previous 1024) so a full video script — or any other
+    // large field — can fit inside a single updateVideoJob tool call
+    // without hitting the cap mid-argument. A script cut off by max_tokens
+    // either saves as a truncated fragment or drops out of the tool call
+    // entirely, which is what caused SCRIPTING's stage gate to report the
+    // script as missing/incomplete.
     let response = await client.messages.create({
       model: 'claude-opus-5',
-      max_tokens: 1024,
-      system: buildSystemPrompt(),
+      max_tokens: 16000,
+      system: await buildSystemPrompt(),
       tools: TOOLS,
       messages,
     });
@@ -220,19 +227,19 @@ app.post('/api/agent', async (req, res) => {
     // every tool_use is always paired before the turn is treated as done.
     while (toolUseBlocks.length > 0) {
       messages.push({ role: 'assistant', content: response.content });
-      messages.push({
-        role: 'user',
-        content: toolUseBlocks.map((tool) => ({
+      const toolResults = await Promise.all(
+        toolUseBlocks.map(async (tool) => ({
           type: 'tool_result',
           tool_use_id: tool.id,
-          content: executeTool(tool.name, jobId, tool.input),
-        })),
-      });
+          content: await executeTool(tool.name, jobId, tool.input),
+        }))
+      );
+      messages.push({ role: 'user', content: toolResults });
 
       response = await client.messages.create({
         model: 'claude-opus-5',
-        max_tokens: 1024,
-        system: buildSystemPrompt(),
+        max_tokens: 16000,
+        system: await buildSystemPrompt(),
         tools: TOOLS,
         messages,
       });
@@ -283,17 +290,17 @@ app.post('/api/agent', async (req, res) => {
   }
 });
 
-app.get('/api/jobs', (req, res) => {
-  res.json(jobStore.listJobs());
+app.get('/api/jobs', async (req, res) => {
+  res.json(await jobStore.listJobs());
 });
 
-app.post('/api/jobs', (req, res) => {
-  const job = jobStore.createJob();
+app.post('/api/jobs', async (req, res) => {
+  const job = await jobStore.createJob();
   res.status(201).json(job);
 });
 
-app.get('/api/jobs/:id', (req, res) => {
-  const job = jobStore.getJob(req.params.id);
+app.get('/api/jobs/:id', async (req, res) => {
+  const job = await jobStore.getJob(req.params.id);
 
   if (!job) {
     return res.status(404).json({ error: 'job not found' });
@@ -302,8 +309,8 @@ app.get('/api/jobs/:id', (req, res) => {
   res.json(job);
 });
 
-app.patch('/api/jobs/:id', (req, res) => {
-  const job = jobStore.updateJob(req.params.id, req.body || {});
+app.patch('/api/jobs/:id', async (req, res) => {
+  const job = await jobStore.updateJob(req.params.id, req.body || {});
 
   if (!job) {
     return res.status(404).json({ error: 'job not found' });
@@ -313,7 +320,7 @@ app.patch('/api/jobs/:id', (req, res) => {
 });
 
 app.post('/api/jobs/:id/generate-images', async (req, res) => {
-  const job = jobStore.getJob(req.params.id);
+  const job = await jobStore.getJob(req.params.id);
 
   if (!job) {
     return res.status(404).json({ error: 'job not found' });
@@ -334,7 +341,7 @@ app.post('/api/jobs/:id/generate-images', async (req, res) => {
       existingImages: job.images,
     });
 
-    const updatedJob = jobStore.updateJob(job.id, { images });
+    const updatedJob = await jobStore.updateJob(job.id, { images });
     res.json(updatedJob);
   } catch (error) {
     console.error(
@@ -345,8 +352,8 @@ app.post('/api/jobs/:id/generate-images', async (req, res) => {
   }
 });
 
-app.post('/api/jobs/:id/advance', (req, res) => {
-  const result = jobStore.advanceJob(req.params.id);
+app.post('/api/jobs/:id/advance', async (req, res) => {
+  const result = await jobStore.advanceJob(req.params.id);
 
   if (result.error === 'not_found') {
     return res.status(404).json({ error: 'job not found' });
