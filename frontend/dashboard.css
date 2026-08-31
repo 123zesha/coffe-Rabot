@@ -228,3 +228,116 @@
   color: var(--color-muted);
   cursor: not-allowed;
 }
+
+.btn-generate-images {
+  background: var(--color-accent);
+  color: #fff;
+  border: none;
+  border-radius: var(--radius);
+  padding: 6px 12px;
+  font-size: 0.85rem;
+  cursor: pointer;
+}
+
+.btn-generate-images:disabled {
+  background: var(--color-border);
+  color: var(--color-muted);
+  cursor: not-allowed;
+}
+
+.generated-images-row td {
+  white-space: normal;
+  background: var(--color-bg);
+}
+
+.generated-images-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.generation-badge {
+  display: inline-block;
+  align-self: flex-start;
+  border-radius: 999px;
+  padding: 4px 10px;
+  font-size: 0.8rem;
+  border: 1px solid var(--color-border);
+  background: var(--color-surface);
+  color: var(--color-muted);
+}
+
+.generation-badge.generating {
+  color: var(--color-primary-dark);
+  border-color: var(--color-primary);
+  background: #eee9fd;
+}
+
+.generation-badge.completed {
+  background: #e8f8f4;
+  color: #146c56;
+  border-color: #bfe9dc;
+}
+
+.generation-badge.partial {
+  background: #fff6e5;
+  color: #8a5b00;
+  border-color: #f4dfa5;
+}
+
+.generation-badge.failed {
+  background: #fdecea;
+  color: #9a2f2f;
+  border-color: #f3c6c2;
+}
+
+.generated-images-error {
+  color: #9a2f2f;
+  font-size: 0.85rem;
+  margin: 0;
+}
+
+.generated-images-hint {
+  color: var(--color-muted);
+  font-size: 0.85rem;
+  margin: 0;
+}
+
+.generated-images-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
+  gap: 12px;
+}
+
+.generated-image-tile {
+  margin: 0;
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius);
+  padding: 8px;
+  font-size: 0.75rem;
+  color: var(--color-muted);
+}
+
+.generated-image-tile img {
+  width: 100%;
+  aspect-ratio: 16 / 9;
+  object-fit: cover;
+  border-radius: 8px;
+  display: block;
+  margin-bottom: 6px;
+}
+
+.generated-image-tile figcaption {
+  white-space: normal;
+}
+
+.generated-image-tile-error {
+  border-color: #f3c6c2;
+}
+
+.generated-image-error {
+  color: #9a2f2f;
+  font-size: 0.8rem;
+  margin: 0 0 6px;
+}

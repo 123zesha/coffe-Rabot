@@ -8,6 +8,10 @@ const newJobDurationInput = document.getElementById('new-job-duration');
 const newJobLanguageInput = document.getElementById('new-job-language');
 const newJobStyleInput = document.getElementById('new-job-style');
 
+let lastJobs = [];
+const generatingImageJobIds = new Set();
+const imageGenerationRequestErrors = new Map();
+
 function showMessage(text, type) {
   messageEl.textContent = text;
   messageEl.className = 'dashboard-message ' + (type || '');
@@ -23,6 +27,75 @@ function confirmationLabel(job) {
   return job.confirmed ? 'Confirmed' : 'Not Confirmed';
 }
 
+function generateImagesButtonLabel(job, isGenerating, hasPrompts) {
+  if (isGenerating) return 'Generating…';
+  if (!hasPrompts) return 'No Image Prompts Yet';
+  const images = Array.isArray(job.images) ? job.images : [];
+  if (images.length === 0) return 'Generate Images';
+  return images.some((image) => image.status === 'failed') ? 'Retry Images' : 'Regenerate Images';
+}
+
+function renderGenerationRow(job) {
+  const isGenerating = generatingImageJobIds.has(job.id);
+  const requestError = imageGenerationRequestErrors.get(job.id);
+  const images = Array.isArray(job.images) ? job.images : [];
+
+  if (!isGenerating && !requestError && images.length === 0) {
+    return '';
+  }
+
+  let statusLabel = 'Ready';
+  let statusClass = 'ready';
+
+  if (isGenerating) {
+    statusLabel = 'Generating';
+    statusClass = 'generating';
+  } else if (requestError) {
+    statusLabel = 'Failed';
+    statusClass = 'failed';
+  } else if (images.length > 0) {
+    const completedCount = images.filter((image) => image.status === 'completed').length;
+    const failedCount = images.filter((image) => image.status === 'failed').length;
+    if (failedCount === 0) {
+      statusLabel = 'Completed';
+      statusClass = 'completed';
+    } else if (completedCount === 0) {
+      statusLabel = 'Failed';
+      statusClass = 'failed';
+    } else {
+      statusLabel = 'Partial Failure';
+      statusClass = 'partial';
+    }
+  }
+
+  const tiles = isGenerating
+    ? '<p class="generated-images-hint">Generating scene images…</p>'
+    : images
+        .map((image) => {
+          if (image.status === 'completed' && image.url) {
+            return `<figure class="generated-image-tile"><img src="${image.url}" alt="Generated scene image" loading="lazy"><figcaption>${image.prompt}</figcaption></figure>`;
+          }
+          return `<div class="generated-image-tile generated-image-tile-error"><p class="generated-image-error">Failed: ${image.error || 'Unknown error'}</p><figcaption>${image.prompt}</figcaption></div>`;
+        })
+        .join('');
+
+  const requestErrorHtml = requestError
+    ? `<p class="generated-images-error">${requestError}</p>`
+    : '';
+
+  return `
+    <tr class="generated-images-row">
+      <td colspan="8">
+        <div class="generated-images-panel">
+          <span class="generation-badge ${statusClass}">${statusLabel}</span>
+          ${requestErrorHtml}
+          <div class="generated-images-grid">${tiles}</div>
+        </div>
+      </td>
+    </tr>
+  `;
+}
+
 function renderJobs(jobs) {
   if (!jobs.length) {
     tableBody.innerHTML = '<tr><td colspan="8" class="dashboard-empty">No video jobs yet. Click "+ New Job" to create one.</td></tr>';
@@ -32,6 +105,10 @@ function renderJobs(jobs) {
   tableBody.innerHTML = jobs
     .map((job) => {
       const isLastStage = job.status === 'COMPLETED';
+      const canGenerateImages = job.status === 'ASSET GENERATION';
+      const hasPrompts = Array.isArray(job.imagePrompts) && job.imagePrompts.length > 0;
+      const isGenerating = generatingImageJobIds.has(job.id);
+
       return `
         <tr>
           <td>${job.id}</td>
@@ -46,9 +123,16 @@ function renderJobs(jobs) {
             <button type="button" class="btn-advance" data-id="${job.id}" ${isLastStage ? 'disabled' : ''}>
               ${isLastStage ? 'Completed' : 'Advance →'}
             </button>
+            ${
+              canGenerateImages
+                ? `<button type="button" class="btn-generate-images" data-id="${job.id}" ${isGenerating || !hasPrompts ? 'disabled' : ''}>
+                    ${generateImagesButtonLabel(job, isGenerating, hasPrompts)}
+                  </button>`
+                : ''
+            }
           </td>
         </tr>
-      `;
+      `.trim() + renderGenerationRow(job);
     })
     .join('');
 }
@@ -57,6 +141,7 @@ async function loadJobs() {
   try {
     const res = await fetch('/api/jobs');
     const jobs = await res.json();
+    lastJobs = jobs;
     renderJobs(jobs);
   } catch (error) {
     tableBody.innerHTML = '<tr><td colspan="8" class="dashboard-empty">Could not load jobs. Please try again.</td></tr>';
@@ -165,6 +250,34 @@ async function confirmJob(id, button) {
   }
 }
 
+async function generateImages(id) {
+  if (generatingImageJobIds.has(id)) {
+    return;
+  }
+
+  generatingImageJobIds.add(id);
+  imageGenerationRequestErrors.delete(id);
+  renderJobs(lastJobs);
+
+  try {
+    const res = await fetch(`/api/jobs/${id}/generate-images`, { method: 'POST' });
+    const data = await res.json();
+
+    if (!res.ok) {
+      imageGenerationRequestErrors.set(id, data.error || 'Could not generate images.');
+      showMessage(data.error || 'Could not generate images.', 'error');
+    } else {
+      clearMessage();
+    }
+  } catch (error) {
+    imageGenerationRequestErrors.set(id, 'Could not generate images. Please try again.');
+    showMessage('Could not generate images. Please try again.', 'error');
+  } finally {
+    generatingImageJobIds.delete(id);
+    await loadJobs();
+  }
+}
+
 newJobBtn.addEventListener('click', openNewJobForm);
 newJobCancelBtn.addEventListener('click', closeNewJobForm);
 newJobForm.addEventListener('submit', createJob);
@@ -179,6 +292,12 @@ tableBody.addEventListener('click', (event) => {
   const confirmBtn = event.target.closest('.btn-confirm');
   if (confirmBtn && !confirmBtn.disabled) {
     confirmJob(confirmBtn.dataset.id, confirmBtn);
+    return;
+  }
+
+  const generateBtn = event.target.closest('.btn-generate-images');
+  if (generateBtn && !generateBtn.disabled) {
+    generateImages(generateBtn.dataset.id);
   }
 });
 
