@@ -134,9 +134,14 @@ function renderVoiceoverRow(job) {
 
   let body = '';
   if (isGenerating) {
-    body = '<p class="generated-images-hint">Generating voice-over…</p>';
+    body =
+      '<p class="generated-images-hint">Generating voice-over' +
+      '<span class="generating-dots"><span></span><span></span><span></span></span></p>';
   } else if (voiceover && voiceover.status === 'completed' && voiceover.url) {
-    body = `<audio class="generated-audio" controls src="${voiceover.url}"></audio>`;
+    const voiceLabel = voiceover.voiceStyle || voiceover.voice;
+    body =
+      `<audio class="generated-audio" controls src="${voiceover.url}"></audio>` +
+      (voiceLabel ? `<p class="generated-images-hint">Voice: ${voiceLabel}</p>` : '');
   } else if (voiceover && voiceover.status === 'failed') {
     body = `<p class="generated-image-error">Failed: ${voiceover.error || 'Unknown error'}</p>`;
   }
@@ -365,8 +370,13 @@ async function generateVoiceover(id) {
     if (!res.ok) {
       voiceoverGenerationRequestErrors.set(id, data.error || 'Could not generate voice-over.');
       showMessage(data.error || 'Could not generate voice-over.', 'error');
+    } else if (data.voiceover && data.voiceover.status === 'completed') {
+      showMessage('Voice-over generated successfully.', 'success');
     } else {
-      clearMessage();
+      // The request succeeded but OpenAI itself failed to produce audio;
+      // the row already shows this from the persisted voiceover.error, so
+      // only surface the top banner here, not a duplicate row-level error.
+      showMessage((data.voiceover && data.voiceover.error) || 'Could not generate voice-over.', 'error');
     }
   } catch (error) {
     voiceoverGenerationRequestErrors.set(id, 'Could not generate voice-over. Please try again.');

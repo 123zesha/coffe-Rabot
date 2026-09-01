@@ -110,10 +110,15 @@ async function generateVoiceover({ script, voiceStyle }) {
       throw new Error('OpenAI did not return audio data.');
     }
 
-    return { url: `data:audio/mpeg;base64,${audioBuffer.toString('base64')}`, status: 'completed', voice };
+    return {
+      url: `data:audio/mpeg;base64,${audioBuffer.toString('base64')}`,
+      status: 'completed',
+      voice,
+      voiceStyle: voiceStyle || '',
+    };
   } catch (error) {
     console.error('OpenAI voice-over generation error:', JSON.stringify({ message: describeError(error) }, null, 2));
-    return { url: null, status: 'failed', voice, error: describeError(error) };
+    return { url: null, status: 'failed', voice, voiceStyle: voiceStyle || '', error: describeError(error) };
   }
 }
 

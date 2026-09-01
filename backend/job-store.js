@@ -305,4 +305,13 @@ async function advanceJob(id) {
   return { job };
 }
 
-module.exports = { STAGES, JOB_FIELDS, listJobs, createJob, getJob, updateJob, advanceJob };
+module.exports = {
+  STAGES,
+  JOB_FIELDS,
+  MIN_SCRIPT_LENGTH,
+  listJobs,
+  createJob,
+  getJob,
+  updateJob,
+  advanceJob,
+};

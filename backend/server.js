@@ -73,8 +73,13 @@ function summarizeJobForAgent(job) {
   }
 
   if (job.voiceover && typeof job.voiceover === 'object') {
-    const { status, voice, error } = job.voiceover;
-    summarized.voiceover = { status, ...(voice ? { voice } : {}), ...(error ? { error } : {}) };
+    const { status, voice, voiceStyle, error } = job.voiceover;
+    summarized.voiceover = {
+      status,
+      ...(voice ? { voice } : {}),
+      ...(voiceStyle ? { voiceStyle } : {}),
+      ...(error ? { error } : {}),
+    };
   }
 
   return summarized;
@@ -407,6 +412,12 @@ app.post('/api/jobs/:id/generate-voiceover', async (req, res) => {
 
   if (!job.script || !job.script.trim()) {
     return res.status(400).json({ error: 'job has no script to generate a voice-over from' });
+  }
+
+  if (job.script.trim().length < jobStore.MIN_SCRIPT_LENGTH) {
+    return res.status(400).json({
+      error: `the script is too short to be an approved, complete script (needs at least ${jobStore.MIN_SCRIPT_LENGTH} characters) — finish scripting before generating a voice-over`,
+    });
   }
 
   if (job.voiceStyle === 'none') {
