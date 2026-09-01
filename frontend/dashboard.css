@@ -245,6 +245,26 @@
   cursor: not-allowed;
 }
 
+.btn-generate-voiceover {
+  background: var(--color-accent);
+  color: #fff;
+  border: none;
+  border-radius: var(--radius);
+  padding: 6px 12px;
+  font-size: 0.85rem;
+  cursor: pointer;
+}
+
+.btn-generate-voiceover:disabled {
+  background: var(--color-border);
+  color: var(--color-muted);
+  cursor: not-allowed;
+}
+
+.generated-audio {
+  width: 100%;
+}
+
 .generated-images-row td {
   white-space: normal;
   background: var(--color-bg);

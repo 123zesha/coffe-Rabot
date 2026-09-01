@@ -11,6 +11,8 @@ const newJobStyleInput = document.getElementById('new-job-style');
 let lastJobs = [];
 const generatingImageJobIds = new Set();
 const imageGenerationRequestErrors = new Map();
+const generatingVoiceoverJobIds = new Set();
+const voiceoverGenerationRequestErrors = new Map();
 
 function showMessage(text, type) {
   messageEl.textContent = text;
@@ -96,6 +98,66 @@ function renderGenerationRow(job) {
   `;
 }
 
+function generateVoiceoverButtonLabel(job, isGenerating) {
+  if (isGenerating) return 'Generating…';
+  const voiceover = job.voiceover;
+  if (voiceover && typeof voiceover === 'object' && voiceover.status === 'completed') return 'Regenerate Voice-over';
+  if (voiceover && typeof voiceover === 'object' && voiceover.status === 'failed') return 'Retry Voice-over';
+  return 'Generate Voice-over';
+}
+
+function renderVoiceoverRow(job) {
+  const isGenerating = generatingVoiceoverJobIds.has(job.id);
+  const requestError = voiceoverGenerationRequestErrors.get(job.id);
+  const voiceover = job.voiceover && typeof job.voiceover === 'object' ? job.voiceover : null;
+
+  if (!isGenerating && !requestError && (!voiceover || voiceover.status === 'pending')) {
+    return '';
+  }
+
+  let statusLabel = 'Ready';
+  let statusClass = 'ready';
+
+  if (isGenerating) {
+    statusLabel = 'Generating';
+    statusClass = 'generating';
+  } else if (requestError) {
+    statusLabel = 'Failed';
+    statusClass = 'failed';
+  } else if (voiceover && voiceover.status === 'completed') {
+    statusLabel = 'Completed';
+    statusClass = 'completed';
+  } else if (voiceover && voiceover.status === 'failed') {
+    statusLabel = 'Failed';
+    statusClass = 'failed';
+  }
+
+  let body = '';
+  if (isGenerating) {
+    body = '<p class="generated-images-hint">Generating voice-over…</p>';
+  } else if (voiceover && voiceover.status === 'completed' && voiceover.url) {
+    body = `<audio class="generated-audio" controls src="${voiceover.url}"></audio>`;
+  } else if (voiceover && voiceover.status === 'failed') {
+    body = `<p class="generated-image-error">Failed: ${voiceover.error || 'Unknown error'}</p>`;
+  }
+
+  const requestErrorHtml = requestError
+    ? `<p class="generated-images-error">${requestError}</p>`
+    : '';
+
+  return `
+    <tr class="generated-images-row">
+      <td colspan="8">
+        <div class="generated-images-panel">
+          <span class="generation-badge ${statusClass}">${statusLabel}</span>
+          ${requestErrorHtml}
+          ${body}
+        </div>
+      </td>
+    </tr>
+  `;
+}
+
 function renderJobs(jobs) {
   if (!jobs.length) {
     tableBody.innerHTML = '<tr><td colspan="8" class="dashboard-empty">No video jobs yet. Click "+ New Job" to create one.</td></tr>';
@@ -108,6 +170,8 @@ function renderJobs(jobs) {
       const canGenerateImages = job.status === 'ASSET GENERATION';
       const hasPrompts = Array.isArray(job.imagePrompts) && job.imagePrompts.length > 0;
       const isGenerating = generatingImageJobIds.has(job.id);
+      const hasScript = typeof job.script === 'string' && job.script.trim().length > 0;
+      const isGeneratingVoiceover = generatingVoiceoverJobIds.has(job.id);
 
       return `
         <tr>
@@ -130,9 +194,16 @@ function renderJobs(jobs) {
                   </button>`
                 : ''
             }
+            ${
+              hasScript
+                ? `<button type="button" class="btn-generate-voiceover" data-id="${job.id}" ${isGeneratingVoiceover ? 'disabled' : ''}>
+                    ${generateVoiceoverButtonLabel(job, isGeneratingVoiceover)}
+                  </button>`
+                : ''
+            }
           </td>
         </tr>
-      `.trim() + renderGenerationRow(job);
+      `.trim() + renderGenerationRow(job) + renderVoiceoverRow(job);
     })
     .join('');
 }
@@ -278,6 +349,34 @@ async function generateImages(id) {
   }
 }
 
+async function generateVoiceover(id) {
+  if (generatingVoiceoverJobIds.has(id)) {
+    return;
+  }
+
+  generatingVoiceoverJobIds.add(id);
+  voiceoverGenerationRequestErrors.delete(id);
+  renderJobs(lastJobs);
+
+  try {
+    const res = await fetch(`/api/jobs/${id}/generate-voiceover`, { method: 'POST' });
+    const data = await res.json();
+
+    if (!res.ok) {
+      voiceoverGenerationRequestErrors.set(id, data.error || 'Could not generate voice-over.');
+      showMessage(data.error || 'Could not generate voice-over.', 'error');
+    } else {
+      clearMessage();
+    }
+  } catch (error) {
+    voiceoverGenerationRequestErrors.set(id, 'Could not generate voice-over. Please try again.');
+    showMessage('Could not generate voice-over. Please try again.', 'error');
+  } finally {
+    generatingVoiceoverJobIds.delete(id);
+    await loadJobs();
+  }
+}
+
 newJobBtn.addEventListener('click', openNewJobForm);
 newJobCancelBtn.addEventListener('click', closeNewJobForm);
 newJobForm.addEventListener('submit', createJob);
@@ -298,6 +397,12 @@ tableBody.addEventListener('click', (event) => {
   const generateBtn = event.target.closest('.btn-generate-images');
   if (generateBtn && !generateBtn.disabled) {
     generateImages(generateBtn.dataset.id);
+    return;
+  }
+
+  const generateVoiceoverBtn = event.target.closest('.btn-generate-voiceover');
+  if (generateVoiceoverBtn && !generateVoiceoverBtn.disabled) {
+    generateVoiceover(generateVoiceoverBtn.dataset.id);
   }
 });
 
