@@ -62,6 +62,7 @@ const JOB_FIELDS = [
   'imagePrompts',
   'videoPrompts',
   'images',
+  'voiceStyle',
   'voiceover',
   'subtitles',
   'music',
@@ -158,7 +159,18 @@ function createDefaultJob(id) {
     // the conversational agent (see UPDATABLE_JOB_FIELDS in server.js) —
     // only the real generation call populates this.
     images: [],
-    voiceover: '',
+    // Which named voice-over option (see data/video-options.json ->
+    // voiceOverOptions) the user picked; writable by the agent like
+    // topic/language/storyStyle, since it's just a preference, not a
+    // generation result.
+    voiceStyle: '',
+    // Populated by the OpenAI voice-over integration (see
+    // backend/voiceover-generation.js): { url, status, voice, error? },
+    // where status is 'pending' | 'completed' | 'failed' and error is only
+    // present on failure. url is only set when the API actually returned
+    // audio data. Not writable by the conversational agent — only the real
+    // generation call populates this.
+    voiceover: { url: null, status: 'pending' },
     subtitles: '',
     music: '',
     thumbnail: '',
@@ -293,4 +305,13 @@ async function advanceJob(id) {
   return { job };
 }
 
-module.exports = { STAGES, JOB_FIELDS, listJobs, createJob, getJob, updateJob, advanceJob };
+module.exports = {
+  STAGES,
+  JOB_FIELDS,
+  MIN_SCRIPT_LENGTH,
+  listJobs,
+  createJob,
+  getJob,
+  updateJob,
+  advanceJob,
+};

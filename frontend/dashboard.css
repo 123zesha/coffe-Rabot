@@ -245,6 +245,50 @@
   cursor: not-allowed;
 }
 
+.btn-generate-voiceover {
+  background: var(--color-accent);
+  color: #fff;
+  border: none;
+  border-radius: var(--radius);
+  padding: 6px 12px;
+  font-size: 0.85rem;
+  cursor: pointer;
+}
+
+.btn-generate-voiceover:disabled {
+  background: var(--color-border);
+  color: var(--color-muted);
+  cursor: not-allowed;
+}
+
+.generated-audio {
+  width: 100%;
+}
+
+.generating-dots {
+  display: inline-flex;
+  gap: 4px;
+  margin-left: 8px;
+  vertical-align: middle;
+}
+
+.generating-dots span {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: currentColor;
+  opacity: 0.4;
+  animation: chat-typing-blink 1.2s infinite ease-in-out;
+}
+
+.generating-dots span:nth-child(2) {
+  animation-delay: 0.2s;
+}
+
+.generating-dots span:nth-child(3) {
+  animation-delay: 0.4s;
+}
+
 .generated-images-row td {
   white-space: normal;
   background: var(--color-bg);
