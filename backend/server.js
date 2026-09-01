@@ -45,6 +45,31 @@ const UPDATABLE_JOB_FIELDS = [
   'description',
 ];
 
+// job.images[].url holds a full base64-encoded image (real generated images
+// are commonly hundreds of KB to a few MB each). The agent never needs the
+// actual image bytes to write scripts, plan scenes, or decide when to
+// advance stages — only whether each prompt succeeded. Embedding the raw
+// url in every tool_result and system prompt bloats the conversation
+// history the frontend echoes back on every subsequent /api/agent request,
+// which is what causes it to exceed the request body size limit once a job
+// has generated images. The real image data is untouched in Redis and stays
+// fully available via /api/jobs/:id and the dashboard — this only shapes
+// what the agent/conversation sees.
+function summarizeJobForAgent(job) {
+  if (!job || !Array.isArray(job.images)) {
+    return job;
+  }
+
+  return {
+    ...job,
+    images: job.images.map(({ prompt, status, error }) => ({
+      prompt,
+      status,
+      ...(error ? { error } : {}),
+    })),
+  };
+}
+
 const TOOLS = [
   {
     name: 'getVideoOptions',
@@ -126,7 +151,7 @@ async function executeTool(name, jobId, input) {
       }
     }
     const job = await jobStore.updateJob(jobId, updates);
-    return JSON.stringify(job || { error: 'job not found' });
+    return JSON.stringify(job ? summarizeJobForAgent(job) : { error: 'job not found' });
   }
 
   if (name === 'advanceVideoJobStage') {
@@ -135,11 +160,14 @@ async function executeTool(name, jobId, input) {
     if (result.error === 'not_found') {
       return JSON.stringify({ error: 'job not found' });
     }
+
+    const job = summarizeJobForAgent(result.job);
+
     if (result.error === 'confirmation_required') {
       return JSON.stringify({
         error:
           'The job cannot be completed until the user has explicitly confirmed the final production summary.',
-        job: result.job,
+        job,
       });
     }
     if (result.error === 'missing_required_output') {
@@ -148,28 +176,36 @@ async function executeTool(name, jobId, input) {
           `The job cannot advance out of ${result.job.status} because the following required output is missing or empty: ` +
           `${result.missingFields.join(', ')}. Use updateVideoJob to fill these in first.`,
         missingFields: result.missingFields,
-        job: result.job,
+        job,
       });
     }
     if (result.error === 'no_next_stage') {
-      return JSON.stringify({ error: 'job has no next stage', job: result.job });
+      return JSON.stringify({ error: 'job has no next stage', job });
     }
 
-    return JSON.stringify(result.job);
+    return JSON.stringify(job);
   }
 
   if (name === 'confirmVideoJob') {
     const job = await jobStore.updateJob(jobId, { confirmed: true });
-    return JSON.stringify(job || { error: 'job not found' });
+    return JSON.stringify(job ? summarizeJobForAgent(job) : { error: 'job not found' });
   }
 
   return JSON.stringify({ error: `Unknown tool: ${name}` });
 }
 
-app.use(express.json());
+// 1mb comfortably covers a real conversation's text (scripts, scene/tool
+// history) — realistically tens of KB even for a long one — while still
+// catching an oversized payload (e.g. raw image data leaking back into the
+// conversation again in the future) with a clear error instead of silently
+// accepting multi-MB request bodies.
+app.use(express.json({ limit: '1mb' }));
 app.use((err, req, res, next) => {
   if (err.type === 'entity.parse.failed') {
     return res.status(400).json({ error: 'invalid JSON in request body' });
+  }
+  if (err.type === 'entity.too.large') {
+    return res.status(413).json({ error: 'request body is too large' });
   }
   next(err);
 });
@@ -195,7 +231,7 @@ app.post('/api/agent', async (req, res) => {
       '\n\n## Current Video Production Job\n' +
       'This is the current state of the video production job for this conversation. ' +
       'Use the updateVideoJob, advanceVideoJobStage, and confirmVideoJob tools to keep it accurate.\n\n' +
-      JSON.stringify(currentJob)
+      JSON.stringify(summarizeJobForAgent(currentJob))
     );
   }
 
