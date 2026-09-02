@@ -16,8 +16,33 @@
   const videoLanguageSelect = document.getElementById('video-language');
   const videoStyleSelect = document.getElementById('video-style');
 
+  const voiceoverPlaceholder = document.getElementById('voiceover-placeholder');
+  const voiceoverPanel = document.getElementById('voiceover-panel');
+  const voiceoverAudio = document.getElementById('voiceover-audio');
+  const generateVoiceoverBtn = document.getElementById('generate-voiceover-btn');
+  const voiceoverStatus = document.getElementById('voiceover-status');
+
+  const JOB_ID_STORAGE_KEY = 'aiAgentJobId';
+
+  function loadStoredJobId() {
+    try {
+      return localStorage.getItem(JOB_ID_STORAGE_KEY);
+    } catch (error) {
+      return null;
+    }
+  }
+
+  function storeJobId(id) {
+    try {
+      localStorage.setItem(JOB_ID_STORAGE_KEY, id);
+    } catch (error) {
+      // Ignore storage failures (private browsing, disabled storage, etc.) —
+      // the page still works within the current session either way.
+    }
+  }
+
   let conversationHistory = [];
-  let jobId = null;
+  let jobId = loadStoredJobId();
 
   async function callAgent(message) {
     const response = await fetch('/api/agent', {
@@ -34,7 +59,10 @@
     conversationHistory = Array.isArray(data.conversationHistory)
       ? data.conversationHistory
       : conversationHistory;
-    jobId = data.jobId || jobId;
+    if (data.jobId) {
+      jobId = data.jobId;
+      storeJobId(jobId);
+    }
     return data.reply;
   }
 
@@ -105,6 +133,7 @@
       input.disabled = false;
       sendBtn.disabled = false;
       input.focus();
+      refreshVoiceoverCard();
     }
   });
 
@@ -144,6 +173,112 @@
       setGenerateStatus(ERROR_REPLY, 'error');
     } finally {
       generateBtn.disabled = false;
+      refreshVoiceoverCard();
     }
   });
+
+  // --- Voice-over (Final Review) ---
+  // Mirrors the same generate/status pattern already used and tested on the
+  // dashboard's per-job "Generate Voice-over" button, scoped to this page's
+  // single current job. Calls the same POST /api/jobs/:id/generate-voiceover
+  // route; nothing about job persistence, /api/agent, or stage validation is
+  // touched here — this only adds a UI that was missing for this page.
+  let voiceoverGenerating = false;
+
+  function setVoiceoverStatus(text, type) {
+    voiceoverStatus.textContent = text;
+    voiceoverStatus.className = 'generate-status' + (type ? ' ' + type : '');
+    voiceoverStatus.hidden = false;
+  }
+
+  function clearVoiceoverStatus() {
+    voiceoverStatus.hidden = true;
+    voiceoverStatus.textContent = '';
+  }
+
+  async function fetchCurrentJob() {
+    if (!jobId) {
+      return null;
+    }
+    try {
+      const res = await fetch(`/api/jobs/${jobId}`);
+      if (!res.ok) {
+        return null;
+      }
+      return await res.json();
+    } catch (error) {
+      return null;
+    }
+  }
+
+  function renderVoiceoverCard(job) {
+    const hasScript = Boolean(job && typeof job.script === 'string' && job.script.trim().length > 0);
+
+    if (!hasScript) {
+      voiceoverPlaceholder.hidden = false;
+      voiceoverPanel.hidden = true;
+      return;
+    }
+
+    voiceoverPlaceholder.hidden = true;
+    voiceoverPanel.hidden = false;
+
+    const voiceover = job.voiceover && typeof job.voiceover === 'object' ? job.voiceover : null;
+
+    generateVoiceoverBtn.disabled = voiceoverGenerating;
+    if (voiceoverGenerating) {
+      generateVoiceoverBtn.textContent = 'Generating…';
+    } else if (voiceover && voiceover.status === 'completed') {
+      generateVoiceoverBtn.textContent = 'Regenerate Voice-over';
+    } else if (voiceover && voiceover.status === 'failed') {
+      generateVoiceoverBtn.textContent = 'Retry Voice-over';
+    } else {
+      generateVoiceoverBtn.textContent = 'Generate Voice-over';
+    }
+
+    // Only ever show the player when the job actually has a real,
+    // successfully generated audio asset — never for 'pending' or 'failed'.
+    if (voiceover && voiceover.status === 'completed' && voiceover.url) {
+      voiceoverAudio.src = voiceover.url;
+      voiceoverAudio.hidden = false;
+    } else {
+      voiceoverAudio.hidden = true;
+      voiceoverAudio.removeAttribute('src');
+    }
+  }
+
+  async function refreshVoiceoverCard() {
+    const job = await fetchCurrentJob();
+    renderVoiceoverCard(job);
+  }
+
+  generateVoiceoverBtn.addEventListener('click', async () => {
+    if (voiceoverGenerating || !jobId) {
+      return;
+    }
+
+    voiceoverGenerating = true;
+    clearVoiceoverStatus();
+    renderVoiceoverCard(await fetchCurrentJob());
+
+    try {
+      const res = await fetch(`/api/jobs/${jobId}/generate-voiceover`, { method: 'POST' });
+      const data = await res.json();
+
+      if (!res.ok) {
+        setVoiceoverStatus(data.error || 'Could not generate voice-over.', 'error');
+      } else if (data.voiceover && data.voiceover.status === 'completed') {
+        setVoiceoverStatus('Voice-over generated successfully.', 'success');
+      } else {
+        setVoiceoverStatus((data.voiceover && data.voiceover.error) || 'Could not generate voice-over.', 'error');
+      }
+    } catch (error) {
+      setVoiceoverStatus('Could not generate voice-over. Please try again.', 'error');
+    } finally {
+      voiceoverGenerating = false;
+      await refreshVoiceoverCard();
+    }
+  });
+
+  refreshVoiceoverCard();
 })();

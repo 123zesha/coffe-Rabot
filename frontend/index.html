@@ -190,6 +190,18 @@
           </article>
 
           <article class="review-card">
+            <h3>Voice-over</h3>
+            <div id="voiceover-placeholder" class="review-placeholder text-placeholder">
+              <p>Your generated voice-over will appear here once the script is ready.</p>
+            </div>
+            <div id="voiceover-panel" hidden>
+              <audio id="voiceover-audio" class="review-audio" controls hidden></audio>
+              <button type="button" id="generate-voiceover-btn" class="btn btn-primary btn-generate">Generate Voice-over</button>
+              <p id="voiceover-status" class="generate-status" hidden aria-live="polite"></p>
+            </div>
+          </article>
+
+          <article class="review-card">
             <h3>YouTube Title</h3>
             <div class="review-placeholder text-placeholder">
               <p>Your generated video title will appear here.</p>
