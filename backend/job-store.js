@@ -64,6 +64,8 @@ const JOB_FIELDS = [
   'images',
   'voiceStyle',
   'voiceover',
+  'videoGeneration',
+  'finalVideo',
   'subtitles',
   'music',
   'thumbnail',
@@ -171,6 +173,27 @@ function createDefaultJob(id) {
     // audio data. Not writable by the conversational agent — only the real
     // generation call populates this.
     voiceover: { url: null, status: 'pending' },
+    // Tracks an attempt to generate the job's final video through the
+    // provider-independent video generation layer (see
+    // backend/video-generation.js): { provider, status, externalJobId,
+    // clips, error }. provider is the video generation provider that
+    // handled (or attempted) the request; status is 'not_started' |
+    // 'processing' | 'completed' | 'failed'; clips holds whatever per-clip
+    // URLs/IDs the provider actually returned (empty until real data
+    // exists). No paid provider is registered yet, so this can currently
+    // only ever reach 'failed' — never fabricated, and never by itself
+    // enough to complete the job (see finalVideo below and
+    // STAGE_OUTPUT_REQUIREMENTS). Not writable by the conversational agent.
+    videoGeneration: { provider: null, status: 'not_started', externalJobId: null, clips: [], error: null },
+    // The real rendered output video: { url, status, error? }, where status
+    // is 'pending' | 'completed' | 'failed'. No rendering integration exists
+    // yet, so this field has no generation call to populate it and will
+    // always stay 'pending' — that's intentional, not a bug. It exists so
+    // the job cannot be marked COMPLETED (see STAGE_OUTPUT_REQUIREMENTS
+    // below) until a real rendering feature is built and actually produces
+    // one. Not writable by the conversational agent, same as images/
+    // voiceover — nothing may ever fabricate a value here.
+    finalVideo: { url: null, status: 'pending' },
     subtitles: '',
     music: '',
     thumbnail: '',
@@ -233,6 +256,12 @@ const STAGE_OUTPUT_REQUIREMENTS = {
   SCRIPTING: ['script'],
   'SCENE PLANNING': ['scenes', 'characters'],
   'ASSET GENERATION': ['imagePrompts', 'videoPrompts'],
+  // A job must have a real, successfully rendered final video before it can
+  // be marked COMPLETED — confirmation alone is not enough. Since no
+  // rendering integration exists yet, finalVideo can never actually reach
+  // 'completed' today, so this correctly keeps every job at READY (blocked,
+  // not falsely finished) until real rendering is built.
+  READY: ['finalVideo'],
 };
 
 function isNonEmptyString(value) {
@@ -263,6 +292,10 @@ function hasRequiredOutput(job, field) {
 
   if (field === 'script') {
     return isNonEmptyString(value) && value.trim().length >= MIN_SCRIPT_LENGTH;
+  }
+
+  if (field === 'finalVideo') {
+    return Boolean(value && typeof value === 'object' && value.status === 'completed' && value.url);
   }
 
   return isNonEmptyString(value);
