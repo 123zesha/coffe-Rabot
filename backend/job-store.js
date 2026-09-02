@@ -64,6 +64,7 @@ const JOB_FIELDS = [
   'images',
   'voiceStyle',
   'voiceover',
+  'videoGeneration',
   'finalVideo',
   'subtitles',
   'music',
@@ -172,6 +173,18 @@ function createDefaultJob(id) {
     // audio data. Not writable by the conversational agent — only the real
     // generation call populates this.
     voiceover: { url: null, status: 'pending' },
+    // Tracks an attempt to generate the job's final video through the
+    // provider-independent video generation layer (see
+    // backend/video-generation.js): { provider, status, externalJobId,
+    // clips, error }. provider is the video generation provider that
+    // handled (or attempted) the request; status is 'not_started' |
+    // 'processing' | 'completed' | 'failed'; clips holds whatever per-clip
+    // URLs/IDs the provider actually returned (empty until real data
+    // exists). No paid provider is registered yet, so this can currently
+    // only ever reach 'failed' — never fabricated, and never by itself
+    // enough to complete the job (see finalVideo below and
+    // STAGE_OUTPUT_REQUIREMENTS). Not writable by the conversational agent.
+    videoGeneration: { provider: null, status: 'not_started', externalJobId: null, clips: [], error: null },
     // The real rendered output video: { url, status, error? }, where status
     // is 'pending' | 'completed' | 'failed'. No rendering integration exists
     // yet, so this field has no generation call to populate it and will

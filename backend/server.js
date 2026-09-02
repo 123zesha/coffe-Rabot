@@ -7,6 +7,7 @@ const Anthropic = require('@anthropic-ai/sdk');
 const jobStore = require('./job-store');
 const imageGeneration = require('./image-generation');
 const voiceoverGeneration = require('./voiceover-generation');
+const videoGeneration = require('./video-generation');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -80,6 +81,11 @@ function summarizeJobForAgent(job) {
       ...(voiceStyle ? { voiceStyle } : {}),
       ...(error ? { error } : {}),
     };
+  }
+
+  if (job.videoGeneration && typeof job.videoGeneration === 'object') {
+    const { provider, status, error } = job.videoGeneration;
+    summarized.videoGeneration = { provider, status, ...(error ? { error } : {}) };
   }
 
   if (job.finalVideo && typeof job.finalVideo === 'object') {
@@ -455,6 +461,43 @@ app.post('/api/jobs/:id/generate-voiceover', async (req, res) => {
       JSON.stringify({ name: error?.name, message: error?.message }, null, 2)
     );
     res.status(502).json({ error: 'Voice-over generation failed unexpectedly.' });
+  }
+});
+
+app.post('/api/jobs/:id/generate-video', async (req, res) => {
+  const job = await jobStore.getJob(req.params.id);
+
+  if (!job) {
+    return res.status(404).json({ error: 'job not found' });
+  }
+
+  if (!Array.isArray(job.videoPrompts) || job.videoPrompts.length === 0) {
+    return res.status(400).json({ error: 'job has no videoPrompts to generate video from' });
+  }
+
+  try {
+    const result = await videoGeneration.generateVideo({
+      videoPrompts: job.videoPrompts,
+      scenes: job.scenes,
+      characters: job.characters,
+    });
+
+    const updates = { videoGeneration: result.videoGeneration };
+    // finalVideo is only ever set here when the video generation pipeline
+    // itself returned a real, completed, playable video — see
+    // backend/video-generation.js. It is never guessed or fabricated.
+    if (result.finalVideo) {
+      updates.finalVideo = result.finalVideo;
+    }
+
+    const updatedJob = await jobStore.updateJob(job.id, updates);
+    res.json(updatedJob);
+  } catch (error) {
+    console.error(
+      'Unexpected error generating video:',
+      JSON.stringify({ name: error?.name, message: error?.message }, null, 2)
+    );
+    res.status(502).json({ error: 'Video generation failed unexpectedly.' });
   }
 });
 

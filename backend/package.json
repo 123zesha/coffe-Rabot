@@ -7,7 +7,8 @@
     "start": "node server.js",
     "test": "echo \"Error: no test specified\" && exit 1",
     "test:connection": "node test-connection.js",
-    "test:completion-gate": "node test-completion-gate.js"
+    "test:completion-gate": "node test-completion-gate.js",
+    "test:video-generation": "node test-video-generation.js"
   },
   "keywords": [],
   "author": "",
