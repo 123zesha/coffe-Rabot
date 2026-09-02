@@ -64,6 +64,7 @@ const JOB_FIELDS = [
   'images',
   'voiceStyle',
   'voiceover',
+  'finalVideo',
   'subtitles',
   'music',
   'thumbnail',
@@ -171,6 +172,15 @@ function createDefaultJob(id) {
     // audio data. Not writable by the conversational agent — only the real
     // generation call populates this.
     voiceover: { url: null, status: 'pending' },
+    // The real rendered output video: { url, status, error? }, where status
+    // is 'pending' | 'completed' | 'failed'. No rendering integration exists
+    // yet, so this field has no generation call to populate it and will
+    // always stay 'pending' — that's intentional, not a bug. It exists so
+    // the job cannot be marked COMPLETED (see STAGE_OUTPUT_REQUIREMENTS
+    // below) until a real rendering feature is built and actually produces
+    // one. Not writable by the conversational agent, same as images/
+    // voiceover — nothing may ever fabricate a value here.
+    finalVideo: { url: null, status: 'pending' },
     subtitles: '',
     music: '',
     thumbnail: '',
@@ -233,6 +243,12 @@ const STAGE_OUTPUT_REQUIREMENTS = {
   SCRIPTING: ['script'],
   'SCENE PLANNING': ['scenes', 'characters'],
   'ASSET GENERATION': ['imagePrompts', 'videoPrompts'],
+  // A job must have a real, successfully rendered final video before it can
+  // be marked COMPLETED — confirmation alone is not enough. Since no
+  // rendering integration exists yet, finalVideo can never actually reach
+  // 'completed' today, so this correctly keeps every job at READY (blocked,
+  // not falsely finished) until real rendering is built.
+  READY: ['finalVideo'],
 };
 
 function isNonEmptyString(value) {
@@ -263,6 +279,10 @@ function hasRequiredOutput(job, field) {
 
   if (field === 'script') {
     return isNonEmptyString(value) && value.trim().length >= MIN_SCRIPT_LENGTH;
+  }
+
+  if (field === 'finalVideo') {
+    return Boolean(value && typeof value === 'object' && value.status === 'completed' && value.url);
   }
 
   return isNonEmptyString(value);

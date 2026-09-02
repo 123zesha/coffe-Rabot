@@ -82,6 +82,11 @@ function summarizeJobForAgent(job) {
     };
   }
 
+  if (job.finalVideo && typeof job.finalVideo === 'object') {
+    const { status, error } = job.finalVideo;
+    summarized.finalVideo = { status, ...(error ? { error } : {}) };
+  }
+
   return summarized;
 }
 
@@ -129,9 +134,12 @@ const TOOLS = [
       '(NEW -> SCRIPTING -> SCENE PLANNING -> ASSET GENERATION -> EDITING -> READY -> COMPLETED). ' +
       'The job cannot advance into COMPLETED unless it has already been confirmed by the user. ' +
       'It also cannot leave SCRIPTING without a complete script (a short fragment is not enough), ' +
-      'leave SCENE PLANNING without non-empty scenes and characters, or leave ASSET GENERATION ' +
-      'without non-empty imagePrompts and videoPrompts — use updateVideoJob to fill those in first ' +
-      'if this call reports them missing.',
+      'leave SCENE PLANNING without non-empty scenes and characters, leave ASSET GENERATION ' +
+      'without non-empty imagePrompts and videoPrompts, or leave READY without a real, ' +
+      'successfully rendered final video file. Video rendering is not implemented yet, so this ' +
+      'call will currently always report finalVideo missing when leaving READY — when it does, ' +
+      'tell the user plainly that final video rendering is not available yet and their job stays ' +
+      'at the READY stage; never say the video has been produced, rendered, or completed.',
     input_schema: {
       type: 'object',
       properties: {},
@@ -186,10 +194,15 @@ async function executeTool(name, jobId, input) {
       });
     }
     if (result.error === 'missing_required_output') {
+      const isRenderingBlock = result.missingFields.includes('finalVideo');
       return JSON.stringify({
-        error:
-          `The job cannot advance out of ${result.job.status} because the following required output is missing or empty: ` +
-          `${result.missingFields.join(', ')}. Use updateVideoJob to fill these in first.`,
+        error: isRenderingBlock
+          ? 'The job cannot be marked COMPLETED because no real rendered final video exists yet. ' +
+            'Video rendering is not implemented in this system — tell the user their video is not ' +
+            'produced/rendered yet and the job stays at the READY stage. Do not call updateVideoJob ' +
+            'for this; it cannot be filled in manually.'
+          : `The job cannot advance out of ${result.job.status} because the following required output is missing or empty: ` +
+            `${result.missingFields.join(', ')}. Use updateVideoJob to fill these in first.`,
         missingFields: result.missingFields,
         job,
       });
@@ -459,10 +472,13 @@ app.post('/api/jobs/:id/advance', async (req, res) => {
   }
 
   if (result.error === 'missing_required_output') {
+    const isRenderingBlock = result.missingFields.includes('finalVideo');
     return res.status(400).json({
-      error:
-        `Cannot advance: the current stage (${result.job.status}) is missing required output: ` +
-        `${result.missingFields.join(', ')}.`,
+      error: isRenderingBlock
+        ? 'Cannot mark this job COMPLETED: video rendering is not implemented yet, so there is no ' +
+          'real rendered final video for this job. It stays at the READY stage.'
+        : `Cannot advance: the current stage (${result.job.status}) is missing required output: ` +
+          `${result.missingFields.join(', ')}.`,
       missingFields: result.missingFields,
       job: result.job,
     });
