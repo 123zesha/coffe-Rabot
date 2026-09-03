@@ -84,8 +84,15 @@ function summarizeJobForAgent(job) {
   }
 
   if (job.videoGeneration && typeof job.videoGeneration === 'object') {
-    const { provider, status, error } = job.videoGeneration;
-    summarized.videoGeneration = { provider, status, ...(error ? { error } : {}) };
+    const { provider, status, error, clips } = job.videoGeneration;
+    summarized.videoGeneration = {
+      provider,
+      status,
+      ...(error ? { error } : {}),
+      ...(Array.isArray(clips)
+        ? { clips: clips.map((clip) => ({ status: clip.status, ...(clip.error ? { error: clip.error } : {}) })) }
+        : {}),
+    };
   }
 
   if (job.finalVideo && typeof job.finalVideo === 'object') {
@@ -142,9 +149,10 @@ const TOOLS = [
       'It also cannot leave SCRIPTING without a complete script (a short fragment is not enough), ' +
       'leave SCENE PLANNING without non-empty scenes and characters, leave ASSET GENERATION ' +
       'without non-empty imagePrompts and videoPrompts, or leave READY without a real, ' +
-      'successfully rendered final video file. Video rendering is not implemented yet, so this ' +
-      'call will currently always report finalVideo missing when leaving READY — when it does, ' +
-      'tell the user plainly that final video rendering is not available yet and their job stays ' +
+      'successfully rendered final video file. Individual scene video clips can be generated, ' +
+      'but they are not yet automatically assembled into one final video file, so this call ' +
+      'will currently always report finalVideo missing when leaving READY — when it does, tell ' +
+      'the user plainly that the final video is not assembled/available yet and their job stays ' +
       'at the READY stage; never say the video has been produced, rendered, or completed.',
     input_schema: {
       type: 'object',
@@ -203,10 +211,11 @@ async function executeTool(name, jobId, input) {
       const isRenderingBlock = result.missingFields.includes('finalVideo');
       return JSON.stringify({
         error: isRenderingBlock
-          ? 'The job cannot be marked COMPLETED because no real rendered final video exists yet. ' +
-            'Video rendering is not implemented in this system — tell the user their video is not ' +
-            'produced/rendered yet and the job stays at the READY stage. Do not call updateVideoJob ' +
-            'for this; it cannot be filled in manually.'
+          ? 'The job cannot be marked COMPLETED because no real, assembled final video exists yet. ' +
+            'Individual scene clips may exist, but they are not automatically combined into one ' +
+            'final video file yet — tell the user their video is not produced/rendered yet and the ' +
+            'job stays at the READY stage. Do not call updateVideoJob for this; it cannot be filled ' +
+            'in manually.'
           : `The job cannot advance out of ${result.job.status} because the following required output is missing or empty: ` +
             `${result.missingFields.join(', ')}. Use updateVideoJob to fill these in first.`,
         missingFields: result.missingFields,
@@ -475,22 +484,46 @@ app.post('/api/jobs/:id/generate-video', async (req, res) => {
     return res.status(400).json({ error: 'job has no videoPrompts to generate video from' });
   }
 
+  if (!Array.isArray(job.images) || job.images.length === 0) {
+    return res.status(400).json({
+      error: 'job has no generated scene images yet — generate images before generating video',
+    });
+  }
+
+  const activeProvider = videoGeneration.getProvider();
+
+  if (activeProvider.name === 'runway' && !process.env.RUNWAYML_API_SECRET) {
+    return res.status(500).json({ error: 'RUNWAYML_API_SECRET is not configured' });
+  }
+
   try {
-    const result = await videoGeneration.generateVideo({
+    const existingClips =
+      job.videoGeneration && Array.isArray(job.videoGeneration.clips) ? job.videoGeneration.clips : [];
+
+    const result = await videoGeneration.generateVideoForScenes({
+      imagePrompts: job.imagePrompts,
       videoPrompts: job.videoPrompts,
-      scenes: job.scenes,
-      characters: job.characters,
+      images: job.images,
+      existingClips,
     });
 
-    const updates = { videoGeneration: result.videoGeneration };
-    // finalVideo is only ever set here when the video generation pipeline
-    // itself returned a real, completed, playable video — see
-    // backend/video-generation.js. It is never guessed or fabricated.
-    if (result.finalVideo) {
-      updates.finalVideo = result.finalVideo;
-    }
+    const allCompleted = result.clips.length > 0 && result.clips.every((clip) => clip.status === 'completed');
+    const anyProcessing = result.clips.some((clip) => clip.status === 'processing');
+    const overallStatus = allCompleted ? 'completed' : anyProcessing ? 'processing' : 'failed';
 
-    const updatedJob = await jobStore.updateJob(job.id, updates);
+    const videoGenerationField = {
+      provider: activeProvider.name,
+      status: overallStatus,
+      clips: result.clips,
+      error: overallStatus === 'failed' ? 'One or more scenes failed to generate a video clip.' : null,
+    };
+
+    // finalVideo is never set here, even when every scene's clip is
+    // 'completed' — that is many separate short clips, not one final
+    // assembled video. Producing finalVideo requires a real, separate
+    // assembly/stitching step that does not exist yet (see
+    // backend/video-generation.js and job-store.js's finalVideo comment).
+    const updatedJob = await jobStore.updateJob(job.id, { videoGeneration: videoGenerationField });
     res.json(updatedJob);
   } catch (error) {
     console.error(
@@ -518,8 +551,9 @@ app.post('/api/jobs/:id/advance', async (req, res) => {
     const isRenderingBlock = result.missingFields.includes('finalVideo');
     return res.status(400).json({
       error: isRenderingBlock
-        ? 'Cannot mark this job COMPLETED: video rendering is not implemented yet, so there is no ' +
-          'real rendered final video for this job. It stays at the READY stage.'
+        ? 'Cannot mark this job COMPLETED: individual scene clips are not automatically assembled ' +
+          'into one final video yet, so there is no real, single rendered final video for this ' +
+          'job. It stays at the READY stage.'
         : `Cannot advance: the current stage (${result.job.status}) is missing required output: ` +
           `${result.missingFields.join(', ')}.`,
       missingFields: result.missingFields,

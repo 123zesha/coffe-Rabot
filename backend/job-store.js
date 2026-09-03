@@ -173,26 +173,30 @@ function createDefaultJob(id) {
     // audio data. Not writable by the conversational agent — only the real
     // generation call populates this.
     voiceover: { url: null, status: 'pending' },
-    // Tracks an attempt to generate the job's final video through the
-    // provider-independent video generation layer (see
-    // backend/video-generation.js): { provider, status, externalJobId,
-    // clips, error }. provider is the video generation provider that
-    // handled (or attempted) the request; status is 'not_started' |
-    // 'processing' | 'completed' | 'failed'; clips holds whatever per-clip
-    // URLs/IDs the provider actually returned (empty until real data
-    // exists). No paid provider is registered yet, so this can currently
-    // only ever reach 'failed' — never fabricated, and never by itself
-    // enough to complete the job (see finalVideo below and
-    // STAGE_OUTPUT_REQUIREMENTS). Not writable by the conversational agent.
-    videoGeneration: { provider: null, status: 'not_started', externalJobId: null, clips: [], error: null },
-    // The real rendered output video: { url, status, error? }, where status
-    // is 'pending' | 'completed' | 'failed'. No rendering integration exists
-    // yet, so this field has no generation call to populate it and will
-    // always stay 'pending' — that's intentional, not a bug. It exists so
-    // the job cannot be marked COMPLETED (see STAGE_OUTPUT_REQUIREMENTS
-    // below) until a real rendering feature is built and actually produces
-    // one. Not writable by the conversational agent, same as images/
-    // voiceover — nothing may ever fabricate a value here.
+    // Tracks per-scene video clip generation through the provider-
+    // independent video generation layer (see backend/video-generation.js
+    // and backend/video-providers/runway.js): { provider, status, clips,
+    // error }. provider is the video generation provider that handled the
+    // request (e.g. 'runway'); status is 'not_started' | 'processing' |
+    // 'completed' | 'failed' for the job as a whole ('completed' only once
+    // every scene's clip is completed); clips is one entry per scene,
+    // { status, externalJobId, url, error, attempts }, url only ever set
+    // once a real playable clip was retrieved. Not writable by the
+    // conversational agent — only the real generation route populates
+    // this. IMPORTANT: even when every clip is completed, that is many
+    // separate short clips, not one final assembled video — this alone
+    // never produces finalVideo (see below).
+    videoGeneration: { provider: null, status: 'not_started', clips: [], error: null },
+    // The real, final, single playable output video: { url, status,
+    // error? }, where status is 'pending' | 'completed' | 'failed'. No
+    // clip-assembly/stitching integration exists yet — turning the
+    // per-scene clips above (plus voice-over) into one merged MP4 is a
+    // separate, not-yet-built step — so this field currently has no way to
+    // ever be populated and will always stay 'pending'. That's intentional,
+    // not a bug: it exists so the job cannot be marked COMPLETED (see
+    // STAGE_OUTPUT_REQUIREMENTS below) until real assembly is built and
+    // actually produces one. Not writable by the conversational agent, same
+    // as images/voiceover — nothing may ever fabricate a value here.
     finalVideo: { url: null, status: 'pending' },
     subtitles: '',
     music: '',
@@ -257,10 +261,12 @@ const STAGE_OUTPUT_REQUIREMENTS = {
   'SCENE PLANNING': ['scenes', 'characters'],
   'ASSET GENERATION': ['imagePrompts', 'videoPrompts'],
   // A job must have a real, successfully rendered final video before it can
-  // be marked COMPLETED — confirmation alone is not enough. Since no
-  // rendering integration exists yet, finalVideo can never actually reach
-  // 'completed' today, so this correctly keeps every job at READY (blocked,
-  // not falsely finished) until real rendering is built.
+  // be marked COMPLETED — confirmation alone is not enough. Per-scene video
+  // clips can now be generated (see backend/video-generation.js), but
+  // assembling them (plus voice-over) into one final MP4 is a separate,
+  // not-yet-built step, so finalVideo can never actually reach 'completed'
+  // today — this correctly keeps every job at READY (blocked, not falsely
+  // finished) until real assembly is built.
   READY: ['finalVideo'],
 };
 
