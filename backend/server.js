@@ -150,6 +150,23 @@ const TOOLS = [
     },
   },
   {
+    name: 'generateSceneImages',
+    description:
+      'Generate the real scene images for the current video job from its existing imagePrompts and ' +
+      'characters, using the same image-generation backend the rest of this app already uses. Only ' +
+      'call this once imagePrompts (and ideally characters, for visual consistency) have been set via ' +
+      'updateVideoJob — typically during ASSET GENERATION. Any imagePrompt that already has a ' +
+      'completed image is skipped automatically and is never regenerated or charged again. This can ' +
+      'take a little while; let the user know generation is in progress. Only tell the user images ' +
+      'were generated if this tool reports them as completed — report any failures honestly instead ' +
+      'of assuming success.',
+    input_schema: {
+      type: 'object',
+      properties: {},
+      additionalProperties: false,
+    },
+  },
+  {
     name: 'advanceVideoJobStage',
     description:
       'Move the current video production job to its next production stage ' +
@@ -198,6 +215,53 @@ async function executeTool(name, jobId, input) {
     }
     const job = await jobStore.updateJob(jobId, updates);
     return JSON.stringify(job ? summarizeJobForAgent(job) : { error: 'job not found' });
+  }
+
+  if (name === 'generateSceneImages') {
+    const job = await jobStore.getJob(jobId);
+
+    if (!job) {
+      return JSON.stringify({ error: 'job not found' });
+    }
+
+    if (!Array.isArray(job.imagePrompts) || job.imagePrompts.length === 0) {
+      return JSON.stringify({
+        error:
+          'There are no imagePrompts yet to generate images from. Use updateVideoJob to set ' +
+          'imagePrompts first.',
+      });
+    }
+
+    if (!process.env.OPENAI_API_KEY) {
+      return JSON.stringify({
+        error:
+          'Image generation is not configured on the server right now. Tell the user image ' +
+          'generation is temporarily unavailable — do not say images were generated.',
+      });
+    }
+
+    try {
+      // Reuses the exact same image-generation implementation the REST
+      // route already uses (backend/image-generation.js) — no second
+      // image-generation system. That function already skips any prompt
+      // that has a completed entry in existingImages, so an already-
+      // generated scene is never regenerated or charged again.
+      const images = await imageGeneration.generateImagesForPrompts({
+        imagePrompts: job.imagePrompts,
+        characters: job.characters,
+        existingImages: job.images,
+      });
+      const updatedJob = await jobStore.updateJob(jobId, { images });
+      return JSON.stringify(updatedJob ? summarizeJobForAgent(updatedJob) : { error: 'job not found' });
+    } catch (error) {
+      console.error(
+        'Unexpected error generating images (agent tool):',
+        JSON.stringify({ name: error?.name, message: error?.message }, null, 2)
+      );
+      return JSON.stringify({
+        error: 'Image generation failed unexpectedly. Tell the user to try again in a moment.',
+      });
+    }
   }
 
   if (name === 'advanceVideoJobStage') {
@@ -601,4 +665,10 @@ if (require.main === module) {
   });
 }
 
+// executeTool is attached to the exported app (rather than changing the
+// export shape to an object) purely so it can be unit-tested directly —
+// app itself is still the plain Express app everywhere else (local dev,
+// Vercel's serverless runtime, and existing tests that `require('./server')`
+// expecting the listenable app).
 module.exports = app;
+module.exports.executeTool = executeTool;
