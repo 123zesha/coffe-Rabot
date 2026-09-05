@@ -12,6 +12,15 @@ const videoGeneration = require('./video-generation');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
+// TEMPORARY safety cap for live Runway testing: /generate-video refuses to
+// run unless the job has EXACTLY this many video prompts/scenes, so a real
+// test can never accidentally submit more than a couple of paid Runway
+// requests. It never truncates a larger job down to this count — it
+// refuses outright, before any provider call is made (see the check in the
+// /generate-video route below). Remove this cap once live testing beyond
+// a small, fixed scene count is intentionally needed.
+const TEMP_GENERATE_VIDEO_SCENE_CAP = 2;
+
 const client = new Anthropic();
 
 const VIDEO_OPTIONS = fs.readFileSync(
@@ -482,6 +491,20 @@ app.post('/api/jobs/:id/generate-video', async (req, res) => {
 
   if (!Array.isArray(job.videoPrompts) || job.videoPrompts.length === 0) {
     return res.status(400).json({ error: 'job has no videoPrompts to generate video from' });
+  }
+
+  // TEMPORARY safety cap (see TEMP_GENERATE_VIDEO_SCENE_CAP above) — refuse
+  // outright, before any provider call, rather than silently truncating a
+  // larger job down to this count.
+  if (job.videoPrompts.length !== TEMP_GENERATE_VIDEO_SCENE_CAP) {
+    return res.status(400).json({
+      error:
+        `Video generation is temporarily capped at exactly ${TEMP_GENERATE_VIDEO_SCENE_CAP} scenes ` +
+        `for testing. This job has ${job.videoPrompts.length} video prompts/scenes — reduce it to ` +
+        `exactly ${TEMP_GENERATE_VIDEO_SCENE_CAP} before generating video. No Runway request was made.`,
+      videoPromptsCount: job.videoPrompts.length,
+      requiredSceneCount: TEMP_GENERATE_VIDEO_SCENE_CAP,
+    });
   }
 
   if (!Array.isArray(job.images) || job.images.length === 0) {
