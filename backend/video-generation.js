@@ -147,6 +147,27 @@ async function generateClip({ imageDataUri, prompt, durationSeconds, ratio, exis
   return { ...clip, status: 'failed', url: null, error: retrieved.error || 'Video retrieval did not return a playable clip.' };
 }
 
+// Diagnostic logging for a scene's clip failure, so a real production
+// failure (bad promptImage, no Runway credits, invalid/expired API key,
+// content-policy rejection, network error, etc.) is visible in server
+// logs instead of only sitting silently in job.videoGeneration.clips[i].
+// Deliberately logs only scene index, provider name, externalJobId, and
+// the error/status text already produced by generateClip/the provider —
+// never the request body, headers, or image data, so RUNWAYML_API_SECRET
+// (or any other secret) can never end up in this log line.
+function logClipFailure(sceneIndex, provider, clip) {
+  console.error(
+    'Video clip generation failed:',
+    JSON.stringify({
+      scene: sceneIndex + 1,
+      provider: provider.name,
+      status: clip.status,
+      externalJobId: clip.externalJobId,
+      error: clip.error,
+    })
+  );
+}
+
 // Runs generateClip for every scene in order, matching each scene's video
 // prompt to its already-generated image by prompt text (the same lookup
 // convention image-generation.js's own reference logic uses). Mirrors
@@ -178,13 +199,15 @@ async function generateVideoForScenes(
     const existingClip = Array.isArray(existingClips) ? existingClips[i] : null;
 
     if (!sourceImage) {
-      clips.push({
+      const clip = {
         status: 'failed',
         externalJobId: null,
         url: null,
         error: 'No completed scene image is available to generate a video clip from.',
         attempts: (existingClip && existingClip.attempts) || 0,
-      });
+      };
+      logClipFailure(i, provider, clip);
+      clips.push(clip);
       continue;
     }
 
@@ -192,6 +215,9 @@ async function generateVideoForScenes(
       { imageDataUri: sourceImage.url, prompt, durationSeconds, ratio, existingClip },
       provider
     );
+    if (clip.status === 'failed') {
+      logClipFailure(i, provider, clip);
+    }
     clips.push(clip);
   }
 

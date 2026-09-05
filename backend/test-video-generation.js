@@ -5,10 +5,11 @@
 // still-pending/processing result, a hard failure, the "no fake
 // completion" case where a provider claims completion but doesn't
 // actually hand back a playable clip, retry-safe resumption of an
-// already-processing or already-failed clip, and per-scene image
-// matching. Also proves that even when every scene's clip completes,
-// finalVideo is never set — only a real (not-yet-built) assembly step may
-// ever do that. Run with:
+// already-processing or already-failed clip, per-scene image matching,
+// and that a scene failure is logged with its exact error/status and
+// never the API secret. Also proves that even when every scene's clip
+// completes, finalVideo is never set — only a real (not-yet-built)
+// assembly step may ever do that. Run with:
 //   node test-video-generation.js
 // or:
 //   npm run test:video-generation
@@ -231,6 +232,52 @@ async function main() {
     assert.strictEqual(result.clips[0].status, 'failed');
     assert.strictEqual(result.clips[0].url, null);
     assert.ok(result.clips[0].error.includes('image'));
+  });
+
+  await test('a failed scene is logged with its exact error, scene number, and never the API secret', async () => {
+    const provider = fakeProvider({
+      async submitVideoGeneration() {
+        return { status: 'failed', externalJobId: null, clips: [], error: 'Runway API error (HTTP 401: invalid API key)' };
+      },
+    });
+
+    const originalConsoleError = console.error;
+    const logged = [];
+    console.error = (...args) => logged.push(args.join(' '));
+
+    try {
+      await videoGen.generateVideoForScenes(
+        {
+          imagePrompts: ['Scene A', 'Scene B'],
+          videoPrompts: ['Pan across A', 'Pan across B'],
+          images: [
+            { prompt: 'Scene A', url: 'data:image/png;base64,aaa', status: 'completed' },
+            { prompt: 'Scene B', url: 'data:image/png;base64,bbb', status: 'completed' },
+          ],
+          existingClips: [],
+        },
+        provider
+      );
+    } finally {
+      console.error = originalConsoleError;
+    }
+
+    const failureLogs = logged.filter((line) => line.includes('Video clip generation failed'));
+    assert.strictEqual(failureLogs.length, 2, 'expected one failure log line per failed scene');
+
+    const scene1Log = JSON.parse(failureLogs[0].replace('Video clip generation failed: ', ''));
+    const scene2Log = JSON.parse(failureLogs[1].replace('Video clip generation failed: ', ''));
+
+    assert.strictEqual(scene1Log.scene, 1);
+    assert.strictEqual(scene2Log.scene, 2);
+    assert.strictEqual(scene1Log.provider, 'fake');
+    assert.strictEqual(scene1Log.status, 'failed');
+    assert.strictEqual(scene1Log.error, 'Runway API error (HTTP 401: invalid API key)');
+
+    const allLogText = logged.join(' ');
+    assert.ok(!allLogText.includes('Bearer'), 'log output must never contain an Authorization header');
+    assert.ok(!allLogText.includes('RUNWAYML_API_SECRET'), 'log output must never contain the secret env var value');
+    assert.ok(!allLogText.includes('data:image/png;base64,'), 'log output must never contain raw image data');
   });
 
   await test('every scene clip completing still never sets finalVideo — job stays blocked at READY', async () => {
