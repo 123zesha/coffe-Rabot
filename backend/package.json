@@ -11,7 +11,8 @@
     "test:video-generation": "node test-video-generation.js",
     "test:runway-provider": "node test-runway-provider.js",
     "test:generate-video-scene-cap": "node test-generate-video-scene-cap.js",
-    "test:generate-scene-images-tool": "node test-generate-scene-images-tool.js"
+    "test:generate-scene-images-tool": "node test-generate-scene-images-tool.js",
+    "test:image-generation-latency-fix": "node test-image-generation-latency-fix.js"
   },
   "keywords": [],
   "author": "",
