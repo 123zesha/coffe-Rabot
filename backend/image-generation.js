@@ -112,9 +112,18 @@ async function generateSceneImage({ prompt, characterContext, referenceDataUri }
   let response;
   if (referenceDataUri) {
     const referenceFile = await dataUriToFile(referenceDataUri);
+    // A single reference image must be passed as-is, not wrapped in an
+    // array. The SDK's TypeScript types accept image: Uploadable[], but the
+    // real OpenAI API rejects an array with "400 Invalid type for 'image':
+    // expected a file, but got an array instead" (a documented mismatch
+    // between the SDK types and actual API behavior). Since every scene
+    // after the first always takes this branch (it references the
+    // previous scene's image for character consistency), the array form
+    // deterministically broke image generation for any job with more than
+    // one scene.
     response = await client.images.edit({
       model: IMAGE_MODEL,
-      image: [referenceFile],
+      image: referenceFile,
       prompt: fullPrompt,
       size: IMAGE_SIZE,
       quality: IMAGE_QUALITY,
