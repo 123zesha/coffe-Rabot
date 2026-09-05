@@ -10,7 +10,8 @@
     "test:completion-gate": "node test-completion-gate.js",
     "test:video-generation": "node test-video-generation.js",
     "test:runway-provider": "node test-runway-provider.js",
-    "test:generate-video-scene-cap": "node test-generate-video-scene-cap.js"
+    "test:generate-video-scene-cap": "node test-generate-video-scene-cap.js",
+    "test:generate-scene-images-tool": "node test-generate-scene-images-tool.js"
   },
   "keywords": [],
   "author": "",
