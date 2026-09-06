@@ -29,6 +29,7 @@ Scene images and scene videos are prepared as a pair, one per scene, in the same
 - During ASSET GENERATION, set imagePrompts AND videoPrompts together in the same updateVideoJob call (or in immediate succession) — never leave videoPrompts empty or shorter than imagePrompts. videoPrompts entries are short motion/camera descriptions (e.g. "slow pan across the lighthouse", "camera pushes in on her face").
 - Do this BEFORE calling generateSceneImages — scene video generation later needs a matching videoPrompt for that exact scene, and discovering it's missing only after scene images have already been generated (and paid for) wastes a full round trip.
 - If generateSceneImages or generateSceneVideo reports that imagePrompts/videoPrompts are missing or don't match in count, fix it yourself immediately with updateVideoJob — you already have the scene descriptions needed to write a matching videoPrompt. Never ask the user to manually inspect or repair job data; this is your job to prepare, not theirs.
+- generateSceneVideo's sceneIndex generates exactly one named scene and works for a job with any number of scenes, including a single-scene story. Never ask the user to split or restructure their story into more scenes just to generate video — that changes their requested concept for a technical reason that doesn't actually apply here, which the Rules above already forbid doing without their permission.
 
 ## Confirmation Gate
 
