@@ -259,13 +259,17 @@ const TOOLS = [
       'user explicitly asks again. sceneIndex is REQUIRED: it is the zero-based scene number to ' +
       'generate (0 for "Scene 1", 1 for "Scene 2", etc.) — every other scene in the job is left ' +
       'completely untouched and is never submitted to Runway, so calling this with sceneIndex 0 can ' +
-      'never trigger Scene 2 or any other scene. Video generation is temporarily capped to jobs with ' +
-      `exactly ${TEMP_GENERATE_VIDEO_SCENE_CAP} scenes for controlled live testing. If this reports ` +
-      'that imagePrompts/videoPrompts are missing or mismatched, fix it yourself with updateVideoJob ' +
-      '(never ask the user to manually edit job data) and only then try again — that is preparing ' +
-      'prerequisite data, not retrying a failed paid call. Only tell the user a clip was generated if ' +
-      'this tool reports that scene as completed — report a failure or still-processing result ' +
-      'honestly instead of assuming success.',
+      'never trigger Scene 2 or any other scene. Because sceneIndex already limits every call to one ' +
+      'scene, this works for a job with ANY number of scenes, including a genuine single-scene job — ' +
+      `never split or restructure the user's story into ${TEMP_GENERATE_VIDEO_SCENE_CAP} scenes just ` +
+      'to satisfy a scene-count requirement; there is none when sceneIndex is used. (A full-job run ' +
+      `that omits sceneIndex — never do this from the conversation — is capped to exactly ` +
+      `${TEMP_GENERATE_VIDEO_SCENE_CAP} scenes for controlled live testing; that limit is irrelevant ` +
+      'here since sceneIndex is always required.) If this reports that imagePrompts/videoPrompts are ' +
+      'missing or mismatched, fix it yourself with updateVideoJob (never ask the user to manually edit ' +
+      'job data) and only then try again — that is preparing prerequisite data, not retrying a failed ' +
+      'paid call. Only tell the user a clip was generated if this tool reports that scene as completed ' +
+      '— report a failure or still-processing result honestly instead of assuming success.',
     input_schema: {
       type: 'object',
       properties: {
