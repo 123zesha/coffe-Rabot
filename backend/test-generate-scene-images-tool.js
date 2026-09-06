@@ -74,6 +74,7 @@ async function main() {
     const job = await jobStore.createJob();
     await jobStore.updateJob(job.id, {
       imagePrompts: ['Scene A: a lighthouse at dusk', 'Scene B: a boat at sea'],
+      videoPrompts: ['Slow pan across the lighthouse', 'Camera follows the boat'],
       characters: ['Mira'],
     });
 
@@ -94,6 +95,7 @@ async function main() {
     const alreadyDoneUrl = 'data:image/png;base64,alreadydonepreviously';
     await jobStore.updateJob(job.id, {
       imagePrompts: ['Scene A: already generated', 'Scene B: not generated yet'],
+      videoPrompts: ['Pan across scene A', 'Pan across scene B'],
       characters: ['Mira'],
       images: [{ prompt: 'Scene A: already generated', url: alreadyDoneUrl, status: 'completed' }],
     });
@@ -124,9 +126,49 @@ async function main() {
     assert.ok(result.error.toLowerCase().includes('imageprompts'));
   });
 
+  // Regression test for the real production failure: a job reached ASSET
+  // GENERATION with imagePrompts set (and, live, a real scene image already
+  // generated) but videoPrompts left empty. Scene video generation later
+  // failed with "job has no videoPrompts to generate video from" — safe
+  // (zero Runway calls) but discovered only after the image had already
+  // been generated and paid for. The root-cause fix checks this pairing
+  // BEFORE the image call too, so the very first paid step refuses until
+  // both are prepared, and tells the Agent exactly how to fix it itself.
+  await test('generateSceneImages refuses — before any OpenAI call — when imagePrompts is set but videoPrompts is empty', async () => {
+    const job = await jobStore.createJob();
+    await jobStore.updateJob(job.id, { imagePrompts: ['Scene 1: a lighthouse at dusk'] });
+
+    mockOpenAiRequestCount = 0;
+    const result = JSON.parse(await app.executeTool('generateSceneImages', job.id, {}));
+
+    assert.strictEqual(mockOpenAiRequestCount, 0, 'no OpenAI call may happen while videoPrompts is missing');
+    assert.ok(result.error.toLowerCase().includes('videoprompts'));
+    assert.ok(result.error.toLowerCase().includes('updatevideojob'), 'the error must tell the Agent how to fix it itself');
+
+    const persisted = await jobStore.getJob(job.id);
+    assert.strictEqual(persisted.images.length, 0, 'no image may be generated or persisted');
+  });
+
+  await test('generateSceneImages refuses — before any OpenAI call — when imagePrompts and videoPrompts have different lengths', async () => {
+    const job = await jobStore.createJob();
+    await jobStore.updateJob(job.id, {
+      imagePrompts: ['Scene 1', 'Scene 2'],
+      videoPrompts: ['Pan across Scene 1'],
+    });
+
+    mockOpenAiRequestCount = 0;
+    const result = JSON.parse(await app.executeTool('generateSceneImages', job.id, {}));
+
+    assert.strictEqual(mockOpenAiRequestCount, 0, 'a scene-count mismatch must never reach OpenAI');
+    assert.ok(result.error.includes('2') && result.error.includes('1'), 'the error should state both counts');
+
+    const persisted = await jobStore.getJob(job.id);
+    assert.strictEqual(persisted.images.length, 0);
+  });
+
   await test('generateSceneImages returns a clear error and makes no call when OPENAI_API_KEY is missing', async () => {
     const job = await jobStore.createJob();
-    await jobStore.updateJob(job.id, { imagePrompts: ['Scene A'] });
+    await jobStore.updateJob(job.id, { imagePrompts: ['Scene A'], videoPrompts: ['Pan across Scene A'] });
 
     const originalKey = process.env.OPENAI_API_KEY;
     delete process.env.OPENAI_API_KEY;

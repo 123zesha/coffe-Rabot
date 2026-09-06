@@ -209,6 +209,27 @@ async function main() {
     assert.strictEqual(persisted.videoGeneration.clips[0].attempts, 1);
   });
 
+  // Regression test for the real production failure: Scene 1's image was
+  // generated and persisted successfully, but videoPrompts had never been
+  // set, so generateSceneVideo failed with "job has no videoPrompts to
+  // generate video from" — safe (zero Runway calls) but only discoverable
+  // after the image spend had already happened. The shared root-cause
+  // check (findScenePromptMismatch) now also guards this tool directly.
+  await test('generateSceneVideo refuses — before any Runway call — when videoPrompts is empty even though imagePrompts/images exist', async () => {
+    const job = await jobStore.createJob();
+    await jobStore.updateJob(job.id, {
+      imagePrompts: ['Scene 1'],
+      images: [completedImage('Scene 1', 'a')],
+    });
+
+    submittedPrompts = [];
+    const result = JSON.parse(await app.executeTool('generateSceneVideo', job.id, { sceneIndex: 0 }));
+
+    assert.strictEqual(submittedPrompts.length, 0, 'no Runway call may happen while videoPrompts is missing');
+    assert.ok(result.error.toLowerCase().includes('videoprompts'));
+    assert.ok(result.error.toLowerCase().includes('updatevideojob'), 'the error must tell the Agent how to fix it itself');
+  });
+
   await test('generateSceneVideo returns a clear error and makes no call when there are no completed images yet', async () => {
     const job = await jobStore.createJob();
     await jobStore.updateJob(job.id, {
