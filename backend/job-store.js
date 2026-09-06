@@ -11,13 +11,37 @@
 // or a cold start handles the next request, since the deployed filesystem
 // is read-only and process memory isn't shared. Set the Redis environment
 // variables in production to avoid that.
+//
+// Redis storage shape: each job is stored under its OWN key
+// (video-job:<id>), with a small Set (video-jobs:index) of job ids used
+// only to enumerate jobs. This is deliberate, not incidental — job records
+// embed real generated media as inline base64 data URIs (images.*.url,
+// voiceover.url), which can individually run to multiple megabytes. Storing
+// every job the app has ever created together under a single key (as an
+// earlier version of this module did) means that single value grows
+// without bound for the lifetime of the deployment, and EVERY read/write of
+// ANY job re-transfers the entire accumulated history of every job's media.
+// Hosted Redis REST APIs (Upstash included) enforce a maximum payload size
+// per request; once that combined blob — or even one large image within
+// it — approaches that limit, the write throws, silently discarding a
+// result that was already generated (and already paid for) a moment
+// earlier, and — because everything shares one key — can also block
+// reading or saving completely unrelated jobs. Per-job keys bound each
+// read/write to that one job's own data, so this failure mode cannot arise
+// from unrelated jobs, and cannot get steadily worse the more the app has
+// been used.
 
 const fs = require('fs');
 const path = require('path');
 const { Redis } = require('@upstash/redis');
 
 const JOBS_FILE = path.resolve(__dirname, '..', 'data', 'jobs.json');
-const JOBS_KEY = 'video-jobs';
+const JOB_KEY_PREFIX = 'video-job:';
+const JOBS_INDEX_KEY = 'video-jobs:index';
+
+function jobKey(id) {
+  return `${JOB_KEY_PREFIX}${id}`;
+}
 
 // Vercel sets VERCEL=1 in every deployed serverless invocation (production
 // and preview alike). Those filesystems are read-only, so don't even
@@ -74,12 +98,12 @@ const JOB_FIELDS = [
   'confirmed',
 ];
 
+// Local (no-Redis) fallback only, from here down to saveJobs — the whole
+// job list really is just one small JSON file on disk, so there is no
+// per-request payload-size concern to design around locally. The Redis
+// path never calls these two functions; see redisGetJob/redisListJobs/
+// redisSaveJob/redisCreateJob below.
 async function loadJobs() {
-  if (redis) {
-    const jobs = await redis.get(JOBS_KEY);
-    return Array.isArray(jobs) ? jobs : [];
-  }
-
   if (IS_SERVERLESS_PRODUCTION && !loggedMissingRedisWarning) {
     loggedMissingRedisWarning = true;
     console.error(
@@ -116,11 +140,6 @@ async function loadJobs() {
 }
 
 async function saveJobs(jobs) {
-  if (redis) {
-    await redis.set(JOBS_KEY, jobs);
-    return;
-  }
-
   cachedJobs = jobs;
 
   if (IS_SERVERLESS_PRODUCTION) {
@@ -138,6 +157,46 @@ async function saveJobs(jobs) {
     // fail for other reasons (permissions, missing directory, etc.).
     console.error('Could not write data/jobs.json; continuing in-memory only.');
   }
+}
+
+// --- Redis-backed job access. Each job lives under its own key
+// (video-job:<id>); video-jobs:index is a Redis Set of job ids used only to
+// enumerate jobs, and is never used to fetch job data directly. Reading or
+// writing one job therefore only ever transfers that one job's own data —
+// never every job the app has ever created, and never any other job's data.
+
+async function redisGetJob(id) {
+  const job = await redis.get(jobKey(id));
+  return job || null;
+}
+
+async function redisListJobs() {
+  const ids = await redis.smembers(JOBS_INDEX_KEY);
+  if (!Array.isArray(ids) || ids.length === 0) {
+    return [];
+  }
+  const jobs = await Promise.all(ids.map((id) => redisGetJob(id)));
+  return jobs.filter((job) => job !== null);
+}
+
+async function redisSaveJob(job) {
+  await redis.set(jobKey(job.id), job);
+}
+
+async function redisCreateJob() {
+  const existingIds = await redis.smembers(JOBS_INDEX_KEY);
+  const nextId =
+    (Array.isArray(existingIds) ? existingIds : []).reduce((max, id) => Math.max(max, Number(id) || 0), 0) + 1;
+  const job = createDefaultJob(String(nextId));
+
+  // Register the id first: if the job write below ever fails, the worst
+  // case is a dangling id that redisListJobs already filters out (getJob
+  // for that id returns null), never a job whose data exists but is
+  // unreachable.
+  await redis.sadd(JOBS_INDEX_KEY, job.id);
+  await redisSaveJob(job);
+
+  return job;
 }
 
 function createDefaultJob(id) {
@@ -207,34 +266,7 @@ function createDefaultJob(id) {
   };
 }
 
-async function listJobs() {
-  return loadJobs();
-}
-
-async function createJob() {
-  const jobs = await loadJobs();
-  const nextId = jobs.reduce((max, job) => Math.max(max, Number(job.id) || 0), 0) + 1;
-  const job = createDefaultJob(String(nextId));
-
-  jobs.push(job);
-  await saveJobs(jobs);
-
-  return job;
-}
-
-async function getJob(id) {
-  const jobs = await loadJobs();
-  return jobs.find((job) => job.id === id) || null;
-}
-
-async function updateJob(id, updates) {
-  const jobs = await loadJobs();
-  const job = jobs.find((j) => j.id === id);
-
-  if (!job) {
-    return null;
-  }
-
+function applyUpdates(job, updates) {
   for (const field of JOB_FIELDS) {
     if (!Object.prototype.hasOwnProperty.call(updates, field)) {
       continue;
@@ -246,7 +278,58 @@ async function updateJob(id, updates) {
 
     job[field] = updates[field];
   }
+}
 
+async function listJobs() {
+  if (redis) {
+    return redisListJobs();
+  }
+  return loadJobs();
+}
+
+async function createJob() {
+  if (redis) {
+    return redisCreateJob();
+  }
+
+  const jobs = await loadJobs();
+  const nextId = jobs.reduce((max, job) => Math.max(max, Number(job.id) || 0), 0) + 1;
+  const job = createDefaultJob(String(nextId));
+
+  jobs.push(job);
+  await saveJobs(jobs);
+
+  return job;
+}
+
+async function getJob(id) {
+  if (redis) {
+    return redisGetJob(id);
+  }
+
+  const jobs = await loadJobs();
+  return jobs.find((job) => job.id === id) || null;
+}
+
+async function updateJob(id, updates) {
+  if (redis) {
+    const job = await redisGetJob(id);
+    if (!job) {
+      return null;
+    }
+    applyUpdates(job, updates);
+    await redisSaveJob(job);
+    return job;
+  }
+
+  const jobs = await loadJobs();
+  const job = jobs.find((j) => j.id === id);
+
+  if (!job) {
+    return null;
+  }
+
+  applyUpdates(job, updates);
   await saveJobs(jobs);
 
   return job;
@@ -312,14 +395,11 @@ function getMissingOutputs(job) {
   return required.filter((field) => !hasRequiredOutput(job, field));
 }
 
-async function advanceJob(id) {
-  const jobs = await loadJobs();
-  const job = jobs.find((j) => j.id === id);
-
-  if (!job) {
-    return { error: 'not_found' };
-  }
-
+// Computes the stage transition for `job`, mutating job.status in place
+// only on success (no error). Shared by both the Redis and local-file
+// paths of advanceJob so the actual persistence call is the only thing
+// that differs between them.
+function computeAdvance(job) {
   const currentIndex = STAGES.indexOf(job.status);
 
   if (currentIndex === -1 || currentIndex === STAGES.length - 1) {
@@ -339,9 +419,34 @@ async function advanceJob(id) {
   }
 
   job.status = nextStage;
-  await saveJobs(jobs);
-
   return { job };
+}
+
+async function advanceJob(id) {
+  if (redis) {
+    const job = await redisGetJob(id);
+    if (!job) {
+      return { error: 'not_found' };
+    }
+    const result = computeAdvance(job);
+    if (!result.error) {
+      await redisSaveJob(job);
+    }
+    return result;
+  }
+
+  const jobs = await loadJobs();
+  const job = jobs.find((j) => j.id === id);
+
+  if (!job) {
+    return { error: 'not_found' };
+  }
+
+  const result = computeAdvance(job);
+  if (!result.error) {
+    await saveJobs(jobs);
+  }
+  return result;
 }
 
 module.exports = {
