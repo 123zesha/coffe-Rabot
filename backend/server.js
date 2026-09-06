@@ -27,6 +27,46 @@ const PORT = process.env.PORT || 3000;
 // is intentionally needed for full-job runs.
 const TEMP_GENERATE_VIDEO_SCENE_CAP = 2;
 
+// imagePrompts[i] and videoPrompts[i] are meant to describe the SAME scene
+// — generateVideoForScenes (backend/video-generation.js) already assumes
+// this positional pairing when it matches a video prompt to its scene
+// image. Nothing previously enforced that pairing before either paid call,
+// so a job could reach ASSET GENERATION with imagePrompts set (and real,
+// paid scene images already generated) while videoPrompts stayed empty —
+// discovered only once video generation was attempted, after the image
+// spend had already happened. Checking this BEFORE the first paid call
+// (image generation) means a missing/mismatched videoPrompts is caught
+// before any money is spent, not after — and the returned message is
+// actionable enough (which tool, which field, what shape) that the Agent
+// can call updateVideoJob and fix it itself, without asking the user to
+// manually repair job data.
+function findScenePromptMismatch(job) {
+  const imageCount = Array.isArray(job.imagePrompts) ? job.imagePrompts.length : 0;
+  const videoCount = Array.isArray(job.videoPrompts) ? job.videoPrompts.length : 0;
+
+  if (imageCount === 0) {
+    return 'There are no imagePrompts yet. Use updateVideoJob to set imagePrompts first.';
+  }
+
+  if (videoCount === 0) {
+    return (
+      `There are ${imageCount} imagePrompts but 0 videoPrompts. Use updateVideoJob to set ` +
+      'videoPrompts with one motion-description entry per imagePrompts entry, in the same scene ' +
+      'order, before generating any scene images or video.'
+    );
+  }
+
+  if (videoCount !== imageCount) {
+    return (
+      `imagePrompts has ${imageCount} entries but videoPrompts has ${videoCount}. Use ` +
+      'updateVideoJob to make videoPrompts match imagePrompts one-to-one (same length, same scene ' +
+      'order) before generating any scene images or video.'
+    );
+  }
+
+  return null;
+}
+
 const client = new Anthropic();
 
 const VIDEO_OPTIONS = fs.readFileSync(
@@ -159,13 +199,16 @@ const TOOLS = [
     name: 'generateSceneImages',
     description:
       'Generate the real scene images for the current video job from its existing imagePrompts and ' +
-      'characters, using the same image-generation backend the rest of this app already uses. Only ' +
-      'call this once imagePrompts (and ideally characters, for visual consistency) have been set via ' +
-      'updateVideoJob — typically during ASSET GENERATION. Any imagePrompt that already has a ' +
-      'completed image is skipped automatically and is never regenerated or charged again. This can ' +
-      'take a little while; let the user know generation is in progress. Only tell the user images ' +
-      'were generated if this tool reports them as completed — report any failures honestly instead ' +
-      'of assuming success.',
+      'characters, using the same image-generation backend the rest of this app already uses. Before ' +
+      'calling this, set BOTH imagePrompts AND videoPrompts via updateVideoJob together — one ' +
+      'videoPrompt (a short motion/camera description) per imagePrompt, in the same scene order — ' +
+      'even though this tool only generates images. Scene video generation later needs a matching ' +
+      'videoPrompt for the same scene, and preparing it only after images already exist wastes a full ' +
+      'round trip; this tool refuses to run at all until both are set with matching lengths. Any ' +
+      'imagePrompt that already has a completed image is skipped automatically and is never ' +
+      'regenerated or charged again. This can take a little while; let the user know generation is in ' +
+      'progress. Only tell the user images were generated if this tool reports them as completed — ' +
+      'report any failures honestly instead of assuming success.',
     input_schema: {
       type: 'object',
       properties: {},
@@ -217,9 +260,12 @@ const TOOLS = [
       'generate (0 for "Scene 1", 1 for "Scene 2", etc.) — every other scene in the job is left ' +
       'completely untouched and is never submitted to Runway, so calling this with sceneIndex 0 can ' +
       'never trigger Scene 2 or any other scene. Video generation is temporarily capped to jobs with ' +
-      `exactly ${TEMP_GENERATE_VIDEO_SCENE_CAP} scenes for controlled live testing. Only tell the ` +
-      'user a clip was generated if this tool reports that scene as completed — report a failure or ' +
-      'still-processing result honestly instead of assuming success.',
+      `exactly ${TEMP_GENERATE_VIDEO_SCENE_CAP} scenes for controlled live testing. If this reports ` +
+      'that imagePrompts/videoPrompts are missing or mismatched, fix it yourself with updateVideoJob ' +
+      '(never ask the user to manually edit job data) and only then try again — that is preparing ' +
+      'prerequisite data, not retrying a failed paid call. Only tell the user a clip was generated if ' +
+      'this tool reports that scene as completed — report a failure or still-processing result ' +
+      'honestly instead of assuming success.',
     input_schema: {
       type: 'object',
       properties: {
@@ -254,12 +300,9 @@ async function executeTool(name, jobId, input) {
       return JSON.stringify({ error: 'job not found' });
     }
 
-    if (!Array.isArray(job.imagePrompts) || job.imagePrompts.length === 0) {
-      return JSON.stringify({
-        error:
-          'There are no imagePrompts yet to generate images from. Use updateVideoJob to set ' +
-          'imagePrompts first.',
-      });
+    const promptMismatch = findScenePromptMismatch(job);
+    if (promptMismatch) {
+      return JSON.stringify({ error: promptMismatch });
     }
 
     if (!process.env.OPENAI_API_KEY) {
@@ -344,8 +387,9 @@ async function executeTool(name, jobId, input) {
       return JSON.stringify({ error: 'job not found' });
     }
 
-    if (!Array.isArray(job.videoPrompts) || job.videoPrompts.length === 0) {
-      return JSON.stringify({ error: 'job has no videoPrompts to generate video from' });
+    const promptMismatch = findScenePromptMismatch(job);
+    if (promptMismatch) {
+      return JSON.stringify({ error: promptMismatch });
     }
 
     const sceneIndex = input && input.sceneIndex;
@@ -616,8 +660,9 @@ app.post('/api/jobs/:id/generate-images', async (req, res) => {
     return res.status(404).json({ error: 'job not found' });
   }
 
-  if (!Array.isArray(job.imagePrompts) || job.imagePrompts.length === 0) {
-    return res.status(400).json({ error: 'job has no imagePrompts to generate images from' });
+  const promptMismatch = findScenePromptMismatch(job);
+  if (promptMismatch) {
+    return res.status(400).json({ error: promptMismatch });
   }
 
   if (!process.env.OPENAI_API_KEY) {
@@ -691,8 +736,9 @@ app.post('/api/jobs/:id/generate-video', async (req, res) => {
     return res.status(404).json({ error: 'job not found' });
   }
 
-  if (!Array.isArray(job.videoPrompts) || job.videoPrompts.length === 0) {
-    return res.status(400).json({ error: 'job has no videoPrompts to generate video from' });
+  const promptMismatch = findScenePromptMismatch(job);
+  if (promptMismatch) {
+    return res.status(400).json({ error: promptMismatch });
   }
 
   // Optional: restrict this run to exactly one scene, by its zero-based
