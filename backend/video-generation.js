@@ -176,6 +176,15 @@ function logClipFailure(sceneIndex, provider, clip) {
 // A scene with no completed source image yet is never sent to the
 // provider — it's recorded as a failed clip with a clear reason, never
 // silently skipped or fabricated.
+//
+// `sceneIndex`, when given, restricts this run to that single zero-based
+// scene index — every other scene is left completely untouched: no
+// provider call, no state change, its existing clip (or an unstarted
+// placeholder if it has none yet) is carried through as-is. This lets a
+// single, bounded, real test generate Scene 1 only, with Scene 2 (or any
+// other scene) structurally guaranteed to never be submitted. Omitting
+// sceneIndex (the default) processes every scene, unchanged from the
+// original behavior.
 async function generateVideoForScenes(
   {
     imagePrompts,
@@ -184,6 +193,7 @@ async function generateVideoForScenes(
     existingClips,
     durationSeconds = DEFAULT_CLIP_DURATION_SECONDS,
     ratio = DEFAULT_ASPECT_RATIO,
+    sceneIndex = null,
   },
   provider = getProvider()
 ) {
@@ -191,12 +201,20 @@ async function generateVideoForScenes(
   const clips = [];
 
   for (let i = 0; i < scenesCount; i++) {
+    const existingClip = Array.isArray(existingClips) ? existingClips[i] : null;
+
+    if (sceneIndex !== null && i !== sceneIndex) {
+      clips.push(
+        existingClip || { status: 'not_started', externalJobId: null, url: null, error: null, attempts: 0 }
+      );
+      continue;
+    }
+
     const prompt = videoPrompts[i];
     const imagePrompt = Array.isArray(imagePrompts) ? imagePrompts[i] : undefined;
     const sourceImage = Array.isArray(images)
       ? images.find((image) => image && image.prompt === imagePrompt && image.status === 'completed')
       : null;
-    const existingClip = Array.isArray(existingClips) ? existingClips[i] : null;
 
     if (!sourceImage) {
       const clip = {

@@ -571,6 +571,23 @@ app.post('/api/jobs/:id/generate-video', async (req, res) => {
     });
   }
 
+  // Optional: restrict this run to exactly one scene, by its zero-based
+  // index, e.g. so a single, bounded, real test can generate Scene 1 only
+  // — every other scene (Scene 2 included) is guaranteed to never be
+  // submitted to the provider for this call. Omitting sceneIndex generates
+  // every scene, unchanged from existing behavior.
+  let sceneIndex = null;
+  if (req.body && req.body.sceneIndex !== undefined) {
+    sceneIndex = req.body.sceneIndex;
+    if (!Number.isInteger(sceneIndex) || sceneIndex < 0 || sceneIndex >= job.videoPrompts.length) {
+      return res.status(400).json({
+        error:
+          `sceneIndex must be an integer between 0 and ${job.videoPrompts.length - 1} for this job. ` +
+          'No Runway request was made.',
+      });
+    }
+  }
+
   if (!Array.isArray(job.images) || job.images.length === 0) {
     return res.status(400).json({
       error: 'job has no generated scene images yet — generate images before generating video',
@@ -592,11 +609,16 @@ app.post('/api/jobs/:id/generate-video', async (req, res) => {
       videoPrompts: job.videoPrompts,
       images: job.images,
       existingClips,
+      sceneIndex,
     });
 
     const allCompleted = result.clips.length > 0 && result.clips.every((clip) => clip.status === 'completed');
     const anyProcessing = result.clips.some((clip) => clip.status === 'processing');
-    const overallStatus = allCompleted ? 'completed' : anyProcessing ? 'processing' : 'failed';
+    const anyFailed = result.clips.some((clip) => clip.status === 'failed');
+    // A scene left untouched by a sceneIndex-restricted run stays
+    // 'not_started' — that must not be reported as an overall 'failed'
+    // status, since it was never submitted at all.
+    const overallStatus = allCompleted ? 'completed' : anyProcessing ? 'processing' : anyFailed ? 'failed' : 'not_started';
 
     const videoGenerationField = {
       provider: activeProvider.name,
