@@ -211,6 +211,70 @@
     }
   }
 
+  // --- Resume an existing job after a page refresh ---
+  // jobId survives a refresh (it's in localStorage), and the job's real
+  // data survives in the backend regardless — but conversationHistory and
+  // the visible chat transcript are plain in-memory/DOM state, never
+  // persisted anywhere, so a refresh always starts both empty. That made
+  // an existing job look "cleared" even though nothing was lost or
+  // regenerated. This reads the job back (GET /api/jobs/:id — the same
+  // read-only route the voice-over card already uses; no paid API call)
+  // and posts one factual summary bubble from its real fields, so
+  // resuming is visible instead of the chat window silently starting
+  // blank. It does not reconstruct the prior message-by-message chat
+  // transcript (that was never stored) or trigger any generation.
+  function describeJobProgress(job) {
+    const parts = [];
+
+    if (job.script && job.script.trim()) {
+      parts.push('a script');
+    }
+    if (Array.isArray(job.scenes) && job.scenes.length > 0) {
+      parts.push(`${job.scenes.length} planned scene(s)`);
+    }
+    if (Array.isArray(job.imagePrompts) && job.imagePrompts.length > 0) {
+      const completedImages = Array.isArray(job.images)
+        ? job.images.filter((image) => image && image.status === 'completed').length
+        : 0;
+      parts.push(`${completedImages} of ${job.imagePrompts.length} scene image(s) generated`);
+    }
+    if (Array.isArray(job.videoPrompts) && job.videoPrompts.length > 0) {
+      parts.push(`${job.videoPrompts.length} scene video prompt(s) set`);
+    }
+    if (job.videoGeneration && job.videoGeneration.status && job.videoGeneration.status !== 'not_started') {
+      const completedClips = Array.isArray(job.videoGeneration.clips)
+        ? job.videoGeneration.clips.filter((clip) => clip && clip.status === 'completed').length
+        : 0;
+      parts.push(`${completedClips} of ${job.videoGeneration.clips.length} scene video clip(s) generated`);
+    }
+    if (job.voiceover && job.voiceover.status === 'completed') {
+      parts.push('a generated voice-over');
+    }
+
+    return parts;
+  }
+
+  function buildResumeSummary(job) {
+    const stage = job.status || 'NEW';
+    const progress = describeJobProgress(job);
+
+    if (progress.length === 0) {
+      return `Welcome back — resuming your existing job (stage: ${stage}). Nothing has been generated yet.`;
+    }
+
+    return `Welcome back — resuming your existing job (stage: ${stage}). So far it has: ${progress.join(', ')}. Nothing was lost or regenerated — just tell me what you'd like to do next.`;
+  }
+
+  async function restoreExistingJob() {
+    if (!jobId) {
+      return;
+    }
+    const job = await fetchCurrentJob();
+    if (job) {
+      addMessage(buildResumeSummary(job), 'bot');
+    }
+  }
+
   function renderVoiceoverCard(job) {
     const hasScript = Boolean(job && typeof job.script === 'string' && job.script.trim().length > 0);
 
@@ -280,5 +344,6 @@
     }
   });
 
+  restoreExistingJob();
   refreshVoiceoverCard();
 })();
