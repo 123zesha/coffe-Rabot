@@ -12,13 +12,19 @@ const videoGeneration = require('./video-generation');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// TEMPORARY safety cap for live Runway testing: /generate-video refuses to
-// run unless the job has EXACTLY this many video prompts/scenes, so a real
-// test can never accidentally submit more than a couple of paid Runway
-// requests. It never truncates a larger job down to this count — it
-// refuses outright, before any provider call is made (see the check in the
-// /generate-video route below). Remove this cap once live testing beyond
-// a small, fixed scene count is intentionally needed.
+// TEMPORARY safety cap for live Runway testing: when a /generate-video (or
+// generateSceneVideo Agent tool) call does NOT specify a sceneIndex — i.e.
+// it would submit every scene in the job at once — the job must have
+// EXACTLY this many video prompts/scenes, so a real full-job test can never
+// accidentally submit more than a couple of paid Runway requests in one
+// call. It never truncates a larger job down to this count — it refuses
+// outright, before any provider call is made. This cap does NOT apply when
+// sceneIndex is given: selecting one explicit scene already bounds that
+// call to exactly one paid request no matter how many scenes the job has,
+// so a genuine single-scene job (or any job size) can generate one
+// specific scene without needing a fake extra scene just to satisfy this
+// cap. Remove this cap once live testing beyond a small, fixed scene count
+// is intentionally needed for full-job runs.
 const TEMP_GENERATE_VIDEO_SCENE_CAP = 2;
 
 const client = new Anthropic();
@@ -342,18 +348,6 @@ async function executeTool(name, jobId, input) {
       return JSON.stringify({ error: 'job has no videoPrompts to generate video from' });
     }
 
-    // Same TEMPORARY safety cap as POST /api/jobs/:id/generate-video (see
-    // TEMP_GENERATE_VIDEO_SCENE_CAP above) — the Agent must never be able
-    // to bypass it, so it is enforced here too, before any provider call.
-    if (job.videoPrompts.length !== TEMP_GENERATE_VIDEO_SCENE_CAP) {
-      return JSON.stringify({
-        error:
-          `Video generation is temporarily capped at exactly ${TEMP_GENERATE_VIDEO_SCENE_CAP} scenes ` +
-          `for testing. This job has ${job.videoPrompts.length} video prompts/scenes. No Runway ` +
-          'request was made.',
-      });
-    }
-
     const sceneIndex = input && input.sceneIndex;
 
     if (!Number.isInteger(sceneIndex) || sceneIndex < 0 || sceneIndex >= job.videoPrompts.length) {
@@ -363,6 +357,14 @@ async function executeTool(name, jobId, input) {
           'No Runway request was made.',
       });
     }
+
+    // The TEMPORARY safety cap on POST /api/jobs/:id/generate-video (see
+    // TEMP_GENERATE_VIDEO_SCENE_CAP above) exists to bound a full-job run
+    // (no sceneIndex) to a couple of paid requests at once. It does not
+    // apply here: sceneIndex is REQUIRED for this tool (enforced by its
+    // input_schema and re-checked above), so every call is already bounded
+    // to exactly one paid provider request no matter how many scenes the
+    // job has — including a genuine single-scene job.
 
     if (!Array.isArray(job.images) || job.images.length === 0) {
       return JSON.stringify({
@@ -693,20 +695,6 @@ app.post('/api/jobs/:id/generate-video', async (req, res) => {
     return res.status(400).json({ error: 'job has no videoPrompts to generate video from' });
   }
 
-  // TEMPORARY safety cap (see TEMP_GENERATE_VIDEO_SCENE_CAP above) — refuse
-  // outright, before any provider call, rather than silently truncating a
-  // larger job down to this count.
-  if (job.videoPrompts.length !== TEMP_GENERATE_VIDEO_SCENE_CAP) {
-    return res.status(400).json({
-      error:
-        `Video generation is temporarily capped at exactly ${TEMP_GENERATE_VIDEO_SCENE_CAP} scenes ` +
-        `for testing. This job has ${job.videoPrompts.length} video prompts/scenes — reduce it to ` +
-        `exactly ${TEMP_GENERATE_VIDEO_SCENE_CAP} before generating video. No Runway request was made.`,
-      videoPromptsCount: job.videoPrompts.length,
-      requiredSceneCount: TEMP_GENERATE_VIDEO_SCENE_CAP,
-    });
-  }
-
   // Optional: restrict this run to exactly one scene, by its zero-based
   // index, e.g. so a single, bounded, real test can generate Scene 1 only
   // — every other scene (Scene 2 included) is guaranteed to never be
@@ -722,6 +710,23 @@ app.post('/api/jobs/:id/generate-video', async (req, res) => {
           'No Runway request was made.',
       });
     }
+  }
+
+  // TEMPORARY safety cap (see TEMP_GENERATE_VIDEO_SCENE_CAP above) — only
+  // applies to a full-job run (no sceneIndex given), since that is the only
+  // case that could submit more than one paid request in a single call.
+  // Refuses outright, before any provider call, rather than silently
+  // truncating a larger job down to this count.
+  if (sceneIndex === null && job.videoPrompts.length !== TEMP_GENERATE_VIDEO_SCENE_CAP) {
+    return res.status(400).json({
+      error:
+        `Video generation is temporarily capped at exactly ${TEMP_GENERATE_VIDEO_SCENE_CAP} scenes ` +
+        `for testing. This job has ${job.videoPrompts.length} video prompts/scenes — reduce it to ` +
+        `exactly ${TEMP_GENERATE_VIDEO_SCENE_CAP}, or pass sceneIndex to generate one specific scene. ` +
+        'No Runway request was made.',
+      videoPromptsCount: job.videoPrompts.length,
+      requiredSceneCount: TEMP_GENERATE_VIDEO_SCENE_CAP,
+    });
   }
 
   if (!Array.isArray(job.images) || job.images.length === 0) {

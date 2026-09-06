@@ -126,7 +126,7 @@ async function main() {
     assert.ok(result.error.toLowerCase().includes('sceneindex'));
   });
 
-  await test('generateSceneVideo enforces the same scene-count safety cap as the REST route', async () => {
+  await test('generateSceneVideo does not enforce the full-job scene-count cap, since sceneIndex already bounds this call to one paid request', async () => {
     const job = await jobStore.createJob();
     await jobStore.updateJob(job.id, {
       imagePrompts: ['Scene 1', 'Scene 2', 'Scene 3'],
@@ -137,8 +137,47 @@ async function main() {
     submittedPrompts = [];
     const result = JSON.parse(await app.executeTool('generateSceneVideo', job.id, { sceneIndex: 0 }));
 
-    assert.strictEqual(submittedPrompts.length, 0, 'a job outside the safety cap must never reach the provider, even for a single-scene request');
-    assert.ok(result.error.toLowerCase().includes('exactly'));
+    assert.deepStrictEqual(submittedPrompts, ['Pan 1'], 'a 3-scene job must still allow generating exactly one explicitly selected scene');
+    assert.strictEqual(result.sceneResult.status, 'completed');
+
+    const persisted = await jobStore.getJob(job.id);
+    assert.strictEqual(persisted.videoGeneration.clips[1].status, 'not_started');
+    assert.strictEqual(persisted.videoGeneration.clips[2].status, 'not_started');
+  });
+
+  await test('generateSceneVideo allows a genuine single-scene job to generate Scene 1 with sceneIndex 0, without needing a fake second scene', async () => {
+    const job = await jobStore.createJob();
+    await jobStore.updateJob(job.id, {
+      imagePrompts: ['Scene 1'],
+      videoPrompts: ['Pan across Scene 1'],
+      images: [completedImage('Scene 1', 'a')],
+    });
+
+    submittedPrompts = [];
+    const result = JSON.parse(await app.executeTool('generateSceneVideo', job.id, { sceneIndex: 0 }));
+
+    assert.deepStrictEqual(submittedPrompts, ['Pan across Scene 1']);
+    assert.strictEqual(result.requestedScene, 0);
+    assert.strictEqual(result.sceneResult.status, 'completed');
+
+    const persisted = await jobStore.getJob(job.id);
+    assert.strictEqual(persisted.videoGeneration.clips.length, 1);
+    assert.strictEqual(persisted.videoGeneration.clips[0].status, 'completed');
+  });
+
+  await test('generateSceneVideo rejects sceneIndex 1 on a genuine single-scene job (out of range), with zero provider calls', async () => {
+    const job = await jobStore.createJob();
+    await jobStore.updateJob(job.id, {
+      imagePrompts: ['Scene 1'],
+      videoPrompts: ['Pan across Scene 1'],
+      images: [completedImage('Scene 1', 'a')],
+    });
+
+    submittedPrompts = [];
+    const result = JSON.parse(await app.executeTool('generateSceneVideo', job.id, { sceneIndex: 1 }));
+
+    assert.strictEqual(submittedPrompts.length, 0);
+    assert.ok(result.error.toLowerCase().includes('sceneindex'));
   });
 
   await test('generateSceneVideo never automatically retries a previously failed scene on its own', async () => {
