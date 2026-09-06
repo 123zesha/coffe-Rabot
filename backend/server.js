@@ -199,6 +199,30 @@ const TOOLS = [
       additionalProperties: false,
     },
   },
+  {
+    name: 'generateSceneVideo',
+    description:
+      'Generate a REAL, PAID Runway video clip for exactly one scene of the current video job, ' +
+      'using the same provider-independent video-generation backend the rest of this app already ' +
+      'uses. This costs real Runway credits — only call this when the user has explicitly asked, ' +
+      'right now, to generate video for a specific scene. Never call this automatically after ' +
+      'generating images, and never call it again to retry a scene that already failed unless the ' +
+      'user explicitly asks again. sceneIndex is REQUIRED: it is the zero-based scene number to ' +
+      'generate (0 for "Scene 1", 1 for "Scene 2", etc.) — every other scene in the job is left ' +
+      'completely untouched and is never submitted to Runway, so calling this with sceneIndex 0 can ' +
+      'never trigger Scene 2 or any other scene. Video generation is temporarily capped to jobs with ' +
+      `exactly ${TEMP_GENERATE_VIDEO_SCENE_CAP} scenes for controlled live testing. Only tell the ` +
+      'user a clip was generated if this tool reports that scene as completed — report a failure or ' +
+      'still-processing result honestly instead of assuming success.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        sceneIndex: { type: 'integer', minimum: 0 },
+      },
+      required: ['sceneIndex'],
+      additionalProperties: false,
+    },
+  },
 ];
 
 async function executeTool(name, jobId, input) {
@@ -305,6 +329,118 @@ async function executeTool(name, jobId, input) {
   if (name === 'confirmVideoJob') {
     const job = await jobStore.updateJob(jobId, { confirmed: true });
     return JSON.stringify(job ? summarizeJobForAgent(job) : { error: 'job not found' });
+  }
+
+  if (name === 'generateSceneVideo') {
+    const job = await jobStore.getJob(jobId);
+
+    if (!job) {
+      return JSON.stringify({ error: 'job not found' });
+    }
+
+    if (!Array.isArray(job.videoPrompts) || job.videoPrompts.length === 0) {
+      return JSON.stringify({ error: 'job has no videoPrompts to generate video from' });
+    }
+
+    // Same TEMPORARY safety cap as POST /api/jobs/:id/generate-video (see
+    // TEMP_GENERATE_VIDEO_SCENE_CAP above) — the Agent must never be able
+    // to bypass it, so it is enforced here too, before any provider call.
+    if (job.videoPrompts.length !== TEMP_GENERATE_VIDEO_SCENE_CAP) {
+      return JSON.stringify({
+        error:
+          `Video generation is temporarily capped at exactly ${TEMP_GENERATE_VIDEO_SCENE_CAP} scenes ` +
+          `for testing. This job has ${job.videoPrompts.length} video prompts/scenes. No Runway ` +
+          'request was made.',
+      });
+    }
+
+    const sceneIndex = input && input.sceneIndex;
+
+    if (!Number.isInteger(sceneIndex) || sceneIndex < 0 || sceneIndex >= job.videoPrompts.length) {
+      return JSON.stringify({
+        error:
+          `sceneIndex must be an integer between 0 and ${job.videoPrompts.length - 1} for this job. ` +
+          'No Runway request was made.',
+      });
+    }
+
+    if (!Array.isArray(job.images) || job.images.length === 0) {
+      return JSON.stringify({
+        error: 'job has no generated scene images yet — generate images before generating video',
+      });
+    }
+
+    const activeProvider = videoGeneration.getProvider();
+
+    if (activeProvider.name === 'runway' && !process.env.RUNWAYML_API_SECRET) {
+      return JSON.stringify({
+        error:
+          'Video generation is not configured on the server right now. Tell the user video ' +
+          'generation is temporarily unavailable — do not say a clip was generated.',
+      });
+    }
+
+    try {
+      // Reuses the exact same video-generation implementation the REST
+      // route already uses (backend/video-generation.js) — no second
+      // video-generation system. sceneIndex restricts this call to exactly
+      // one scene; every other scene's existing clip state is carried
+      // through untouched (see generateVideoForScenes), so this can never
+      // submit any scene other than the one explicitly requested.
+      const existingClips =
+        job.videoGeneration && Array.isArray(job.videoGeneration.clips) ? job.videoGeneration.clips : [];
+
+      const result = await videoGeneration.generateVideoForScenes({
+        imagePrompts: job.imagePrompts,
+        videoPrompts: job.videoPrompts,
+        images: job.images,
+        existingClips,
+        sceneIndex,
+      });
+
+      const allCompleted = result.clips.length > 0 && result.clips.every((clip) => clip.status === 'completed');
+      const anyProcessing = result.clips.some((clip) => clip.status === 'processing');
+      const anyFailed = result.clips.some((clip) => clip.status === 'failed');
+      const overallStatus = allCompleted
+        ? 'completed'
+        : anyProcessing
+        ? 'processing'
+        : anyFailed
+        ? 'failed'
+        : 'not_started';
+
+      const videoGenerationField = {
+        provider: activeProvider.name,
+        status: overallStatus,
+        clips: result.clips,
+        error: overallStatus === 'failed' ? 'One or more scenes failed to generate a video clip.' : null,
+      };
+
+      // finalVideo is never set here — many separate scene clips are not
+      // one final assembled video (see the /generate-video route and
+      // job-store.js's finalVideo comment). The COMPLETED gate is untouched.
+      const updatedJob = await jobStore.updateJob(jobId, { videoGeneration: videoGenerationField });
+
+      const sceneClip = result.clips[sceneIndex];
+      return JSON.stringify({
+        job: updatedJob ? summarizeJobForAgent(updatedJob) : { error: 'job not found' },
+        requestedScene: sceneIndex,
+        // Mirrors summarizeJobForAgent's own clip shape — status/error only,
+        // never the clip URL or externalJobId, consistent with how every
+        // other generated asset is reported back to the conversation.
+        sceneResult: sceneClip
+          ? { status: sceneClip.status, ...(sceneClip.error ? { error: sceneClip.error } : {}) }
+          : null,
+      });
+    } catch (error) {
+      console.error(
+        'Unexpected error generating video (agent tool):',
+        JSON.stringify({ name: error?.name, message: error?.message }, null, 2)
+      );
+      return JSON.stringify({
+        error: 'Video generation failed unexpectedly. Tell the user to try again in a moment.',
+      });
+    }
   }
 
   return JSON.stringify({ error: `Unknown tool: ${name}` });
