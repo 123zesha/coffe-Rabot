@@ -134,6 +134,29 @@ async function main() {
     assert.strictEqual(generateVideoForScenesCallCount, before, 'generateVideoForScenes must never be called for a 1-scene job');
   });
 
+  await test('a job with only 1 scene bypasses the cap and reaches the video generation layer once when sceneIndex is given', async () => {
+    const job = await jobStore.createJob();
+    await jobStore.updateJob(job.id, {
+      imagePrompts: ['Only scene'],
+      videoPrompts: ['Only pan'],
+      images: [completedImage('Only scene', 'a')],
+    });
+
+    const before = generateVideoForScenesCallCount;
+    const res = await fetch(`${baseUrl}/api/jobs/${job.id}/generate-video`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ sceneIndex: 0 }),
+    });
+    await res.json();
+
+    // A genuine single-scene job must never need a fake second scene just
+    // to satisfy the full-job cap — selecting one explicit scene already
+    // bounds this call to exactly one paid request.
+    assert.strictEqual(res.status, 200);
+    assert.strictEqual(generateVideoForScenesCallCount, before + 1, 'a 1-scene job with an explicit sceneIndex must reach generateVideoForScenes');
+  });
+
   await test('a job with exactly 2 scenes passes the cap and reaches the video generation layer once', async () => {
     const job = await jobStore.createJob();
     await jobStore.updateJob(job.id, {

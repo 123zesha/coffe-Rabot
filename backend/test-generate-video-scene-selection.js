@@ -249,6 +249,28 @@ async function main() {
     assert.ok(body.videoGeneration.clips.every((clip) => clip.status === 'completed'));
   });
 
+  await test('POST /generate-video allows a genuine single-scene job to generate Scene 1 with sceneIndex 0, bypassing the full-job scene-count cap', async () => {
+    const job = await jobStore.createJob();
+    await jobStore.updateJob(job.id, {
+      imagePrompts: ['Scene 1'],
+      videoPrompts: ['Pan across Scene 1'],
+      images: [completedImage('Scene 1', 'a')],
+    });
+
+    routeSubmittedPrompts = [];
+    const res = await fetch(`${baseUrl}/api/jobs/${job.id}/generate-video`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ sceneIndex: 0 }),
+    });
+    const body = await res.json();
+
+    assert.strictEqual(res.status, 200, JSON.stringify(body));
+    assert.deepStrictEqual(routeSubmittedPrompts, ['Pan across Scene 1']);
+    assert.strictEqual(body.videoGeneration.clips.length, 1);
+    assert.strictEqual(body.videoGeneration.clips[0].status, 'completed');
+  });
+
   server.close();
   delete videoGeneration.PROVIDERS.fake;
   delete process.env.VIDEO_GENERATION_PROVIDER;
