@@ -441,7 +441,6 @@ async function executeTool(name, jobId, input) {
         job.videoGeneration && Array.isArray(job.videoGeneration.clips) ? job.videoGeneration.clips : [];
 
       const result = await videoGeneration.generateVideoForScenes({
-        imagePrompts: job.imagePrompts,
         videoPrompts: job.videoPrompts,
         images: job.images,
         existingClips,
@@ -796,7 +795,6 @@ app.post('/api/jobs/:id/generate-video', async (req, res) => {
       job.videoGeneration && Array.isArray(job.videoGeneration.clips) ? job.videoGeneration.clips : [];
 
     const result = await videoGeneration.generateVideoForScenes({
-      imagePrompts: job.imagePrompts,
       videoPrompts: job.videoPrompts,
       images: job.images,
       existingClips,

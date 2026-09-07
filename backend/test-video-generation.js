@@ -188,7 +188,7 @@ async function main() {
     assert.strictEqual(result.attempts, 2);
   });
 
-  await test('generateVideoForScenes matches each scene to its completed image by prompt text', async () => {
+  await test('generateVideoForScenes matches each scene to its completed image by position (images[i])', async () => {
     const provider = fakeProvider({
       async checkVideoGenerationStatus() {
         return { status: 'completed', clips: [] };
@@ -200,7 +200,6 @@ async function main() {
 
     const result = await videoGen.generateVideoForScenes(
       {
-        imagePrompts: ['Mira at the lighthouse', 'The boat at sea'],
         videoPrompts: ['Slow pan across Mira', 'Boat rocking in waves'],
         images: [
           { prompt: 'Mira at the lighthouse', url: 'data:image/png;base64,mira', status: 'completed' },
@@ -213,6 +212,48 @@ async function main() {
 
     assert.strictEqual(result.clips.length, 2);
     assert.ok(result.clips.every((clip) => clip.status === 'completed' && clip.url === 'https://example.test/scene.mp4'));
+  });
+
+  // Regression test for the real production failure: Scene 1's image was
+  // generated and marked 'completed' in job.images[0], but video
+  // generation still reported "No completed scene image is available" —
+  // even though the job record listed the image as completed. Root cause:
+  // matching was done by exact imagePrompts[i] === image.prompt text
+  // equality. updateVideoJob can rewrite imagePrompts text at any time
+  // (e.g. while separately fixing a missing videoPrompts entry), but the
+  // stored image's .prompt field is frozen at generation time — any later
+  // rewording of imagePrompts[i], even one that doesn't change the scene
+  // at all, silently orphaned an already-completed, perfectly usable
+  // image. Matching by position (images[i]) instead of by prompt text
+  // fixes this: the scene's image is found regardless of how imagePrompts
+  // has since been reworded.
+  await test('generateVideoForScenes still finds the scene image after imagePrompts text has been reworded since generation', async () => {
+    const provider = fakeProvider({
+      async checkVideoGenerationStatus() {
+        return { status: 'completed', clips: [] };
+      },
+      async retrieveGeneratedVideo() {
+        return { status: 'completed', url: 'https://example.test/scene.mp4' };
+      },
+    });
+
+    const result = await videoGen.generateVideoForScenes(
+      {
+        // imagePrompts is no longer used for matching at all — this
+        // reflects the CURRENT (reworded) prompt, deliberately different
+        // from images[0].prompt below, exactly as would happen after an
+        // updateVideoJob edit made post-generation.
+        imagePrompts: ['Mira stands alone at the lighthouse at dusk, reworded after generation'],
+        videoPrompts: ['Slow pan across Mira'],
+        images: [{ prompt: 'Mira at the lighthouse', url: 'data:image/png;base64,mira', status: 'completed' }],
+        existingClips: [],
+      },
+      provider
+    );
+
+    assert.strictEqual(result.clips.length, 1);
+    assert.strictEqual(result.clips[0].status, 'completed', 'the completed image must still be found by position, despite the reworded imagePrompts text');
+    assert.strictEqual(result.clips[0].url, 'https://example.test/scene.mp4');
   });
 
   await test('a scene with no completed source image gets a failed clip, never skipped or fabricated', async () => {
