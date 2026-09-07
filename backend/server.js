@@ -286,8 +286,13 @@ const TOOLS = [
       'using the same provider-independent video-generation backend the rest of this app already ' +
       'uses. This costs real Runway credits — only call this when the user has explicitly asked, ' +
       'right now, to generate video for a specific scene. Never call this automatically after ' +
-      'generating images, and never call it again to retry a scene that already failed unless the ' +
-      'user explicitly asks again. sceneIndex is REQUIRED: it is the zero-based scene number to ' +
+      'generating images, and never call it again to retry a scene that already FAILED unless the ' +
+      'user explicitly asks again. IMPORTANT exception: if the scene\'s status is "processing" ' +
+      '(Runway accepted the request and is still rendering), calling this again is a FREE, SAFE ' +
+      'status check, never a new paid submission — the backend only re-submits a scene whose status ' +
+      'is not_started or failed, and a processing scene is only polled. Feel free to call this again ' +
+      'to check on a processing scene whenever the user asks for an update, without needing to ask ' +
+      'their permission first for that specific check. sceneIndex is REQUIRED: it is the zero-based scene number to ' +
       'generate (0 for "Scene 1", 1 for "Scene 2", etc.) — every other scene in the job is left ' +
       'completely untouched and is never submitted to Runway, so calling this with sceneIndex 0 can ' +
       'never trigger Scene 2 or any other scene. Because sceneIndex already limits every call to one ' +
