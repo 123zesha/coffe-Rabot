@@ -79,6 +79,33 @@ async function main() {
     assert.ok(result.error.includes('400'));
   });
 
+  // Regression test for the real production failure: a 400 "Validation of
+  // body failed" response gave no indication of which field was invalid
+  // (an invalid `ratio` value, as it turned out) because describeHttpError
+  // only ever read the generic top-level error/message string. Runway's
+  // actual response carries the real, field-specific reason in an `issues`
+  // array ({ code, path, message }) — this must now be surfaced too, so a
+  // future validation failure is diagnosable from the error text alone.
+  await test('submitVideoGeneration surfaces Runway\'s field-specific validation issues, not just the generic message', async () => {
+    const fetchImpl = fakeFetch(async () =>
+      jsonResponse(400, {
+        error: 'Validation of body failed',
+        docUrl: 'https://docs.dev.runwayml.com/errors/troubleshooting/',
+        issues: [{ code: 'invalid_enum_value', path: ['ratio'], message: 'Invalid ratio. Must be one of: 1280:720, 720:1280, 1104:832, 832:1104, 960:960, 1584:672.' }],
+      })
+    );
+
+    const result = await runway.submitVideoGeneration(
+      { imageDataUri: 'x', prompt: 'x', durationSeconds: 5, ratio: '16:9' },
+      fetchImpl
+    );
+
+    assert.strictEqual(result.status, 'failed');
+    assert.ok(result.error.includes('Validation of body failed'));
+    assert.ok(result.error.includes('ratio'), `expected the invalid field name in the error, got: ${result.error}`);
+    assert.ok(result.error.includes('Invalid ratio'), `expected the specific validation message in the error, got: ${result.error}`);
+  });
+
   await test('submitVideoGeneration fails safely when the response has no task id', async () => {
     const fetchImpl = fakeFetch(async () => jsonResponse(200, {}));
 
