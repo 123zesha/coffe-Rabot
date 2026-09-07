@@ -59,6 +59,19 @@ function fakeProvider(overrides) {
 }
 
 async function main() {
+  // Regression test for the real production failure: a real, paid Runway
+  // request for Scene 1 was rejected with "HTTP 400: Validation of body
+  // failed". Root cause: Runway's image_to_video endpoint, on the API
+  // version this integration pins (2024-11-06), rejects the simplified
+  // aspect-ratio notation "16:9" — `ratio` must be one of gen4_turbo's
+  // literal supported output resolutions (e.g. "1280:720" for 16:9
+  // landscape), confirmed by Runway's own Node SDK examples. Pins the
+  // fixed default so this can never silently regress back to "16:9".
+  await test('DEFAULT_ASPECT_RATIO is a literal Runway-supported resolution, not a reduced ratio string', () => {
+    assert.strictEqual(videoGen.DEFAULT_ASPECT_RATIO, '1280:720');
+    assert.notStrictEqual(videoGen.DEFAULT_ASPECT_RATIO, '16:9', '"16:9" is rejected by Runway\'s image_to_video validation on API version 2024-11-06');
+  });
+
   await test('the default (unconfigured "none") provider never fabricates a result', async () => {
     const result = await videoGen.generateClip({
       imageDataUri: 'data:image/png;base64,abc',

@@ -47,9 +47,17 @@ const PROVIDERS = { none: NONE_PROVIDER, runway: RUNWAY_PROVIDER };
 // feature (deciding which scenes get real video vs. still+pan/zoom, and
 // what duration/ratio fits the video type) is built — that's a separate,
 // not-yet-implemented piece of work. For now every scene with a completed
-// source image gets one 5-second, 16:9 clip.
+// source image gets one 5-second, 16:9-landscape clip.
 const DEFAULT_CLIP_DURATION_SECONDS = 5;
-const DEFAULT_ASPECT_RATIO = '16:9';
+// Runway's image_to_video endpoint, on the API version pinned in
+// video-providers/runway.js (2024-11-06), rejects the simplified aspect
+// ratio notation "16:9" with a 400 "Validation of body failed" error — as
+// of that version, `ratio` must be one of gen4_turbo's literal supported
+// output resolutions (landscape: 1280:720, 1584:672, 1104:832; portrait:
+// 720:1280, 832:1104; square: 960:960), not a reduced ratio string. This
+// is confirmed by Runway's own Node SDK examples, which pass '1280:720'
+// for a 16:9 landscape gen4_turbo request. 1280:720 is that literal value.
+const DEFAULT_ASPECT_RATIO = '1280:720';
 
 function getProvider(name) {
   const requested = name || process.env.VIDEO_GENERATION_PROVIDER;

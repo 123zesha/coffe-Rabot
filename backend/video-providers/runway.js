@@ -44,9 +44,25 @@ function mapStatus(runwayStatus) {
   return 'processing';
 }
 
+// Runway's own 400 "Validation of body failed" responses carry the actual
+// useful detail in an `issues` array ({ code, path, message } per invalid
+// field — e.g. path ["ratio"], message naming the allowed values), not in
+// the top-level `error`/`message` string alone. A prior version of this
+// function only surfaced the generic top-level message, which is exactly
+// how an invalid `ratio` value produced nothing more diagnosable than
+// "Validation of body failed" — the real, field-specific reason existed in
+// Runway's response the whole time but was discarded before it ever
+// reached a log line or the job record.
 function describeHttpError(status, body) {
   const detail = body && (body.error || body.message);
-  return `Runway API error (HTTP ${status}${detail ? `: ${detail}` : ''})`;
+  const issues = body && Array.isArray(body.issues) ? body.issues : null;
+  const issuesText = issues && issues.length
+    ? ' — ' + issues.map((issue) => {
+        const path = Array.isArray(issue.path) ? issue.path.join('.') : issue.path;
+        return `${path ? `${path}: ` : ''}${issue.message || issue.code || 'invalid'}`;
+      }).join('; ')
+    : '';
+  return `Runway API error (HTTP ${status}${detail ? `: ${detail}` : ''}${issuesText})`;
 }
 
 function describeTaskFailure(task) {
