@@ -169,12 +169,12 @@ function logClipFailure(sceneIndex, provider, clip) {
 }
 
 // Runs generateClip for every scene in order, matching each scene's video
-// prompt to its already-generated image by prompt text (the same lookup
-// convention image-generation.js's own reference logic uses). Mirrors
-// image-generation.js's generateImagesForPrompts: one convenience function
-// that loops internally so callers (the /generate-video route) stay thin.
-// A scene with no completed source image yet is never sent to the
-// provider — it's recorded as a failed clip with a clear reason, never
+// prompt to its already-generated image by scene position (images[i] for
+// videoPrompts[i] — see the positional-matching note further down).
+// Mirrors image-generation.js's generateImagesForPrompts: one convenience
+// function that loops internally so callers (the /generate-video route)
+// stay thin. A scene with no completed source image yet is never sent to
+// the provider — it's recorded as a failed clip with a clear reason, never
 // silently skipped or fabricated.
 //
 // `sceneIndex`, when given, restricts this run to that single zero-based
@@ -187,7 +187,6 @@ function logClipFailure(sceneIndex, provider, clip) {
 // original behavior.
 async function generateVideoForScenes(
   {
-    imagePrompts,
     videoPrompts,
     images,
     existingClips,
@@ -211,10 +210,18 @@ async function generateVideoForScenes(
     }
 
     const prompt = videoPrompts[i];
-    const imagePrompt = Array.isArray(imagePrompts) ? imagePrompts[i] : undefined;
-    const sourceImage = Array.isArray(images)
-      ? images.find((image) => image && image.prompt === imagePrompt && image.status === 'completed')
-      : null;
+    // Scene i's image is images[i] — a positional match, not a text match.
+    // image-generation.js's generateImagesForPrompts always rebuilds
+    // job.images from job.imagePrompts in the same order on every run, so
+    // images[i] is already guaranteed to be the image for imagePrompts[i].
+    // Matching by exact prompt-text equality (the previous approach) broke
+    // silently the moment imagePrompts[i]'s wording was edited after the
+    // image had already been generated — updateVideoJob can rewrite
+    // imagePrompts text at any time, but the stored image's .prompt field
+    // is frozen at generation time, so any later edit — even a harmless
+    // rewording, not a real change of scene — orphaned an already-
+    // completed, perfectly usable image from ever being found again.
+    const sourceImage = Array.isArray(images) && images[i] && images[i].status === 'completed' ? images[i] : null;
 
     if (!sourceImage) {
       const clip = {
