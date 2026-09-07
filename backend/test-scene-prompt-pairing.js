@@ -142,6 +142,30 @@ async function main() {
     assert.ok(body.error.includes('2') && body.error.includes('1'));
   });
 
+  // Regression test for the real production failure: a real, paid Runway
+  // request failed with "promptText: Invalid input: expected string,
+  // received object" — updateVideoJob's own schema (items: {}, no type
+  // constraint) let videoPrompts contain a non-string entry, which reached
+  // Runway's promptText field unchanged. The schema itself is now
+  // items: { type: 'string' }, but this proves the runtime data check
+  // catches it too (e.g. for a job set before the schema tightened).
+  await test('POST /generate-images refuses with zero OpenAI calls when an imagePrompts entry is not a string', async () => {
+    const job = await jobStore.createJob();
+    await jobStore.updateJob(job.id, {
+      imagePrompts: ['Scene 1', { description: 'Scene 2 as an object, not a string' }],
+      videoPrompts: ['Pan across Scene 1', 'Pan across Scene 2'],
+    });
+
+    const before = mockOpenAi.count;
+    const res = await fetch(`${baseUrl}/api/jobs/${job.id}/generate-images`, { method: 'POST' });
+    const body = await res.json();
+
+    assert.strictEqual(res.status, 400);
+    assert.strictEqual(mockOpenAi.count, before, 'no OpenAI call may happen while an imagePrompts entry is not a string');
+    assert.ok(body.error.includes('imagePrompts[1]'));
+    assert.ok(body.error.toLowerCase().includes('updatevideojob'));
+  });
+
   await test('POST /generate-images proceeds normally once imagePrompts and videoPrompts match 1:1', async () => {
     const job = await jobStore.createJob();
     await jobStore.updateJob(job.id, {
@@ -156,6 +180,32 @@ async function main() {
     assert.strictEqual(res.status, 200, JSON.stringify(body));
     assert.strictEqual(mockOpenAi.count, before + 1, 'exactly one real generation call once prompts are paired');
     assert.strictEqual(body.images[0].status, 'completed');
+  });
+
+  // Reproduces the exact real production failure: sceneIndex 0, a real
+  // completed Scene 1 image, but videoPrompts[0] is an object instead of a
+  // plain string — this must be caught before Runway ever sees it, not
+  // discovered via a real "expected string, received object" 400.
+  await test('POST /generate-video refuses with zero Runway calls when a videoPrompts entry is not a string', async () => {
+    const job = await jobStore.createJob();
+    await jobStore.updateJob(job.id, {
+      imagePrompts: ['Scene 1'],
+      videoPrompts: [{ text: 'Slow pan across Scene 1', camera: 'push-in' }],
+      images: [completedImage('Scene 1', 'a')],
+    });
+
+    submittedPrompts = [];
+    const res = await fetch(`${baseUrl}/api/jobs/${job.id}/generate-video`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ sceneIndex: 0 }),
+    });
+    const body = await res.json();
+
+    assert.strictEqual(res.status, 400);
+    assert.strictEqual(submittedPrompts.length, 0, 'no Runway call may happen while a videoPrompts entry is not a string');
+    assert.ok(body.error.includes('videoPrompts[0]'));
+    assert.ok(body.error.toLowerCase().includes('updatevideojob'));
   });
 
   await test('POST /generate-video refuses with zero Runway calls when videoPrompts is missing, even with a completed image', async () => {
