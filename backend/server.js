@@ -64,6 +64,29 @@ function findScenePromptMismatch(job) {
     );
   }
 
+  // Both feed a real paid API call downstream as raw text (the image
+  // generation prompt, Runway's promptText) with no defensive coercion —
+  // a non-string entry here isn't caught until the provider itself rejects
+  // it (e.g. Runway's real, paid "promptText: Invalid input: expected
+  // string, received object"). updateVideoJob's own schema now requires
+  // string items, but this checks the job's actual current data too, so a
+  // job left over from before that schema existed is still caught safely.
+  const firstNonStringImagePrompt = job.imagePrompts.findIndex((prompt) => typeof prompt !== 'string');
+  if (firstNonStringImagePrompt !== -1) {
+    return (
+      `imagePrompts[${firstNonStringImagePrompt}] is not a plain string. Use updateVideoJob to set ` +
+      'every imagePrompts entry as a short text description, not an object.'
+    );
+  }
+
+  const firstNonStringVideoPrompt = job.videoPrompts.findIndex((prompt) => typeof prompt !== 'string');
+  if (firstNonStringVideoPrompt !== -1) {
+    return (
+      `videoPrompts[${firstNonStringVideoPrompt}] is not a plain string. Use updateVideoJob to set ` +
+      'every videoPrompts entry as a short text description, not an object.'
+    );
+  }
+
   return null;
 }
 
@@ -184,8 +207,16 @@ const TOOLS = [
         script: { type: 'string' },
         scenes: { type: 'array', items: {} },
         characters: { type: 'array', items: {} },
-        imagePrompts: { type: 'array', items: {} },
-        videoPrompts: { type: 'array', items: {} },
+        // Must be plain strings: both feed a real paid API call downstream
+        // as raw text (image-generation.js's prompt, runway.js's
+        // promptText) with no defensive coercion — unlike characters/
+        // scenes, which are already handled either way. Allowing objects
+        // here (the previous `items: {}`) let the Agent set videoPrompts
+        // to something Runway's own validation then rejected with
+        // "promptText: Invalid input: expected string, received object" —
+        // a real, paid, avoidable failure.
+        imagePrompts: { type: 'array', items: { type: 'string' } },
+        videoPrompts: { type: 'array', items: { type: 'string' } },
         voiceStyle: { type: 'string' },
         subtitles: { type: 'string' },
         music: { type: 'string' },

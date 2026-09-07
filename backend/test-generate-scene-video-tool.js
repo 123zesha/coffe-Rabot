@@ -230,6 +230,27 @@ async function main() {
     assert.ok(result.error.toLowerCase().includes('updatevideojob'), 'the error must tell the Agent how to fix it itself');
   });
 
+  // Reproduces the exact real production failure: a real completed Scene 1
+  // image, sceneIndex 0, but videoPrompts[0] is an object instead of a
+  // plain string. Runway's real, paid response was "promptText: Invalid
+  // input: expected string, received object" — this must be caught here,
+  // before any Runway call, not discovered via a real paid rejection.
+  await test('generateSceneVideo refuses — before any Runway call — when a videoPrompts entry is not a string', async () => {
+    const job = await jobStore.createJob();
+    await jobStore.updateJob(job.id, {
+      imagePrompts: ['Scene 1'],
+      videoPrompts: [{ text: 'Slow pan across Scene 1', camera: 'push-in' }],
+      images: [completedImage('Scene 1', 'a')],
+    });
+
+    submittedPrompts = [];
+    const result = JSON.parse(await app.executeTool('generateSceneVideo', job.id, { sceneIndex: 0 }));
+
+    assert.strictEqual(submittedPrompts.length, 0, 'no Runway call may happen while a videoPrompts entry is not a string');
+    assert.ok(result.error.includes('videoPrompts[0]'));
+    assert.ok(result.error.toLowerCase().includes('updatevideojob'));
+  });
+
   await test('generateSceneVideo returns a clear error and makes no call when there are no completed images yet', async () => {
     const job = await jobStore.createJob();
     await jobStore.updateJob(job.id, {

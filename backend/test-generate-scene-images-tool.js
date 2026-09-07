@@ -166,6 +166,26 @@ async function main() {
     assert.strictEqual(persisted.images.length, 0);
   });
 
+  // Regression test for the real production failure: a real, paid Runway
+  // request failed with "promptText: Invalid input: expected string,
+  // received object" because a videoPrompts entry was an object, not a
+  // string — the updateVideoJob schema now requires string items, but this
+  // proves the tool also refuses on the job's actual current data.
+  await test('generateSceneImages refuses — before any OpenAI call — when an imagePrompts entry is not a string', async () => {
+    const job = await jobStore.createJob();
+    await jobStore.updateJob(job.id, {
+      imagePrompts: [{ description: 'Scene 1 as an object, not a string' }],
+      videoPrompts: ['Pan across Scene 1'],
+    });
+
+    mockOpenAiRequestCount = 0;
+    const result = JSON.parse(await app.executeTool('generateSceneImages', job.id, {}));
+
+    assert.strictEqual(mockOpenAiRequestCount, 0, 'a non-string imagePrompts entry must never reach OpenAI');
+    assert.ok(result.error.includes('imagePrompts[0]'));
+    assert.ok(result.error.toLowerCase().includes('updatevideojob'));
+  });
+
   await test('generateSceneImages returns a clear error and makes no call when OPENAI_API_KEY is missing', async () => {
     const job = await jobStore.createJob();
     await jobStore.updateJob(job.id, { imagePrompts: ['Scene A'], videoPrompts: ['Pan across Scene A'] });
