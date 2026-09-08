@@ -1,0 +1,216 @@
+// Tests for the new assembleFinalVideo Agent tool AND its matching
+// POST /api/jobs/:id/assemble-video REST route (backend/server.js), which
+// let the conversational Agent (and the REST API) trigger the real
+// ffmpeg-based final-video assembly backend (backend/video-assembly.js) —
+// see test-video-assembly.js for the module's own unit tests.
+//
+// Every scene "video clip" used here is a real, tiny local MP4 this test
+// generates itself with ffmpeg (via ffmpeg-static) — no Runway, OpenAI,
+// Anthropic, or any other paid API is ever called. Uses the local
+// data/jobs.json fallback (no Redis needed). Run with:
+//   node test-assemble-final-video.js
+// or:
+//   npm run test:assemble-final-video
+
+const path = require('path');
+const fs = require('fs');
+const os = require('os');
+const assert = require('assert');
+const { execFileSync } = require('child_process');
+
+const JOBS_FILE = path.resolve(__dirname, '..', 'data', 'jobs.json');
+const originalJobsFile = fs.existsSync(JOBS_FILE) ? fs.readFileSync(JOBS_FILE, 'utf8') : null;
+fs.writeFileSync(JOBS_FILE, '[]\n');
+
+process.env.ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY || 'test-key';
+
+const app = require('./server');
+const jobStore = require('./job-store');
+const { ffmpegPath } = require('./video-assembly');
+
+let failures = 0;
+
+async function test(name, fn) {
+  try {
+    await fn();
+    console.log(`ok - ${name}`);
+  } catch (error) {
+    failures++;
+    console.error(`FAIL - ${name}`);
+    console.error(`       ${error.message}`);
+  }
+}
+
+const fixturesDir = fs.mkdtempSync(path.join(os.tmpdir(), 'assemble-final-video-fixtures-'));
+
+function makeClip(name) {
+  const outPath = path.join(fixturesDir, name);
+  execFileSync(
+    ffmpegPath,
+    ['-y', '-f', 'lavfi', '-i', 'color=c=green:s=320x240:d=1', '-r', '30', '-pix_fmt', 'yuv420p', outPath],
+    { stdio: 'ignore' }
+  );
+  return outPath;
+}
+
+function completedClip(clipPath) {
+  return { status: 'completed', url: clipPath, externalJobId: 'ext', error: null, attempts: 1 };
+}
+
+async function main() {
+  const clipPath = makeClip('scene.mp4');
+  const server = app.listen(0);
+  await new Promise((resolve) => server.once('listening', resolve));
+  const baseUrl = `http://localhost:${server.address().port}`;
+
+  await test('assembleFinalVideo tool refuses — no ffmpeg run — when there are no scene video clips yet', async () => {
+    const job = await jobStore.createJob();
+    await jobStore.updateJob(job.id, { videoPrompts: ['Scene 1 motion'] });
+
+    const result = JSON.parse(await app.executeTool('assembleFinalVideo', job.id, {}));
+
+    assert.ok(result.error.toLowerCase().includes('generatescenevideo'));
+    const persisted = await jobStore.getJob(job.id);
+    assert.strictEqual(persisted.finalVideo.status, 'pending', 'finalVideo must stay untouched');
+  });
+
+  await test('assembleFinalVideo tool refuses — naming the exact scene — when one scene clip is still processing', async () => {
+    const job = await jobStore.createJob();
+    await jobStore.updateJob(job.id, {
+      videoPrompts: ['Scene 1 motion', 'Scene 2 motion'],
+      videoGeneration: {
+        provider: 'fake',
+        status: 'processing',
+        error: null,
+        clips: [completedClip(clipPath), { status: 'processing', url: null, externalJobId: 'x', error: null, attempts: 1 }],
+      },
+    });
+
+    const result = JSON.parse(await app.executeTool('assembleFinalVideo', job.id, {}));
+
+    assert.ok(result.error.includes('Scene 2'));
+    assert.ok(result.error.toLowerCase().includes('processing'));
+    const persisted = await jobStore.getJob(job.id);
+    assert.strictEqual(persisted.finalVideo.status, 'pending');
+  });
+
+  await test('assembleFinalVideo tool assembles a real, playable final MP4 once every scene clip is completed', async () => {
+    const job = await jobStore.createJob();
+    await jobStore.updateJob(job.id, {
+      videoPrompts: ['Scene 1 motion'],
+      videoGeneration: { provider: 'fake', status: 'completed', error: null, clips: [completedClip(clipPath)] },
+    });
+
+    const result = JSON.parse(await app.executeTool('assembleFinalVideo', job.id, {}));
+
+    assert.strictEqual(result.finalVideo.status, 'completed');
+    // summarizeJobForAgent must strip the URL from the conversation, same as
+    // every other generated-media field (images, voiceover, video clips).
+    assert.strictEqual(result.finalVideo.url, undefined);
+
+    const persisted = await jobStore.getJob(job.id);
+    assert.strictEqual(persisted.finalVideo.status, 'completed');
+    assert.ok(persisted.finalVideo.url && persisted.finalVideo.url.startsWith('data:video/mp4;base64,'));
+  });
+
+  await test('assembleFinalVideo tool skips real work once finalVideo is already completed (no re-assembly)', async () => {
+    const job = await jobStore.createJob();
+    const placeholderUrl = 'data:video/mp4;base64,QUxSRUFEWURPTkU=';
+    await jobStore.updateJob(job.id, {
+      videoPrompts: ['Scene 1 motion'],
+      // Deliberately an unfetchable clip URL — if the tool re-ran assembly
+      // instead of skipping, this would make it fail, not silently succeed.
+      videoGeneration: {
+        provider: 'fake',
+        status: 'completed',
+        error: null,
+        clips: [{ status: 'completed', url: 'http://localhost:1/does-not-exist.mp4', externalJobId: 'x', error: null, attempts: 1 }],
+      },
+      finalVideo: { url: placeholderUrl, status: 'completed' },
+    });
+
+    const result = JSON.parse(await app.executeTool('assembleFinalVideo', job.id, {}));
+    assert.strictEqual(result.finalVideo.status, 'completed');
+
+    const persisted = await jobStore.getJob(job.id);
+    assert.strictEqual(persisted.finalVideo.url, placeholderUrl, 'must not re-run assembly on an already-completed final video');
+  });
+
+  await test('assembleFinalVideo tool reports job not found for an unknown job id', async () => {
+    const result = JSON.parse(await app.executeTool('assembleFinalVideo', 'does-not-exist', {}));
+    assert.strictEqual(result.error, 'job not found');
+  });
+
+  // A real, completed finalVideo is exactly what the existing completion
+  // gate (job-store.js's STAGE_OUTPUT_REQUIREMENTS.READY) requires before a
+  // confirmed job can advance out of READY into COMPLETED — this proves the
+  // new assembly step actually closes that gate instead of duplicating its
+  // logic, and that a job is never marked COMPLETED without a real
+  // finalVideo (see test-completion-gate.js for the gate's own tests).
+  await test('a real assembled finalVideo (via the tool) is what finally lets a confirmed job leave READY', async () => {
+    const job = await jobStore.createJob();
+    await jobStore.updateJob(job.id, {
+      status: 'READY',
+      confirmed: true,
+      videoPrompts: ['Scene 1 motion'],
+      videoGeneration: { provider: 'fake', status: 'completed', error: null, clips: [completedClip(clipPath)] },
+    });
+
+    const blocked = JSON.parse(await app.executeTool('advanceVideoJobStage', job.id, {}));
+    assert.ok(blocked.error.toLowerCase().includes('finalvideo') || blocked.error.toLowerCase().includes('final video'));
+
+    await app.executeTool('assembleFinalVideo', job.id, {});
+
+    const advanced = JSON.parse(await app.executeTool('advanceVideoJobStage', job.id, {}));
+    assert.strictEqual(advanced.status, 'COMPLETED', JSON.stringify(advanced));
+  });
+
+  await test('POST /assemble-video returns 404 for an unknown job', async () => {
+    const res = await fetch(`${baseUrl}/api/jobs/does-not-exist/assemble-video`, { method: 'POST' });
+    assert.strictEqual(res.status, 404);
+  });
+
+  await test('POST /assemble-video returns 400 with a clear reason when scene clips are not ready', async () => {
+    const job = await jobStore.createJob();
+    await jobStore.updateJob(job.id, { videoPrompts: ['Scene 1 motion'] });
+
+    const res = await fetch(`${baseUrl}/api/jobs/${job.id}/assemble-video`, { method: 'POST' });
+    const body = await res.json();
+
+    assert.strictEqual(res.status, 400);
+    assert.ok(body.error.toLowerCase().includes('generatescenevideo'));
+  });
+
+  await test('POST /assemble-video assembles and persists a real final MP4', async () => {
+    const job = await jobStore.createJob();
+    await jobStore.updateJob(job.id, {
+      videoPrompts: ['Scene 1 motion'],
+      videoGeneration: { provider: 'fake', status: 'completed', error: null, clips: [completedClip(clipPath)] },
+    });
+
+    const res = await fetch(`${baseUrl}/api/jobs/${job.id}/assemble-video`, { method: 'POST' });
+    const body = await res.json();
+
+    assert.strictEqual(res.status, 200, JSON.stringify(body));
+    assert.strictEqual(body.finalVideo.status, 'completed');
+    assert.ok(body.finalVideo.url.startsWith('data:video/mp4;base64,'));
+  });
+
+  server.close();
+  fs.rmSync(fixturesDir, { recursive: true, force: true });
+
+  if (originalJobsFile !== null) {
+    fs.writeFileSync(JOBS_FILE, originalJobsFile);
+  } else {
+    fs.writeFileSync(JOBS_FILE, '[]\n');
+  }
+
+  if (failures > 0) {
+    console.error(`\n${failures} test(s) failed.`);
+    process.exitCode = 1;
+  } else {
+    console.log('\nAll assembleFinalVideo tool/route tests passed.');
+  }
+}
+
+main();
