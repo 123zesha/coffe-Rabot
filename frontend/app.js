@@ -22,6 +22,9 @@
   const generateVoiceoverBtn = document.getElementById('generate-voiceover-btn');
   const voiceoverStatus = document.getElementById('voiceover-status');
 
+  const sceneClipsEmpty = document.getElementById('scene-clips-empty');
+  const sceneClipsList = document.getElementById('scene-clips-list');
+
   const JOB_ID_STORAGE_KEY = 'aiAgentJobId';
 
   function loadStoredJobId() {
@@ -134,6 +137,7 @@
       sendBtn.disabled = false;
       input.focus();
       refreshVoiceoverCard();
+      refreshSceneClipsCard();
     }
   });
 
@@ -174,6 +178,7 @@
     } finally {
       generateBtn.disabled = false;
       refreshVoiceoverCard();
+      refreshSceneClipsCard();
     }
   });
 
@@ -316,6 +321,68 @@
     renderVoiceoverCard(job);
   }
 
+  // --- Scene video clips (Progress tab) ---
+  // Renders a real <video> player for each scene clip the Agent has already
+  // generated via generateSceneVideo — the clip's real URL already exists in
+  // job.videoGeneration.clips[i].url (returned in full by GET /api/jobs/:id,
+  // the same read-only route the voice-over card uses) but was previously
+  // never shown anywhere: the chat tool deliberately strips it, and this tab
+  // was a static, unwired placeholder. No paid API call is triggered by
+  // viewing it; a still-processing or failed scene shows its status instead
+  // of a player, never a fabricated link.
+  function buildSceneClipCard(index, clip) {
+    const card = document.createElement('div');
+    card.className = 'scene-clip-card';
+
+    const heading = document.createElement('h4');
+    heading.textContent = `Scene ${index + 1}`;
+    card.appendChild(heading);
+
+    if (clip && clip.status === 'completed' && clip.url) {
+      const video = document.createElement('video');
+      video.className = 'scene-clip-video';
+      video.controls = true;
+      video.src = clip.url;
+      card.appendChild(video);
+    } else {
+      const status = document.createElement('p');
+      status.className = 'scene-clip-status' + (clip && clip.status === 'failed' ? ' error' : '');
+      if (clip && clip.status === 'processing') {
+        status.textContent = 'Generating…';
+      } else if (clip && clip.status === 'failed') {
+        status.textContent = `Failed: ${clip.error || 'video generation failed.'}`;
+      } else {
+        status.textContent = 'Not generated yet.';
+      }
+      card.appendChild(status);
+    }
+
+    return card;
+  }
+
+  function renderSceneClipsCard(job) {
+    const clips =
+      job && job.videoGeneration && Array.isArray(job.videoGeneration.clips) ? job.videoGeneration.clips : [];
+
+    sceneClipsList.innerHTML = '';
+
+    if (clips.length === 0) {
+      sceneClipsEmpty.hidden = false;
+      sceneClipsList.hidden = true;
+      return;
+    }
+
+    sceneClipsEmpty.hidden = true;
+    sceneClipsList.hidden = false;
+    clips.forEach((clip, index) => {
+      sceneClipsList.appendChild(buildSceneClipCard(index, clip));
+    });
+  }
+
+  async function refreshSceneClipsCard() {
+    renderSceneClipsCard(await fetchCurrentJob());
+  }
+
   generateVoiceoverBtn.addEventListener('click', async () => {
     if (voiceoverGenerating || !jobId) {
       return;
@@ -346,4 +413,5 @@
 
   restoreExistingJob();
   refreshVoiceoverCard();
+  refreshSceneClipsCard();
 })();
