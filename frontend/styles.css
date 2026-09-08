@@ -325,6 +325,48 @@ a {
   font-weight: 600;
 }
 
+.scene-clips {
+  margin-top: 40px;
+}
+
+.scene-clips h3 {
+  margin: 0 0 12px;
+}
+
+.scene-clips-list {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
+  gap: 16px;
+}
+
+.scene-clip-card {
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius);
+  padding: 16px;
+  background: var(--color-surface);
+}
+
+.scene-clip-card h4 {
+  margin: 0 0 10px;
+}
+
+.scene-clip-video {
+  width: 100%;
+  border-radius: var(--radius);
+  aspect-ratio: 16 / 9;
+  background: #000;
+}
+
+.scene-clip-status {
+  margin: 0;
+  color: var(--color-muted);
+  font-size: 0.9rem;
+}
+
+.scene-clip-status.error {
+  color: #9a2f2f;
+}
+
 /* ---------- Final Review ---------- */
 .review {
   background: var(--color-surface);
