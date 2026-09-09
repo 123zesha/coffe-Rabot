@@ -185,8 +185,12 @@
         <div class="review-grid">
           <article class="review-card">
             <h3>Final MP4</h3>
-            <div class="review-placeholder video-placeholder" aria-hidden="true">▶</div>
-            <p class="review-note">Your rendered video will appear here.</p>
+            <div id="final-video-placeholder" class="review-placeholder video-placeholder" aria-hidden="true">▶</div>
+            <div id="final-video-panel" hidden>
+              <video id="final-video-player" class="review-video" controls hidden></video>
+              <a id="final-video-download" class="btn btn-primary" target="_blank" rel="noopener" hidden>Open / Download Final MP4</a>
+              <p id="final-video-status" class="generate-status" hidden aria-live="polite"></p>
+            </div>
           </article>
 
           <article class="review-card">

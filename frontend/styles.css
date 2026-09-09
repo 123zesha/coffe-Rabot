@@ -431,14 +431,24 @@ a {
   margin-bottom: 12px;
 }
 
+.review-video {
+  width: 100%;
+  aspect-ratio: 16 / 9;
+  border-radius: var(--radius);
+  background: #000;
+  margin-bottom: 12px;
+}
+
 /* .review-placeholder sets its own `display`, which otherwise overrides the
    native [hidden] behavior — without this, toggling .hidden in JS wouldn't
    actually hide this specific placeholder once it has that class. */
-#voiceover-placeholder[hidden] {
+#voiceover-placeholder[hidden],
+#final-video-placeholder[hidden] {
   display: none;
 }
 
-#voiceover-panel .generate-status {
+#voiceover-panel .generate-status,
+#final-video-panel .generate-status {
   margin-top: 12px;
 }
 
