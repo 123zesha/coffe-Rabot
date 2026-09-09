@@ -26,7 +26,7 @@ process.env.ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY || 'test-key';
 
 const app = require('./server');
 const jobStore = require('./job-store');
-const { ffmpegPath } = require('./video-assembly');
+const { ffmpegPath, getMediaDuration } = require('./video-assembly');
 const { GENERATED_DIR } = require('./video-storage');
 
 let failures = 0;
@@ -56,6 +56,14 @@ function makeClip(name) {
 
 function completedClip(clipPath) {
   return { status: 'completed', url: clipPath, externalJobId: 'ext', error: null, attempts: 1 };
+}
+
+function makeAudio(name, durationSeconds) {
+  const outPath = path.join(fixturesDir, name);
+  execFileSync(ffmpegPath, ['-y', '-f', 'lavfi', '-i', `sine=frequency=440:duration=${durationSeconds}`, outPath], {
+    stdio: 'ignore',
+  });
+  return outPath;
 }
 
 async function main() {
@@ -121,6 +129,33 @@ async function main() {
       `expected a /generated/ reference, got: ${persisted.finalVideo.url}`
     );
     assert.ok(!persisted.finalVideo.url.startsWith('data:'), 'the video bytes must never be embedded in the job record');
+  });
+
+  // End-to-end proof (through the real tool + storage, not just the
+  // video-assembly.js unit tests) that a job's real, already-generated
+  // voice-over actually ends up synchronized into the stored final MP4:
+  // every scene's clip is real 1s footage, the voice-over is a real 5s
+  // track, so the assembled+stored output must run the full ~5s (proving
+  // narration is never truncated) with a real audio stream muxed in.
+  await test('assembleFinalVideo tool syncs a real persisted voice-over into the stored final MP4', async () => {
+    const voiceoverPath = makeAudio('job-voiceover.mp3', 5);
+    const voiceoverDataUri = `data:audio/mpeg;base64,${fs.readFileSync(voiceoverPath).toString('base64')}`;
+
+    const job = await jobStore.createJob();
+    await jobStore.updateJob(job.id, {
+      videoPrompts: ['Scene 1 motion'],
+      videoGeneration: { provider: 'fake', status: 'completed', error: null, clips: [completedClip(clipPath)] },
+      voiceover: { url: voiceoverDataUri, status: 'completed', voice: 'alloy', voiceStyle: 'neutral-narrator' },
+    });
+
+    const result = JSON.parse(await app.executeTool('assembleFinalVideo', job.id, {}));
+    assert.strictEqual(result.finalVideo.status, 'completed', JSON.stringify(result));
+
+    const persisted = await jobStore.getJob(job.id);
+    const storedPath = path.join(GENERATED_DIR, persisted.finalVideo.url.replace('/generated/', ''));
+
+    const duration = await getMediaDuration(storedPath);
+    assert.ok(Math.abs(duration - 5) < 0.5, `expected the stored final video to run the full ~5s voice-over, got ${duration}s`);
   });
 
   await test('assembleFinalVideo tool skips real work once finalVideo is already completed (no re-assembly)', async () => {

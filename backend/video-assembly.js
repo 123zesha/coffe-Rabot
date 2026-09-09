@@ -66,6 +66,34 @@ function runFfmpeg(args) {
   });
 }
 
+// Real duration of a media file in seconds, read from ffmpeg's own decode
+// log (`-f null -` fully decodes the file with no output written) — never
+// trusted from a filename, a requested/expected duration, or any other
+// guess. Used to work out how each scene's clip needs to be retimed to
+// actually line up with the voice-over (see the sync comment below).
+function getMediaDuration(filePath) {
+  return new Promise((resolve, reject) => {
+    execFile(ffmpegPath, ['-i', filePath, '-f', 'null', '-'], { maxBuffer: 1024 * 1024 * 16 }, (error, stdout, stderr) => {
+      const log = (stderr || '').toString();
+      if (error) {
+        reject(new Error(`Could not read ${filePath} to determine its duration: ${log.trim().slice(-500)}`));
+        return;
+      }
+      const match = log.match(/Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)/);
+      if (!match) {
+        reject(new Error(`ffmpeg did not report a duration for ${filePath}.`));
+        return;
+      }
+      const seconds = Number(match[1]) * 3600 + Number(match[2]) * 60 + Number(match[3]);
+      if (!(seconds > 0)) {
+        reject(new Error(`${filePath} has no measurable duration.`));
+        return;
+      }
+      resolve(seconds);
+    });
+  });
+}
+
 // Resolves one clip/audio URL to real bytes on disk at destPath. Supports
 // exactly the two shapes this app's job records actually use — a base64
 // data: URI (voiceover.url, and any future locally-stored clip) and a real
@@ -109,6 +137,23 @@ async function fetchToFile(url, destPath) {
 // produces a real, playable, video-only final file instead, exactly as
 // required — a missing voice-over is never treated as an assembly failure.
 //
+// Scene sync: the voice-over is one continuous track generated from the
+// whole script (backend/voiceover-generation.js) — there is no per-scene
+// narration timing to align against without a real speech-alignment/ASR
+// call, which would be a new paid API this step must not add. So each
+// scene is given an equal share of the voice-over's REAL, measured
+// duration (never assumed/guessed) — every scene's own clip is trimmed
+// down or extended (by freezing its last frame, never by inventing new
+// footage or stretching motion speed) to exactly that share. This
+// guarantees the two things "synchronized" actually requires here: the
+// full narration is always heard (fixing the old '-shortest' behavior,
+// which silently cut off any narration past however long the
+// concatenated clips happened to run), and every scene still gets real,
+// proportional screen time instead of the final video being paced only by
+// arbitrary per-clip lengths. Without a voice-over, clips keep their
+// original, unmodified durations — nothing about the video-only path
+// changes.
+//
 // Returns { status: 'completed', buffer: Buffer, error: null } on success —
 // buffer is the real assembled MP4's raw bytes, deliberately NOT a url or
 // data: URI; see the module comment above for why storage is a separate
@@ -129,15 +174,58 @@ async function assembleFinalVideo({ clips, voiceover }) {
       clipPaths.push(clipPath);
     }
 
+    const hasVoiceover = Boolean(voiceover && voiceover.status === 'completed' && voiceover.url);
+    let audioPath = null;
+    let perSceneDuration = null;
+
+    if (hasVoiceover) {
+      audioPath = path.join(workDir, 'voiceover-audio');
+      await fetchToFile(voiceover.url, audioPath);
+      const totalAudioDuration = await getMediaDuration(audioPath);
+      perSceneDuration = totalAudioDuration / clipPaths.length;
+    }
+
     const concatenatedPath = path.join(workDir, 'concatenated.mp4');
     const inputArgs = clipPaths.flatMap((clipPath) => ['-i', clipPath]);
-    const normalizeFilters = clipPaths
-      .map(
-        (_, i) =>
-          `[${i}:v]scale=${OUTPUT_WIDTH}:${OUTPUT_HEIGHT}:force_original_aspect_ratio=decrease,` +
-          `pad=${OUTPUT_WIDTH}:${OUTPUT_HEIGHT}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=${OUTPUT_FPS}[v${i}]`
-      )
-      .join(';');
+
+    let normalizeFilters;
+    if (hasVoiceover) {
+      const clipDurations = await Promise.all(clipPaths.map((clipPath) => getMediaDuration(clipPath)));
+      normalizeFilters = clipPaths
+        .map((_, i) => {
+          // trim first to whichever is shorter (a no-op if the clip is
+          // already shorter than its share), then tpad makes up any
+          // remaining shortfall by holding the last frame — so every
+          // normalized clip ends up at EXACTLY perSceneDuration, never
+          // over (which would re-introduce the old truncation problem
+          // downstream) and never under (dead air with no picture).
+          const trimTo = Math.min(clipDurations[i], perSceneDuration).toFixed(3);
+          const padBy = Math.max(0, perSceneDuration - clipDurations[i]).toFixed(3);
+          // Deliberately no setpts=PTS-STARTPTS between trim and tpad: it
+          // resets each frame's timestamp to start at 0, which — verified
+          // empirically against this exact ffmpeg build — makes tpad
+          // compute its stop_duration padding against the wrong timeline
+          // and silently pad far less than requested. concat (below)
+          // already normalizes timestamps across segments on its own, so
+          // no reset is needed here.
+          return (
+            `[${i}:v]scale=${OUTPUT_WIDTH}:${OUTPUT_HEIGHT}:force_original_aspect_ratio=decrease,` +
+            `pad=${OUTPUT_WIDTH}:${OUTPUT_HEIGHT}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=${OUTPUT_FPS},` +
+            `trim=duration=${trimTo},` +
+            `tpad=stop_mode=clone:stop_duration=${padBy}[v${i}]`
+          );
+        })
+        .join(';');
+    } else {
+      normalizeFilters = clipPaths
+        .map(
+          (_, i) =>
+            `[${i}:v]scale=${OUTPUT_WIDTH}:${OUTPUT_HEIGHT}:force_original_aspect_ratio=decrease,` +
+            `pad=${OUTPUT_WIDTH}:${OUTPUT_HEIGHT}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=${OUTPUT_FPS}[v${i}]`
+        )
+        .join(';');
+    }
+
     const concatRefs = clipPaths.map((_, i) => `[v${i}]`).join('');
     const filterComplex = `${normalizeFilters};${concatRefs}concat=n=${clipPaths.length}:v=1:a=0[outv]`;
 
@@ -156,18 +244,13 @@ async function assembleFinalVideo({ clips, voiceover }) {
     ]);
 
     let finalPath = concatenatedPath;
-    const hasVoiceover = Boolean(voiceover && voiceover.status === 'completed' && voiceover.url);
 
     if (hasVoiceover) {
-      const audioPath = path.join(workDir, 'voiceover-audio');
-      await fetchToFile(voiceover.url, audioPath);
-
       finalPath = path.join(workDir, 'final.mp4');
-      // -shortest bounds the output to the shorter of the concatenated
-      // scene video and the voice-over track, so the result never ends in
-      // trailing silence over a black/frozen frame, nor plain video with no
-      // narration once it runs out — a known, simple limitation (no
-      // duration-matching/retiming logic exists yet), not a bug.
+      // The concatenated video's total length is now (perSceneDuration *
+      // scene count), which already equals the voice-over's real duration
+      // to within float/frame rounding — -shortest here is only a safety
+      // net for that rounding, not the primary sync mechanism anymore.
       await runFfmpeg([
         '-y',
         '-i',
@@ -202,4 +285,4 @@ async function assembleFinalVideo({ clips, voiceover }) {
   }
 }
 
-module.exports = { assembleFinalVideo, ffmpegPath };
+module.exports = { assembleFinalVideo, getMediaDuration, ffmpegPath };
