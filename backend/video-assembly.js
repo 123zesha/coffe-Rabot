@@ -1,9 +1,11 @@
 // Assembles a job's already-generated, real scene video clips (see
 // backend/video-generation.js) — plus its voice-over audio, if one has
 // already been generated (see backend/voiceover-generation.js) — into one
-// real, playable final MP4. This is the ONLY place job.finalVideo may ever
-// be set to 'completed'; nothing else may fabricate a value here (see
-// job-store.js's finalVideo comment and the READY stage-output gate).
+// real, playable final MP4. Combined with backend/video-storage.js (which
+// this module deliberately does NOT depend on — see below), this is the
+// ONLY path that may ever set job.finalVideo to 'completed'; nothing else
+// may fabricate a value here (see job-store.js's finalVideo comment and the
+// READY stage-output gate).
 //
 // This step calls no paid API at all: every input (clip URLs, voice-over
 // audio) was already generated and paid for earlier in the pipeline, and
@@ -12,13 +14,23 @@
 // this environment and in a deployed serverless function alike, without
 // relying on a system package that Vercel's runtime does not provide).
 //
+// This module only returns the assembled video's raw bytes — it never
+// decides how/where they end up stored. That is deliberately a separate
+// concern (backend/video-storage.js): a multi-scene final video can run to
+// tens of MB, and embedding that as base64 directly in job.finalVideo.url
+// (the way images/voiceover already work) would risk hitting the Redis/
+// Upstash per-request payload-size limit — exactly the class of bug fixed
+// in job-store.js's per-job-key rework. Keeping ffmpeg processing and
+// storage as two separate, independently testable steps means either one
+// can change without touching the other.
+//
 // Callers (backend/server.js) are responsible for checking that every scene
 // clip is actually 'completed' before calling this — see
 // findFinalVideoBlocker — so this module can assume its `clips` input is
 // ready to assemble. It still never trusts that blindly: any clip whose
 // media can't actually be fetched, or any ffmpeg failure, is reported back
 // as a real 'failed' result with the actual error, never silently ignored
-// or papered over with a fabricated URL.
+// or papered over with fabricated output.
 
 const fs = require('fs');
 const os = require('os');
@@ -96,9 +108,15 @@ async function fetchToFile(url, destPath) {
 // and it has a url; any other voiceover state (pending/failed/missing)
 // produces a real, playable, video-only final file instead, exactly as
 // required — a missing voice-over is never treated as an assembly failure.
+//
+// Returns { status: 'completed', buffer: Buffer, error: null } on success —
+// buffer is the real assembled MP4's raw bytes, deliberately NOT a url or
+// data: URI; see the module comment above for why storage is a separate
+// step (backend/video-storage.js) — or { status: 'failed', buffer: null,
+// error } on any real failure. Never fabricates a buffer.
 async function assembleFinalVideo({ clips, voiceover }) {
   if (!Array.isArray(clips) || clips.length === 0) {
-    return { url: null, status: 'failed', error: 'No scene video clips were provided to assemble.' };
+    return { buffer: null, status: 'failed', error: 'No scene video clips were provided to assemble.' };
   }
 
   const workDir = fs.mkdtempSync(path.join(os.tmpdir(), 'video-assembly-'));
@@ -174,15 +192,11 @@ async function assembleFinalVideo({ clips, voiceover }) {
       throw new Error('ffmpeg produced an empty output file.');
     }
 
-    return {
-      url: `data:video/mp4;base64,${buffer.toString('base64')}`,
-      status: 'completed',
-      error: null,
-    };
+    return { buffer, status: 'completed', error: null };
   } catch (error) {
     const message = (error && error.message) || 'Unknown error assembling final video.';
     console.error('Final video assembly error:', JSON.stringify({ message }, null, 2));
-    return { url: null, status: 'failed', error: message };
+    return { buffer: null, status: 'failed', error: message };
   } finally {
     fs.rmSync(workDir, { recursive: true, force: true });
   }

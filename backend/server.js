@@ -9,6 +9,7 @@ const imageGeneration = require('./image-generation');
 const voiceoverGeneration = require('./voiceover-generation');
 const videoGeneration = require('./video-generation');
 const videoAssembly = require('./video-assembly');
+const videoStorage = require('./video-storage');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -130,6 +131,38 @@ function findFinalVideoBlocker(job) {
   }
 
   return null;
+}
+
+// Runs the real ffmpeg assembly step (backend/video-assembly.js) and, only
+// on success, stores the resulting bytes outside the job record itself
+// (backend/video-storage.js) — see that module's comment for why an
+// assembled multi-scene video must never be embedded directly in
+// job.finalVideo.url the way images/voiceover are. Shared by the
+// assembleFinalVideo Agent tool and its REST route so the two never drift.
+async function assembleAndStoreFinalVideo(job, jobId) {
+  const assembly = await videoAssembly.assembleFinalVideo({
+    clips: job.videoGeneration.clips,
+    voiceover: job.voiceover,
+  });
+
+  if (assembly.status !== 'completed') {
+    return { url: null, status: 'failed', error: assembly.error || 'Final video assembly failed.' };
+  }
+
+  try {
+    const url = await videoStorage.storeFinalVideo(assembly.buffer, jobId);
+    return { url, status: 'completed', error: null };
+  } catch (error) {
+    console.error(
+      'Final video storage error:',
+      JSON.stringify({ name: error?.name, message: error?.message }, null, 2)
+    );
+    return {
+      url: null,
+      status: 'failed',
+      error: `The final video was assembled but could not be stored: ${error.message}`,
+    };
+  }
 }
 
 const client = new Anthropic();
@@ -612,14 +645,12 @@ async function executeTool(name, jobId, input) {
     }
 
     try {
-      // Reuses the exact same assembly implementation the REST route
-      // already uses (backend/video-assembly.js) — no second assembly
-      // system. Calls no paid API: every clip and the voice-over were
-      // already generated (and, for the clips, already paid for) earlier.
-      const finalVideo = await videoAssembly.assembleFinalVideo({
-        clips: job.videoGeneration.clips,
-        voiceover: job.voiceover,
-      });
+      // Reuses the exact same assembly + storage implementation the REST
+      // route already uses (backend/video-assembly.js, backend/
+      // video-storage.js) — no second assembly system. Calls no paid API:
+      // every clip and the voice-over were already generated (and, for the
+      // clips, already paid for) earlier.
+      const finalVideo = await assembleAndStoreFinalVideo(job, jobId);
       const updatedJob = await jobStore.updateJob(jobId, { finalVideo });
       return JSON.stringify(updatedJob ? summarizeJobForAgent(updatedJob) : { error: 'job not found' });
     } catch (error) {
@@ -652,6 +683,13 @@ app.use((err, req, res, next) => {
   next(err);
 });
 app.use(express.static(path.resolve(__dirname, '..', 'frontend')));
+// Serves a locally-assembled final video back out (see
+// backend/video-storage.js) — only ever populated in local dev/tests, where
+// there is no BLOB_READ_WRITE_TOKEN and the video was written to
+// data/generated/ instead of Vercel Blob. In production this directory is
+// never written to (Vercel's deployed filesystem is read-only) and this
+// route simply serves nothing.
+app.use('/generated', express.static(videoStorage.GENERATED_DIR));
 
 app.post('/api/agent', async (req, res) => {
   const { message, conversationHistory, jobId: requestedJobId } = req.body || {};
@@ -993,11 +1031,7 @@ app.post('/api/jobs/:id/assemble-video', async (req, res) => {
   }
 
   try {
-    const finalVideo = await videoAssembly.assembleFinalVideo({
-      clips: job.videoGeneration.clips,
-      voiceover: job.voiceover,
-    });
-
+    const finalVideo = await assembleAndStoreFinalVideo(job, job.id);
     const updatedJob = await jobStore.updateJob(job.id, { finalVideo });
     res.json(updatedJob);
   } catch (error) {

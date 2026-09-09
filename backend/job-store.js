@@ -254,9 +254,15 @@ function createDefaultJob(id) {
     // completed scene clip above and muxes in the voice-over audio if one
     // exists. Stays 'pending' until that has actually run and succeeded —
     // this is what keeps the job from being marked COMPLETED (see
-    // STAGE_OUTPUT_REQUIREMENTS below) until a real final video exists. Not
-    // writable by the conversational agent, same as images/voiceover —
-    // nothing may ever fabricate a value here.
+    // STAGE_OUTPUT_REQUIREMENTS below) until a real final video exists.
+    // UNLIKE images[].url/voiceover.url, this is never an embedded base64
+    // data: URI — a multi-scene final video is far larger than one image or
+    // voice-over track, so backend/video-storage.js stores the real bytes
+    // outside the job record (Vercel Blob in production, a local file in
+    // dev) and only that lightweight reference URL lives here, keeping this
+    // job record small regardless of video size (see video-storage.js's own
+    // comment). Not writable by the conversational agent, same as
+    // images/voiceover — nothing may ever fabricate a value here.
     finalVideo: { url: null, status: 'pending' },
     subtitles: '',
     music: '',

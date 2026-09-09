@@ -5,6 +5,11 @@
 // other paid API is ever called. This proves the module can produce a real,
 // playable MP4 from local/mock media alone.
 //
+// assembleFinalVideo returns the assembled video's raw bytes (a Buffer),
+// never a url — see backend/video-storage.js (and
+// test-video-storage.js/test-assemble-final-video.js) for the separate
+// storage step that turns that buffer into job.finalVideo.url.
+//
 // Run with:
 //   node test-video-assembly.js
 // or:
@@ -65,17 +70,12 @@ function probe(filePath) {
   return result.stderr || '';
 }
 
-function decodeDataUri(dataUri) {
-  const commaIndex = dataUri.indexOf(',');
-  return Buffer.from(dataUri.slice(commaIndex + 1), 'base64');
-}
-
 async function main() {
   const redClipPath = makeClip('red.mp4', 'red');
   const blueClipPath = makeClip('blue.mp4', 'blue');
   const audioPath = makeAudio('voice.mp3');
 
-  await test('assembleFinalVideo concatenates two completed local-file clips into one real, playable MP4', async () => {
+  await test('assembleFinalVideo concatenates two completed local-file clips into one real, playable MP4 buffer', async () => {
     const result = await assembleFinalVideo({
       clips: [
         { status: 'completed', url: redClipPath },
@@ -85,17 +85,14 @@ async function main() {
     });
 
     assert.strictEqual(result.status, 'completed');
-    assert.ok(result.url && result.url.startsWith('data:video/mp4;base64,'));
-
-    const buffer = decodeDataUri(result.url);
-    assert.ok(buffer.length > 0, 'decoded MP4 buffer must not be empty');
+    assert.ok(Buffer.isBuffer(result.buffer) && result.buffer.length > 0, 'must return a real, non-empty Buffer');
     // Every valid MP4 has an 'ftyp' box near the start of the file — this is
     // a real, structural proof the bytes are an actual MP4, not arbitrary
-    // data wrapped in a data: URI.
-    assert.ok(buffer.slice(4, 12).toString('ascii').includes('ftyp'), 'output must be a real MP4 file');
+    // data.
+    assert.ok(result.buffer.slice(4, 12).toString('ascii').includes('ftyp'), 'output must be a real MP4 file');
 
     const tmpOut = path.join(fixturesDir, 'check-concat.mp4');
-    fs.writeFileSync(tmpOut, buffer);
+    fs.writeFileSync(tmpOut, result.buffer);
     const log = probe(tmpOut);
     assert.ok(log.includes('Video:'), 'ffmpeg must be able to decode a real video stream from the output');
   });
@@ -119,7 +116,7 @@ async function main() {
       });
 
       assert.strictEqual(result.status, 'completed');
-      assert.ok(result.url.startsWith('data:video/mp4;base64,'));
+      assert.ok(Buffer.isBuffer(result.buffer) && result.buffer.length > 0);
     } finally {
       server.close();
     }
@@ -134,7 +131,7 @@ async function main() {
     });
 
     assert.strictEqual(result.status, 'completed');
-    assert.ok(result.url.startsWith('data:video/mp4;base64,'));
+    assert.ok(Buffer.isBuffer(result.buffer) && result.buffer.length > 0);
   });
 
   await test('assembleFinalVideo mixes in the existing voice-over audio track when one is completed', async () => {
@@ -150,9 +147,8 @@ async function main() {
 
     assert.strictEqual(result.status, 'completed');
 
-    const buffer = decodeDataUri(result.url);
     const tmpOut = path.join(fixturesDir, 'check-with-audio.mp4');
-    fs.writeFileSync(tmpOut, buffer);
+    fs.writeFileSync(tmpOut, result.buffer);
     const log = probe(tmpOut);
     assert.ok(log.includes('Video:'), 'output must still have a video stream');
     assert.ok(log.includes('Audio:'), 'output must have the voice-over mixed in as a real audio stream');
@@ -167,23 +163,22 @@ async function main() {
 
       assert.strictEqual(result.status, 'completed', `expected success with voiceover=${JSON.stringify(voiceover)}`);
 
-      const buffer = decodeDataUri(result.url);
       const tmpOut = path.join(fixturesDir, 'check-video-only.mp4');
-      fs.writeFileSync(tmpOut, buffer);
+      fs.writeFileSync(tmpOut, result.buffer);
       const log = probe(tmpOut);
       assert.ok(log.includes('Video:'));
       assert.ok(!log.includes('Audio:'), 'a missing/incomplete voice-over must never produce a fabricated audio track');
     }
   });
 
-  await test('assembleFinalVideo returns a real failure, never a fabricated URL, when a clip cannot be fetched', async () => {
+  await test('assembleFinalVideo returns a real failure, never a fabricated buffer, when a clip cannot be fetched', async () => {
     const result = await assembleFinalVideo({
       clips: [{ status: 'completed', url: 'http://localhost:1/does-not-exist.mp4' }],
       voiceover: null,
     });
 
     assert.strictEqual(result.status, 'failed');
-    assert.strictEqual(result.url, null);
+    assert.strictEqual(result.buffer, null);
     assert.ok(result.error && result.error.length > 0);
   });
 
@@ -191,7 +186,7 @@ async function main() {
     const result = await assembleFinalVideo({ clips: [], voiceover: null });
 
     assert.strictEqual(result.status, 'failed');
-    assert.strictEqual(result.url, null);
+    assert.strictEqual(result.buffer, null);
     assert.ok(result.error.toLowerCase().includes('clip'));
   });
 

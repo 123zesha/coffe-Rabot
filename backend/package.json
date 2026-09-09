@@ -19,6 +19,7 @@
     "test:image-generation-latency-fix": "node test-image-generation-latency-fix.js",
     "test:image-edit-reference-shape": "node test-image-edit-reference-shape.js",
     "test:video-assembly": "node test-video-assembly.js",
+    "test:video-storage": "node test-video-storage.js",
     "test:assemble-final-video": "node test-assemble-final-video.js"
   },
   "keywords": [],
@@ -27,6 +28,7 @@
   "dependencies": {
     "@anthropic-ai/sdk": "^0.122.0",
     "@upstash/redis": "^1.38.3",
+    "@vercel/blob": "^2.8.0",
     "dotenv": "^17.4.2",
     "express": "^5.2.1",
     "ffmpeg-static": "^5.3.0",

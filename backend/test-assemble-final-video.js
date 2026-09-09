@@ -27,6 +27,7 @@ process.env.ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY || 'test-key';
 const app = require('./server');
 const jobStore = require('./job-store');
 const { ffmpegPath } = require('./video-assembly');
+const { GENERATED_DIR } = require('./video-storage');
 
 let failures = 0;
 
@@ -110,12 +111,21 @@ async function main() {
 
     const persisted = await jobStore.getJob(job.id);
     assert.strictEqual(persisted.finalVideo.status, 'completed');
-    assert.ok(persisted.finalVideo.url && persisted.finalVideo.url.startsWith('data:video/mp4;base64,'));
+    // No BLOB_READ_WRITE_TOKEN is set in this test process, so this exercises
+    // video-storage.js's local-file fallback: a real MP4 was written to
+    // data/generated/ and only a short /generated/... reference is stored on
+    // the job — never the video bytes themselves (see
+    // test-video-storage.js and the dedicated payload-size test below).
+    assert.ok(
+      persisted.finalVideo.url && persisted.finalVideo.url.startsWith('/generated/final-video-'),
+      `expected a /generated/ reference, got: ${persisted.finalVideo.url}`
+    );
+    assert.ok(!persisted.finalVideo.url.startsWith('data:'), 'the video bytes must never be embedded in the job record');
   });
 
   await test('assembleFinalVideo tool skips real work once finalVideo is already completed (no re-assembly)', async () => {
     const job = await jobStore.createJob();
-    const placeholderUrl = 'data:video/mp4;base64,QUxSRUFEWURPTkU=';
+    const placeholderUrl = '/generated/final-video-already-done.mp4';
     await jobStore.updateJob(job.id, {
       videoPrompts: ['Scene 1 motion'],
       // Deliberately an unfetchable clip URL — if the tool re-ran assembly
@@ -193,11 +203,58 @@ async function main() {
 
     assert.strictEqual(res.status, 200, JSON.stringify(body));
     assert.strictEqual(body.finalVideo.status, 'completed');
-    assert.ok(body.finalVideo.url.startsWith('data:video/mp4;base64,'));
+    assert.ok(body.finalVideo.url.startsWith('/generated/final-video-'));
+  });
+
+  // Regression test for the exact production risk this storage rework
+  // fixes: embedding an assembled video as base64 directly in job.finalVideo
+  // (the way images/voiceover already work) grows the job record
+  // proportionally to video size, risking the same Redis/Upstash
+  // payload-size failure PR #25 fixed. Concatenates several real, several-
+  // second clips (a few hundred KB of real MP4 — a genuine multi-scene-sized
+  // final video, not a trivial one-frame fixture) and proves the persisted
+  // JOB record's own serialized size stays small regardless, because only a
+  // short reference URL is ever stored there.
+  await test('a real multi-scene final video does not bloat the job record (no Redis/Upstash payload-size risk)', async () => {
+    // A moving test pattern (not a flat color) so it doesn't compress down
+    // to near-nothing — this needs to be a realistically-sized real video,
+    // not just a technically-valid tiny one.
+    const biggerClipPath = path.join(fixturesDir, 'bigger-scene.mp4');
+    execFileSync(
+      ffmpegPath,
+      ['-y', '-f', 'lavfi', '-i', 'testsrc=size=640x480:rate=30:duration=3', '-pix_fmt', 'yuv420p', biggerClipPath],
+      { stdio: 'ignore' }
+    );
+
+    const job = await jobStore.createJob();
+    await jobStore.updateJob(job.id, {
+      videoPrompts: ['Scene 1 motion', 'Scene 2 motion', 'Scene 3 motion'],
+      videoGeneration: {
+        provider: 'fake',
+        status: 'completed',
+        error: null,
+        clips: [completedClip(biggerClipPath), completedClip(biggerClipPath), completedClip(biggerClipPath)],
+      },
+    });
+
+    const result = JSON.parse(await app.executeTool('assembleFinalVideo', job.id, {}));
+    assert.strictEqual(result.finalVideo.status, 'completed', JSON.stringify(result));
+
+    const persisted = await jobStore.getJob(job.id);
+    const generatedFilePath = path.join(GENERATED_DIR, persisted.finalVideo.url.replace('/generated/', ''));
+    const realVideoBytes = fs.statSync(generatedFilePath).size;
+    const jobRecordBytes = JSON.stringify(persisted).length;
+
+    assert.ok(realVideoBytes > 50 * 1024, `expected a real multi-second video, only got ${realVideoBytes} bytes`);
+    assert.ok(
+      jobRecordBytes < 5 * 1024,
+      `job record grew to ${jobRecordBytes} bytes for a ${realVideoBytes}-byte video — the video must be stored outside the job record`
+    );
   });
 
   server.close();
   fs.rmSync(fixturesDir, { recursive: true, force: true });
+  fs.rmSync(GENERATED_DIR, { recursive: true, force: true });
 
   if (originalJobsFile !== null) {
     fs.writeFileSync(JOBS_FILE, originalJobsFile);
