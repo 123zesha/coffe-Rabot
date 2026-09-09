@@ -8,6 +8,8 @@ const jobStore = require('./job-store');
 const imageGeneration = require('./image-generation');
 const voiceoverGeneration = require('./voiceover-generation');
 const videoGeneration = require('./video-generation');
+const videoAssembly = require('./video-assembly');
+const videoStorage = require('./video-storage');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -88,6 +90,79 @@ function findScenePromptMismatch(job) {
   }
 
   return null;
+}
+
+// job.videoGeneration.clips[i] must actually exist and be 'completed' — with
+// a real url — for every scene before assembleFinalVideo (backend/
+// video-assembly.js) is called; assembling from a clip that is missing,
+// still processing, or failed would either crash ffmpeg or silently produce
+// a final video with a scene missing. Checking this up front, by scene
+// number, lets the error tell the Agent exactly which scene still needs
+// generateSceneVideo, the same actionable style as findScenePromptMismatch.
+function findFinalVideoBlocker(job) {
+  const expectedCount = Array.isArray(job.videoPrompts) ? job.videoPrompts.length : 0;
+  const clips = job.videoGeneration && Array.isArray(job.videoGeneration.clips) ? job.videoGeneration.clips : [];
+
+  if (expectedCount === 0) {
+    return 'There are no videoPrompts yet, so there are no scene video clips to assemble. Set up scene video generation first.';
+  }
+
+  if (clips.length === 0) {
+    return (
+      'No scene video clips have been generated yet. Use generateSceneVideo to generate every ' +
+      "scene's video clip before assembling the final video."
+    );
+  }
+
+  if (clips.length !== expectedCount) {
+    return (
+      `Only ${clips.length} of ${expectedCount} scene video clip(s) exist yet. Use generateSceneVideo ` +
+      'to generate the remaining scene(s) before assembling the final video.'
+    );
+  }
+
+  const incompleteIndex = clips.findIndex((clip) => !clip || clip.status !== 'completed');
+  if (incompleteIndex !== -1) {
+    const status = clips[incompleteIndex] ? clips[incompleteIndex].status : 'not_started';
+    return (
+      `Scene ${incompleteIndex + 1}'s video clip is not completed yet (status: ${status}). Use ` +
+      'generateSceneVideo to finish every scene before assembling the final video.'
+    );
+  }
+
+  return null;
+}
+
+// Runs the real ffmpeg assembly step (backend/video-assembly.js) and, only
+// on success, stores the resulting bytes outside the job record itself
+// (backend/video-storage.js) — see that module's comment for why an
+// assembled multi-scene video must never be embedded directly in
+// job.finalVideo.url the way images/voiceover are. Shared by the
+// assembleFinalVideo Agent tool and its REST route so the two never drift.
+async function assembleAndStoreFinalVideo(job, jobId) {
+  const assembly = await videoAssembly.assembleFinalVideo({
+    clips: job.videoGeneration.clips,
+    voiceover: job.voiceover,
+  });
+
+  if (assembly.status !== 'completed') {
+    return { url: null, status: 'failed', error: assembly.error || 'Final video assembly failed.' };
+  }
+
+  try {
+    const url = await videoStorage.storeFinalVideo(assembly.buffer, jobId);
+    return { url, status: 'completed', error: null };
+  } catch (error) {
+    console.error(
+      'Final video storage error:',
+      JSON.stringify({ name: error?.name, message: error?.message }, null, 2)
+    );
+    return {
+      url: null,
+      status: 'failed',
+      error: `The final video was assembled but could not be stored: ${error.message}`,
+    };
+  }
 }
 
 const client = new Anthropic();
@@ -255,11 +330,11 @@ const TOOLS = [
       'It also cannot leave SCRIPTING without a complete script (a short fragment is not enough), ' +
       'leave SCENE PLANNING without non-empty scenes and characters, leave ASSET GENERATION ' +
       'without non-empty imagePrompts and videoPrompts, or leave READY without a real, ' +
-      'successfully rendered final video file. Individual scene video clips can be generated, ' +
-      'but they are not yet automatically assembled into one final video file, so this call ' +
-      'will currently always report finalVideo missing when leaving READY — when it does, tell ' +
-      'the user plainly that the final video is not assembled/available yet and their job stays ' +
-      'at the READY stage; never say the video has been produced, rendered, or completed.',
+      'successfully rendered final video file. Once every scene\'s video clip is completed, call ' +
+      'assembleFinalVideo first — this reports finalVideo missing if that has not been done yet. ' +
+      'When it reports finalVideo missing, tell the user plainly that the final video is not ' +
+      'assembled/available yet and their job stays at the READY stage; never say the video has ' +
+      'been produced, rendered, or completed until assembleFinalVideo actually reports it completed.',
     input_schema: {
       type: 'object',
       properties: {},
@@ -312,6 +387,27 @@ const TOOLS = [
         sceneIndex: { type: 'integer', minimum: 0 },
       },
       required: ['sceneIndex'],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: 'assembleFinalVideo',
+    description:
+      'Combine every already-completed scene video clip (plus the existing voice-over audio, if one ' +
+      'has been generated) into one real, playable final MP4 for the current job, using local ffmpeg ' +
+      'processing only. This calls NO paid API — every clip and the voice-over were already generated ' +
+      'and paid for earlier — so, unlike generateSceneVideo/generateSceneImages, you do not need to ' +
+      'ask the user for permission before calling this. Requires every scene\'s video clip to already ' +
+      'be completed; if any scene is missing or not yet completed, this refuses with a clear reason — ' +
+      'generate the missing scene(s) with generateSceneVideo and try again, never ask the user to fix ' +
+      'it manually. If there is no voice-over yet, the final video is produced silently (video only), ' +
+      'which is expected, not a failure. Calling this again after it already succeeded is a safe no-op ' +
+      'that returns the existing final video unchanged. Only tell the user the final video is ready if ' +
+      'this reports it as completed — subtitles, background music, thumbnail generation, and YouTube ' +
+      'publishing are still not implemented, so never claim any of those happened.',
+    input_schema: {
+      type: 'object',
+      properties: {},
       additionalProperties: false,
     },
   },
@@ -398,10 +494,9 @@ async function executeTool(name, jobId, input) {
       return JSON.stringify({
         error: isRenderingBlock
           ? 'The job cannot be marked COMPLETED because no real, assembled final video exists yet. ' +
-            'Individual scene clips may exist, but they are not automatically combined into one ' +
-            'final video file yet — tell the user their video is not produced/rendered yet and the ' +
-            'job stays at the READY stage. Do not call updateVideoJob for this; it cannot be filled ' +
-            'in manually.'
+            'Call assembleFinalVideo once every scene\'s video clip is completed — tell the user ' +
+            'their video is not produced/rendered yet and the job stays at the READY stage until ' +
+            'that succeeds. Do not call updateVideoJob for this; it cannot be filled in manually.'
           : `The job cannot advance out of ${result.job.status} because the following required output is missing or empty: ` +
             `${result.missingFields.join(', ')}. Use updateVideoJob to fill these in first.`,
         missingFields: result.missingFields,
@@ -528,6 +623,47 @@ async function executeTool(name, jobId, input) {
     }
   }
 
+  if (name === 'assembleFinalVideo') {
+    const job = await jobStore.getJob(jobId);
+
+    if (!job) {
+      return JSON.stringify({ error: 'job not found' });
+    }
+
+    // Already assembled — return the existing result unchanged rather than
+    // re-running ffmpeg on every call. Not a paid-cost concern like the
+    // image/video providers, but still real, non-trivial local compute, and
+    // re-assembling would otherwise silently replace a job's real final
+    // video with a fresh one whenever the Agent is asked about it again.
+    if (job.finalVideo && job.finalVideo.status === 'completed' && job.finalVideo.url) {
+      return JSON.stringify(summarizeJobForAgent(job));
+    }
+
+    const blocker = findFinalVideoBlocker(job);
+    if (blocker) {
+      return JSON.stringify({ error: blocker });
+    }
+
+    try {
+      // Reuses the exact same assembly + storage implementation the REST
+      // route already uses (backend/video-assembly.js, backend/
+      // video-storage.js) — no second assembly system. Calls no paid API:
+      // every clip and the voice-over were already generated (and, for the
+      // clips, already paid for) earlier.
+      const finalVideo = await assembleAndStoreFinalVideo(job, jobId);
+      const updatedJob = await jobStore.updateJob(jobId, { finalVideo });
+      return JSON.stringify(updatedJob ? summarizeJobForAgent(updatedJob) : { error: 'job not found' });
+    } catch (error) {
+      console.error(
+        'Unexpected error assembling final video (agent tool):',
+        JSON.stringify({ name: error?.name, message: error?.message }, null, 2)
+      );
+      return JSON.stringify({
+        error: 'Final video assembly failed unexpectedly. Tell the user to try again in a moment.',
+      });
+    }
+  }
+
   return JSON.stringify({ error: `Unknown tool: ${name}` });
 }
 
@@ -547,6 +683,13 @@ app.use((err, req, res, next) => {
   next(err);
 });
 app.use(express.static(path.resolve(__dirname, '..', 'frontend')));
+// Serves a locally-assembled final video back out (see
+// backend/video-storage.js) — only ever populated in local dev/tests, where
+// there is no BLOB_READ_WRITE_TOKEN and the video was written to
+// data/generated/ instead of Vercel Blob. In production this directory is
+// never written to (Vercel's deployed filesystem is read-only) and this
+// route simply serves nothing.
+app.use('/generated', express.static(videoStorage.GENERATED_DIR));
 
 app.post('/api/agent', async (req, res) => {
   const { message, conversationHistory, jobId: requestedJobId } = req.body || {};
@@ -854,9 +997,9 @@ app.post('/api/jobs/:id/generate-video', async (req, res) => {
 
     // finalVideo is never set here, even when every scene's clip is
     // 'completed' — that is many separate short clips, not one final
-    // assembled video. Producing finalVideo requires a real, separate
-    // assembly/stitching step that does not exist yet (see
-    // backend/video-generation.js and job-store.js's finalVideo comment).
+    // assembled video. POST /api/jobs/:id/assemble-video (backend/
+    // video-assembly.js) is the separate, real assembly/stitching step that
+    // actually produces finalVideo.
     const updatedJob = await jobStore.updateJob(job.id, { videoGeneration: videoGenerationField });
     res.json(updatedJob);
   } catch (error) {
@@ -865,6 +1008,38 @@ app.post('/api/jobs/:id/generate-video', async (req, res) => {
       JSON.stringify({ name: error?.name, message: error?.message }, null, 2)
     );
     res.status(502).json({ error: 'Video generation failed unexpectedly.' });
+  }
+});
+
+app.post('/api/jobs/:id/assemble-video', async (req, res) => {
+  const job = await jobStore.getJob(req.params.id);
+
+  if (!job) {
+    return res.status(404).json({ error: 'job not found' });
+  }
+
+  // Already assembled — return the existing result unchanged rather than
+  // re-running ffmpeg on every call (mirrors the assembleFinalVideo Agent
+  // tool's own idempotency check; see its comment there).
+  if (job.finalVideo && job.finalVideo.status === 'completed' && job.finalVideo.url) {
+    return res.json(job);
+  }
+
+  const blocker = findFinalVideoBlocker(job);
+  if (blocker) {
+    return res.status(400).json({ error: blocker });
+  }
+
+  try {
+    const finalVideo = await assembleAndStoreFinalVideo(job, job.id);
+    const updatedJob = await jobStore.updateJob(job.id, { finalVideo });
+    res.json(updatedJob);
+  } catch (error) {
+    console.error(
+      'Unexpected error assembling final video:',
+      JSON.stringify({ name: error?.name, message: error?.message }, null, 2)
+    );
+    res.status(502).json({ error: 'Final video assembly failed unexpectedly.' });
   }
 });
 
@@ -885,9 +1060,9 @@ app.post('/api/jobs/:id/advance', async (req, res) => {
     const isRenderingBlock = result.missingFields.includes('finalVideo');
     return res.status(400).json({
       error: isRenderingBlock
-        ? 'Cannot mark this job COMPLETED: individual scene clips are not automatically assembled ' +
-          'into one final video yet, so there is no real, single rendered final video for this ' +
-          'job. It stays at the READY stage.'
+        ? 'Cannot mark this job COMPLETED: there is no real, single rendered final video for this ' +
+          'job yet. POST /api/jobs/:id/assemble-video once every scene\'s video clip is completed. ' +
+          'It stays at the READY stage until that succeeds.'
         : `Cannot advance: the current stage (${result.job.status}) is missing required output: ` +
           `${result.missingFields.join(', ')}.`,
       missingFields: result.missingFields,

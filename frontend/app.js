@@ -25,6 +25,12 @@
   const sceneClipsEmpty = document.getElementById('scene-clips-empty');
   const sceneClipsList = document.getElementById('scene-clips-list');
 
+  const finalVideoPlaceholder = document.getElementById('final-video-placeholder');
+  const finalVideoPanel = document.getElementById('final-video-panel');
+  const finalVideoPlayer = document.getElementById('final-video-player');
+  const finalVideoDownload = document.getElementById('final-video-download');
+  const finalVideoStatus = document.getElementById('final-video-status');
+
   const JOB_ID_STORAGE_KEY = 'aiAgentJobId';
 
   function loadStoredJobId() {
@@ -138,6 +144,7 @@
       input.focus();
       refreshVoiceoverCard();
       refreshSceneClipsCard();
+      refreshFinalVideoCard();
     }
   });
 
@@ -179,6 +186,7 @@
       generateBtn.disabled = false;
       refreshVoiceoverCard();
       refreshSceneClipsCard();
+      refreshFinalVideoCard();
     }
   });
 
@@ -383,6 +391,46 @@
     renderSceneClipsCard(await fetchCurrentJob());
   }
 
+  // --- Final assembled video (Final Review tab) ---
+  // job.finalVideo.url is a real hosted reference (Vercel Blob in
+  // production, or a /generated/... local path in dev — see
+  // backend/video-storage.js) once assembleFinalVideo has actually
+  // succeeded; this was previously a static, unwired placeholder, the same
+  // gap the Progress tab's scene-clip viewer had before it was built. Only
+  // ever shows a player/download link when finalVideo.status is genuinely
+  // 'completed' with a real url — never for 'pending' or 'failed'.
+  function renderFinalVideoCard(job) {
+    const finalVideo = job && job.finalVideo && typeof job.finalVideo === 'object' ? job.finalVideo : null;
+
+    if (!finalVideo || finalVideo.status === 'pending') {
+      finalVideoPlaceholder.hidden = false;
+      finalVideoPanel.hidden = true;
+      return;
+    }
+
+    finalVideoPlaceholder.hidden = true;
+    finalVideoPanel.hidden = false;
+
+    if (finalVideo.status === 'completed' && finalVideo.url) {
+      finalVideoPlayer.src = finalVideo.url;
+      finalVideoPlayer.hidden = false;
+      finalVideoDownload.href = finalVideo.url;
+      finalVideoDownload.hidden = false;
+      finalVideoStatus.hidden = true;
+    } else {
+      finalVideoPlayer.hidden = true;
+      finalVideoPlayer.removeAttribute('src');
+      finalVideoDownload.hidden = true;
+      finalVideoStatus.textContent = `Final video assembly failed: ${finalVideo.error || 'unknown error'}`;
+      finalVideoStatus.className = 'generate-status error';
+      finalVideoStatus.hidden = false;
+    }
+  }
+
+  async function refreshFinalVideoCard() {
+    renderFinalVideoCard(await fetchCurrentJob());
+  }
+
   generateVoiceoverBtn.addEventListener('click', async () => {
     if (voiceoverGenerating || !jobId) {
       return;
@@ -414,4 +462,5 @@
   restoreExistingJob();
   refreshVoiceoverCard();
   refreshSceneClipsCard();
+  refreshFinalVideoCard();
 })();

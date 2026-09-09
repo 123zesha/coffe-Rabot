@@ -243,19 +243,26 @@ function createDefaultJob(id) {
     // once a real playable clip was retrieved. Not writable by the
     // conversational agent — only the real generation route populates
     // this. IMPORTANT: even when every clip is completed, that is many
-    // separate short clips, not one final assembled video — this alone
-    // never produces finalVideo (see below).
+    // separate short clips, not one final assembled video — turning them
+    // into one is the separate assembleFinalVideo step below.
     videoGeneration: { provider: null, status: 'not_started', clips: [], error: null },
     // The real, final, single playable output video: { url, status,
-    // error? }, where status is 'pending' | 'completed' | 'failed'. No
-    // clip-assembly/stitching integration exists yet — turning the
-    // per-scene clips above (plus voice-over) into one merged MP4 is a
-    // separate, not-yet-built step — so this field currently has no way to
-    // ever be populated and will always stay 'pending'. That's intentional,
-    // not a bug: it exists so the job cannot be marked COMPLETED (see
-    // STAGE_OUTPUT_REQUIREMENTS below) until real assembly is built and
-    // actually produces one. Not writable by the conversational agent, same
-    // as images/voiceover — nothing may ever fabricate a value here.
+    // error? }, where status is 'pending' | 'completed' | 'failed'. Only
+    // ever populated by backend/video-assembly.js's real ffmpeg-based
+    // assembly (triggered via the assembleFinalVideo Agent tool or
+    // POST /api/jobs/:id/assemble-video), which concatenates every
+    // completed scene clip above and muxes in the voice-over audio if one
+    // exists. Stays 'pending' until that has actually run and succeeded —
+    // this is what keeps the job from being marked COMPLETED (see
+    // STAGE_OUTPUT_REQUIREMENTS below) until a real final video exists.
+    // UNLIKE images[].url/voiceover.url, this is never an embedded base64
+    // data: URI — a multi-scene final video is far larger than one image or
+    // voice-over track, so backend/video-storage.js stores the real bytes
+    // outside the job record (Vercel Blob in production, a local file in
+    // dev) and only that lightweight reference URL lives here, keeping this
+    // job record small regardless of video size (see video-storage.js's own
+    // comment). Not writable by the conversational agent, same as
+    // images/voiceover — nothing may ever fabricate a value here.
     finalVideo: { url: null, status: 'pending' },
     subtitles: '',
     music: '',
@@ -345,11 +352,10 @@ const STAGE_OUTPUT_REQUIREMENTS = {
   'ASSET GENERATION': ['imagePrompts', 'videoPrompts'],
   // A job must have a real, successfully rendered final video before it can
   // be marked COMPLETED — confirmation alone is not enough. Per-scene video
-  // clips can now be generated (see backend/video-generation.js), but
-  // assembling them (plus voice-over) into one final MP4 is a separate,
-  // not-yet-built step, so finalVideo can never actually reach 'completed'
-  // today — this correctly keeps every job at READY (blocked, not falsely
-  // finished) until real assembly is built.
+  // clips (backend/video-generation.js) are combined into one final MP4 by
+  // backend/video-assembly.js's assembleFinalVideo step; until that has
+  // actually run and succeeded, finalVideo stays 'pending' and this
+  // correctly keeps the job at READY (blocked, not falsely finished).
   READY: ['finalVideo'],
 };
 

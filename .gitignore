@@ -10,3 +10,7 @@ node_modules/
 .DS_Store
 Thumbs.db
 desktop.ini
+
+# Locally-assembled final videos (backend/video-storage.js's no-Redis-token
+# dev/test fallback only — production stores these in Vercel Blob instead)
+data/generated/
