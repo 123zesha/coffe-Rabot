@@ -20,7 +20,8 @@
     "test:image-edit-reference-shape": "node test-image-edit-reference-shape.js",
     "test:video-assembly": "node test-video-assembly.js",
     "test:video-storage": "node test-video-storage.js",
-    "test:assemble-final-video": "node test-assemble-final-video.js"
+    "test:assemble-final-video": "node test-assemble-final-video.js",
+    "test:generate-voiceover-tool": "node test-generate-voiceover-tool.js"
   },
   "keywords": [],
   "author": "",
