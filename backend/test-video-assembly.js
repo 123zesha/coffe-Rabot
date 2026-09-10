@@ -22,7 +22,7 @@ const http = require('http');
 const assert = require('assert');
 const { execFileSync, spawnSync } = require('child_process');
 
-const { assembleFinalVideo, ffmpegPath } = require('./video-assembly');
+const { assembleFinalVideo, getMediaDuration, ffmpegPath } = require('./video-assembly');
 
 let failures = 0;
 
@@ -39,19 +39,19 @@ async function test(name, fn) {
 
 const fixturesDir = fs.mkdtempSync(path.join(os.tmpdir(), 'video-assembly-fixtures-'));
 
-function makeClip(name, color) {
+function makeClip(name, color, durationSeconds = 1) {
   const outPath = path.join(fixturesDir, name);
   execFileSync(
     ffmpegPath,
-    ['-y', '-f', 'lavfi', '-i', `color=c=${color}:s=320x240:d=1`, '-r', '30', '-pix_fmt', 'yuv420p', outPath],
+    ['-y', '-f', 'lavfi', '-i', `color=c=${color}:s=320x240:d=${durationSeconds}`, '-r', '30', '-pix_fmt', 'yuv420p', outPath],
     { stdio: 'ignore' }
   );
   return outPath;
 }
 
-function makeAudio(name) {
+function makeAudio(name, durationSeconds = 1) {
   const outPath = path.join(fixturesDir, name);
-  execFileSync(ffmpegPath, ['-y', '-f', 'lavfi', '-i', 'sine=frequency=440:duration=1', outPath], {
+  execFileSync(ffmpegPath, ['-y', '-f', 'lavfi', '-i', `sine=frequency=440:duration=${durationSeconds}`, outPath], {
     stdio: 'ignore',
   });
   return outPath;
@@ -152,6 +152,89 @@ async function main() {
     const log = probe(tmpOut);
     assert.ok(log.includes('Video:'), 'output must still have a video stream');
     assert.ok(log.includes('Audio:'), 'output must have the voice-over mixed in as a real audio stream');
+  });
+
+  await test("assembleFinalVideo stretches the final video to the voice-over's full real duration when narration outlasts the clips (no more silent truncation)", async () => {
+    // Two 1-second clips (2s of video) against a 6-second voice-over — the
+    // old '-shortest'-only behavior would have cut the output (and 4 of
+    // the 6 seconds of narration) down to just 2 seconds.
+    const longVoiceoverPath = makeAudio('long-voice.mp3', 6);
+    const voiceoverDataUri = `data:audio/mpeg;base64,${fs.readFileSync(longVoiceoverPath).toString('base64')}`;
+
+    const result = await assembleFinalVideo({
+      clips: [
+        { status: 'completed', url: redClipPath },
+        { status: 'completed', url: blueClipPath },
+      ],
+      voiceover: { status: 'completed', url: voiceoverDataUri },
+    });
+
+    assert.strictEqual(result.status, 'completed');
+
+    const tmpOut = path.join(fixturesDir, 'check-sync-long-audio.mp4');
+    fs.writeFileSync(tmpOut, result.buffer);
+    const outputDuration = await getMediaDuration(tmpOut);
+
+    assert.ok(
+      Math.abs(outputDuration - 6) < 0.5,
+      `expected the final video to run the full ~6s of narration, got ${outputDuration}s`
+    );
+  });
+
+  await test('assembleFinalVideo trims the final video down to the voice-over\'s real duration when narration is shorter than the clips', async () => {
+    // Two 3-second clips (6s of video) against a 2-second voice-over.
+    const shortClipA = makeClip('sync-short-a.mp4', 'green', 3);
+    const shortClipB = makeClip('sync-short-b.mp4', 'yellow', 3);
+    const shortVoiceoverPath = makeAudio('short-voice.mp3', 2);
+    const voiceoverDataUri = `data:audio/mpeg;base64,${fs.readFileSync(shortVoiceoverPath).toString('base64')}`;
+
+    const result = await assembleFinalVideo({
+      clips: [
+        { status: 'completed', url: shortClipA },
+        { status: 'completed', url: shortClipB },
+      ],
+      voiceover: { status: 'completed', url: voiceoverDataUri },
+    });
+
+    assert.strictEqual(result.status, 'completed');
+
+    const tmpOut = path.join(fixturesDir, 'check-sync-short-audio.mp4');
+    fs.writeFileSync(tmpOut, result.buffer);
+    const outputDuration = await getMediaDuration(tmpOut);
+
+    assert.ok(
+      Math.abs(outputDuration - 2) < 0.5,
+      `expected the final video trimmed to the ~2s voice-over, got ${outputDuration}s`
+    );
+  });
+
+  await test("assembleFinalVideo gives every scene an equal share of the voice-over regardless of the clips' own original lengths", async () => {
+    // A 1s clip and a 3s clip against a 4s voice-over — each scene should
+    // be retimed to 2s (4s / 2 scenes) so they line up with the narration,
+    // not left at its own unrelated original length.
+    const shortClip = makeClip('sync-equal-short.mp4', 'purple', 1);
+    const longClip = makeClip('sync-equal-long.mp4', 'orange', 3);
+    const voiceoverPath = makeAudio('equal-voice.mp3', 4);
+    const voiceoverDataUri = `data:audio/mpeg;base64,${fs.readFileSync(voiceoverPath).toString('base64')}`;
+
+    const result = await assembleFinalVideo({
+      clips: [
+        { status: 'completed', url: shortClip },
+        { status: 'completed', url: longClip },
+      ],
+      voiceover: { status: 'completed', url: voiceoverDataUri },
+    });
+
+    assert.strictEqual(result.status, 'completed');
+
+    const tmpOut = path.join(fixturesDir, 'check-sync-equal-share.mp4');
+    fs.writeFileSync(tmpOut, result.buffer);
+    const outputDuration = await getMediaDuration(tmpOut);
+
+    assert.ok(
+      Math.abs(outputDuration - 4) < 0.5,
+      `expected the combined output to run the full ~4s (2 scenes x 2s each), got ${outputDuration}s`
+    );
   });
 
   await test('assembleFinalVideo produces a real, playable video-only file when there is no voice-over yet', async () => {
