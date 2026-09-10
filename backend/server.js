@@ -165,12 +165,50 @@ async function assembleAndStoreFinalVideo(job, jobId) {
   }
 }
 
+// job.script must be a real, complete script and voiceStyle must not be
+// 'none' before any real OpenAI TTS call — checked once here so the
+// existing REST route (the Final Review "Generate Voice-over" button) and
+// the generateVoiceover Agent tool can never diverge or duplicate this
+// logic (mirrors findScenePromptMismatch/findFinalVideoBlocker's role for
+// their own pipelines).
+function findVoiceoverBlocker(job) {
+  if (!job.script || !job.script.trim()) {
+    return 'job has no script to generate a voice-over from';
+  }
+
+  if (job.script.trim().length < jobStore.MIN_SCRIPT_LENGTH) {
+    return (
+      `the script is too short to be an approved, complete script (needs at least ` +
+      `${jobStore.MIN_SCRIPT_LENGTH} characters) — finish scripting before generating a voice-over`
+    );
+  }
+
+  if (job.voiceStyle === 'none') {
+    return 'this job is set to no voice-over (text only)';
+  }
+
+  return null;
+}
+
 const client = new Anthropic();
 
 const VIDEO_OPTIONS = fs.readFileSync(
   path.resolve(__dirname, '..', 'data', 'video-options.json'),
   'utf8'
 );
+
+// Parsed once for programmatic use (tool schema enums, validation) —
+// VIDEO_OPTIONS itself stays the raw string above since getVideoOptions and
+// the system prompt embed it verbatim. Single source of truth: the actual
+// selectable voice options (data/video-options.json's voiceOverOptions),
+// never a separately hardcoded list that could quietly drift out of sync.
+const VIDEO_OPTIONS_DATA = JSON.parse(VIDEO_OPTIONS);
+// 'none' ("No Voice-Over") is a real choice for voiceStyle itself (set via
+// updateVideoJob), but not a valid input to the generateVoiceover tool —
+// generating "no voice" makes no sense, so it's excluded from this list.
+const VOICE_STYLE_OPTIONS = VIDEO_OPTIONS_DATA.voiceOverOptions
+  .map((option) => option.value)
+  .filter((value) => value !== 'none');
 
 const SYSTEM_PROMPT_BASE =
   fs.readFileSync(path.resolve(__dirname, '..', 'prompts', 'system-prompt.md'), 'utf8') +
@@ -292,7 +330,11 @@ const TOOLS = [
         // a real, paid, avoidable failure.
         imagePrompts: { type: 'array', items: { type: 'string' } },
         videoPrompts: { type: 'array', items: { type: 'string' } },
-        voiceStyle: { type: 'string' },
+        // Constrained to the project's actual voice-over options (plus
+        // 'none') so this can never silently drift to an unsupported value
+        // that voiceover-generation.js's VOICE_MAP would then just fall
+        // back to a default voice for, without telling anyone.
+        voiceStyle: { type: 'string', enum: [...VOICE_STYLE_OPTIONS, 'none'] },
         subtitles: { type: 'string' },
         music: { type: 'string' },
         thumbnail: { type: 'string' },
@@ -387,6 +429,34 @@ const TOOLS = [
         sceneIndex: { type: 'integer', minimum: 0 },
       },
       required: ['sceneIndex'],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: 'generateVoiceover',
+    description:
+      'Generate a REAL, PAID OpenAI text-to-speech voice-over narrating the current job\'s script, ' +
+      'using the exact same voice-over backend the Final Review "Generate Voice-over" button already ' +
+      'uses. This costs real OpenAI credits — only call this when the user has explicitly asked, right ' +
+      'now, to generate or regenerate the voice-over. Optionally pass voiceStyle to set (or change) ' +
+      'which voice is used before generating in the same call — e.g. the user saying "use Female Warm ' +
+      'voice" or "change the voice to Neutral Narrator" should call this with that voiceStyle right ' +
+      'away. If the user only wants to change the voice preference WITHOUT generating yet, use ' +
+      'updateVideoJob instead and do not call this. Omitting voiceStyle keeps whatever voice is ' +
+      'already set. Every call re-generates the voice-over from the current script from scratch — ' +
+      'there is no "already done, skip it" behavior here (unlike scene images/video) — so calling this ' +
+      'again is exactly how "regenerate the voice-over with a different voice" works, not a wasted ' +
+      'duplicate call. Requires a real, complete script and a voice style other than "no voice-over" — ' +
+      'refuses first, before any paid call, if either is missing, and tells you exactly what to fix ' +
+      '(never ask the user to fix job data manually). If a final video was already assembled, a ' +
+      'successful new voice-over resets it so it must be assembled again with assembleFinalVideo before ' +
+      'the fresh narration is actually reflected in the final MP4 — tell the user this if it applies. ' +
+      'Only tell the user the voice-over was generated if this reports it as completed.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        voiceStyle: { type: 'string', enum: VOICE_STYLE_OPTIONS },
+      },
       additionalProperties: false,
     },
   },
@@ -619,6 +689,66 @@ async function executeTool(name, jobId, input) {
       );
       return JSON.stringify({
         error: 'Video generation failed unexpectedly. Tell the user to try again in a moment.',
+      });
+    }
+  }
+
+  if (name === 'generateVoiceover') {
+    let job = await jobStore.getJob(jobId);
+
+    if (!job) {
+      return JSON.stringify({ error: 'job not found' });
+    }
+
+    // Setting the voice preference and generating are one tool call when
+    // the user names a voice (e.g. "use Female Warm voice") — updateJob
+    // returns the updated job directly, so every check below (script
+    // length, voiceStyle !== 'none') already sees the new voiceStyle.
+    if (input && typeof input.voiceStyle === 'string' && input.voiceStyle) {
+      job = await jobStore.updateJob(jobId, { voiceStyle: input.voiceStyle });
+    }
+
+    const blocker = findVoiceoverBlocker(job);
+    if (blocker) {
+      return JSON.stringify({ error: blocker });
+    }
+
+    if (!process.env.OPENAI_API_KEY) {
+      return JSON.stringify({
+        error:
+          'Voice-over generation is not configured on the server right now. Tell the user voice-over ' +
+          'generation is temporarily unavailable — do not say a voice-over was generated.',
+      });
+    }
+
+    try {
+      // Reuses the exact same voice-over implementation the REST route
+      // already uses (backend/voiceover-generation.js) — no second
+      // voice-over system.
+      const voiceover = await voiceoverGeneration.generateVoiceover({
+        script: job.script,
+        voiceStyle: job.voiceStyle,
+      });
+
+      const updates = { voiceover };
+      if (voiceover.status === 'completed') {
+        // A fresh voice-over invalidates any already-assembled final video
+        // — it was combined from whatever narration (or silence) existed
+        // before, and no longer reflects this new one. Resetting finalVideo
+        // here means assembleFinalVideo's own "already completed, skip"
+        // check never keeps serving a stale, out-of-sync video afterward.
+        updates.finalVideo = { url: null, status: 'pending' };
+      }
+
+      const updatedJob = await jobStore.updateJob(jobId, updates);
+      return JSON.stringify(updatedJob ? summarizeJobForAgent(updatedJob) : { error: 'job not found' });
+    } catch (error) {
+      console.error(
+        'Unexpected error generating voice-over (agent tool):',
+        JSON.stringify({ name: error?.name, message: error?.message }, null, 2)
+      );
+      return JSON.stringify({
+        error: 'Voice-over generation failed unexpectedly. Tell the user to try again in a moment.',
       });
     }
   }
@@ -876,18 +1006,9 @@ app.post('/api/jobs/:id/generate-voiceover', async (req, res) => {
     return res.status(404).json({ error: 'job not found' });
   }
 
-  if (!job.script || !job.script.trim()) {
-    return res.status(400).json({ error: 'job has no script to generate a voice-over from' });
-  }
-
-  if (job.script.trim().length < jobStore.MIN_SCRIPT_LENGTH) {
-    return res.status(400).json({
-      error: `the script is too short to be an approved, complete script (needs at least ${jobStore.MIN_SCRIPT_LENGTH} characters) — finish scripting before generating a voice-over`,
-    });
-  }
-
-  if (job.voiceStyle === 'none') {
-    return res.status(400).json({ error: 'this job is set to no voice-over (text only)' });
+  const blocker = findVoiceoverBlocker(job);
+  if (blocker) {
+    return res.status(400).json({ error: blocker });
   }
 
   if (!process.env.OPENAI_API_KEY) {
@@ -900,7 +1021,14 @@ app.post('/api/jobs/:id/generate-voiceover', async (req, res) => {
       voiceStyle: job.voiceStyle,
     });
 
-    const updatedJob = await jobStore.updateJob(job.id, { voiceover });
+    const updates = { voiceover };
+    if (voiceover.status === 'completed') {
+      // See the generateVoiceover Agent tool's identical comment: a fresh
+      // voice-over invalidates any already-assembled final video.
+      updates.finalVideo = { url: null, status: 'pending' };
+    }
+
+    const updatedJob = await jobStore.updateJob(job.id, updates);
     res.json(updatedJob);
   } catch (error) {
     console.error(
