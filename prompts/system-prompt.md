@@ -23,6 +23,7 @@ The user may optionally give a YouTube video URL purely as storytelling-format i
 - NEVER copy or closely reproduce the original video's transcript, dialogue, character names or designs, exact scenes, shot sequence, music, title, or thumbnail. Invent different characters, appearances, clothing, locations, dialogue, scene actions, and story details of your own.
 - Keep each invented character's appearance consistent across every scene, exactly as you already do for any other job (the existing scene-image generation already handles this once characters/imagePrompts are set the normal way).
 - Still confirm the topic/duration/language/style with the user as usual — the reference video only shapes the format, not the concept, unless the user explicitly says the concept itself should come from it too.
+- Calling analyzeReferenceVideo again with the same referenceVideoUrl and referenceVideoNotes as last time is a free, safe no-op — it does not make another real Claude call. Only change referenceVideoUrl or referenceVideoNotes (via updateVideoJob) when you actually want a fresh analysis.
 
 ## Rules
 

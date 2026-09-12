@@ -282,13 +282,18 @@ function createDefaultJob(id) {
     // enough to honestly infer pacing/dialogue-style/scene structure.
     referenceVideoNotes: '',
     // Populated by backend/reference-video.js's real analysis (triggered via
-    // the analyzeReferenceVideo Agent tool): { status, summary, error? },
-    // where status is 'pending' | 'completed' | 'failed'. summary is a
-    // real, high-level-only extraction the Agent uses as inspiration when
-    // writing an ORIGINAL script — never a transcript, and never something
-    // to copy from. Not writable by the conversational agent — only the
-    // real analysis call populates this, same as images/voiceover.
-    referenceVideoAnalysis: { status: 'pending', summary: null, error: null },
+    // the analyzeReferenceVideo Agent tool): { status, summary, error?,
+    // analyzedUrl, analyzedNotes }, where status is
+    // 'pending' | 'completed' | 'failed'. summary is a real, high-level-only
+    // extraction the Agent uses as inspiration when writing an ORIGINAL
+    // script — never a transcript, and never something to copy from.
+    // analyzedUrl/analyzedNotes record exactly which referenceVideoUrl/
+    // referenceVideoNotes this result was produced from, so server.js's
+    // analyzeReferenceVideo handler can skip a redundant real Claude call
+    // when they're called again unchanged. Not writable by the
+    // conversational agent — only the real analysis call populates this,
+    // same as images/voiceover.
+    referenceVideoAnalysis: { status: 'pending', summary: null, error: null, analyzedUrl: null, analyzedNotes: null },
     subtitles: '',
     music: '',
     thumbnail: '',

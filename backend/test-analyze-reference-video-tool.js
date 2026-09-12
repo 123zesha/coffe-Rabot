@@ -153,6 +153,90 @@ async function main() {
     assert.strictEqual(persisted.referenceVideoAnalysis.summary, result.referenceVideoAnalysis.summary);
   });
 
+  await test('summarizeJobForAgent strips the internal analyzedUrl/analyzedNotes bookkeeping fields', async () => {
+    const job = await jobStore.createJob();
+    await app.executeTool('updateVideoJob', job.id, { referenceVideoUrl: REFERENCE_URL });
+
+    const result = JSON.parse(await app.executeTool('analyzeReferenceVideo', job.id, {}));
+    assert.strictEqual(result.referenceVideoAnalysis.analyzedUrl, undefined);
+    assert.strictEqual(result.referenceVideoAnalysis.analyzedNotes, undefined);
+
+    // The raw job record still keeps them — that's what the skip-guard reads.
+    const persisted = await jobStore.getJob(job.id);
+    assert.strictEqual(persisted.referenceVideoAnalysis.analyzedUrl, REFERENCE_URL);
+  });
+
+  await test('analyzeReferenceVideo is a free no-op on a second call with the exact same URL/notes — never re-spends a Claude call', async () => {
+    const job = await jobStore.createJob();
+    await app.executeTool('updateVideoJob', job.id, {
+      referenceVideoUrl: REFERENCE_URL,
+      referenceVideoNotes: 'A story about a lighthouse keeper.',
+    });
+
+    anthropicRequestCount = 0;
+    const first = JSON.parse(await app.executeTool('analyzeReferenceVideo', job.id, {}));
+    assert.strictEqual(first.referenceVideoAnalysis.status, 'completed');
+    assert.strictEqual(anthropicRequestCount, 1);
+
+    const second = JSON.parse(await app.executeTool('analyzeReferenceVideo', job.id, {}));
+    assert.strictEqual(anthropicRequestCount, 1, 'a second call with unchanged URL/notes must not make another real Claude call');
+    assert.strictEqual(second.referenceVideoAnalysis.status, 'completed');
+    assert.strictEqual(second.referenceVideoAnalysis.summary, first.referenceVideoAnalysis.summary, 'must return the existing analysis unchanged');
+
+    // A third, fourth, ... call keeps being free too — this isn't a
+    // one-shot allowance.
+    await app.executeTool('analyzeReferenceVideo', job.id, {});
+    await app.executeTool('analyzeReferenceVideo', job.id, {});
+    assert.strictEqual(anthropicRequestCount, 1);
+  });
+
+  await test('analyzeReferenceVideo re-analyzes for real when referenceVideoUrl changes after a completed analysis', async () => {
+    const job = await jobStore.createJob();
+    await app.executeTool('updateVideoJob', job.id, { referenceVideoUrl: REFERENCE_URL });
+
+    anthropicRequestCount = 0;
+    await app.executeTool('analyzeReferenceVideo', job.id, {});
+    assert.strictEqual(anthropicRequestCount, 1);
+
+    const otherUrl = 'https://www.youtube.com/watch?v=abcdefghijk';
+    await app.executeTool('updateVideoJob', job.id, { referenceVideoUrl: otherUrl });
+    const result = JSON.parse(await app.executeTool('analyzeReferenceVideo', job.id, {}));
+
+    assert.strictEqual(anthropicRequestCount, 2, 'a changed referenceVideoUrl must trigger a fresh real Claude call');
+    assert.strictEqual(result.referenceVideoAnalysis.status, 'completed');
+
+    const persisted = await jobStore.getJob(job.id);
+    assert.strictEqual(persisted.referenceVideoAnalysis.analyzedUrl, otherUrl);
+  });
+
+  await test('analyzeReferenceVideo re-analyzes for real when only referenceVideoNotes changes after a completed analysis', async () => {
+    const job = await jobStore.createJob();
+    await app.executeTool('updateVideoJob', job.id, { referenceVideoUrl: REFERENCE_URL, referenceVideoNotes: 'first notes' });
+
+    anthropicRequestCount = 0;
+    await app.executeTool('analyzeReferenceVideo', job.id, {});
+    assert.strictEqual(anthropicRequestCount, 1);
+
+    await app.executeTool('updateVideoJob', job.id, { referenceVideoNotes: 'completely different notes now' });
+    await app.executeTool('analyzeReferenceVideo', job.id, {});
+
+    assert.strictEqual(anthropicRequestCount, 2, 'changed referenceVideoNotes alone must also trigger a fresh real Claude call');
+  });
+
+  await test('analyzeReferenceVideo does NOT cache a failed analysis — it always retries on the same unchanged input', async () => {
+    const job = await jobStore.createJob();
+    await app.executeTool('updateVideoJob', job.id, { referenceVideoUrl: 'https://vimeo.com/12345678' });
+
+    anthropicRequestCount = 0;
+    const first = JSON.parse(await app.executeTool('analyzeReferenceVideo', job.id, {}));
+    assert.strictEqual(first.referenceVideoAnalysis.status, 'failed');
+    assert.strictEqual(anthropicRequestCount, 0, 'a non-YouTube URL fails before any Claude call, first time');
+
+    const second = JSON.parse(await app.executeTool('analyzeReferenceVideo', job.id, {}));
+    assert.strictEqual(second.referenceVideoAnalysis.status, 'failed');
+    assert.strictEqual(anthropicRequestCount, 0, 'a failed analysis is never treated as cached — it keeps trying, not silently skipping');
+  });
+
   await test('analyzeReferenceVideo reports job not found for an unknown job id', async () => {
     anthropicRequestCount = 0;
     const result = JSON.parse(await app.executeTool('analyzeReferenceVideo', 'does-not-exist', {}));

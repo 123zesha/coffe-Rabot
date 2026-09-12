@@ -327,6 +327,19 @@ function summarizeJobForAgent(job) {
     summarized.finalVideo = { status, ...(error ? { error } : {}) };
   }
 
+  if (job.referenceVideoAnalysis && typeof job.referenceVideoAnalysis === 'object') {
+    // analyzedUrl/analyzedNotes are internal bookkeeping (see
+    // analyzeReferenceVideo below) used only to decide whether a fresh
+    // Claude call is needed — they just duplicate referenceVideoUrl/
+    // referenceVideoNotes already in the summary, so strip them here.
+    const { status, summary, error } = job.referenceVideoAnalysis;
+    summarized.referenceVideoAnalysis = {
+      status,
+      ...(summary ? { summary } : {}),
+      ...(error ? { error } : {}),
+    };
+  }
+
   return summarized;
 }
 
@@ -405,7 +418,12 @@ const TOOLS = [
       'actual transcript, dialogue, character names/designs, exact scenes, title, thumbnail, or music. ' +
       'Once you have it, write an entirely original English script/scenes/characters inspired only by ' +
       'that general format, with different characters, appearances, clothing, locations, dialogue, and ' +
-      'scene details — then continue the normal production flow exactly as usual.',
+      'scene details — then continue the normal production flow exactly as usual. Calling this again ' +
+      'with the exact same referenceVideoUrl and referenceVideoNotes as the last successful analysis ' +
+      'is a safe no-op that returns the existing analysis unchanged — no extra Claude call is made, so ' +
+      'feel free to call it to check the current state without worrying about repeat cost. It only ' +
+      'actually re-analyzes when referenceVideoUrl or referenceVideoNotes have changed (set via ' +
+      'updateVideoJob) since the last successful analysis.',
     input_schema: {
       type: 'object',
       properties: {},
@@ -581,6 +599,25 @@ async function executeTool(name, jobId, input) {
       });
     }
 
+    const currentUrl = job.referenceVideoUrl.trim();
+    const currentNotes = typeof job.referenceVideoNotes === 'string' ? job.referenceVideoNotes.trim() : '';
+    const existingAnalysis = job.referenceVideoAnalysis;
+
+    // Never re-spend a real Claude call analyzing the exact same reference
+    // video/notes that were already successfully analyzed — return the
+    // existing result unchanged instead. A failed or pending analysis is
+    // NOT cached here (it always re-tries), only a completed one; changing
+    // referenceVideoUrl or referenceVideoNotes (via updateVideoJob) is what
+    // forces a fresh analysis.
+    if (
+      existingAnalysis &&
+      existingAnalysis.status === 'completed' &&
+      existingAnalysis.analyzedUrl === currentUrl &&
+      (existingAnalysis.analyzedNotes || '') === currentNotes
+    ) {
+      return JSON.stringify(summarizeJobForAgent(job));
+    }
+
     if (!process.env.ANTHROPIC_API_KEY) {
       return JSON.stringify({
         error:
@@ -590,10 +627,13 @@ async function executeTool(name, jobId, input) {
     }
 
     try {
-      const referenceVideoAnalysis = await referenceVideo.analyzeReferenceVideo({
+      const analysisResult = await referenceVideo.analyzeReferenceVideo({
         referenceVideoUrl: job.referenceVideoUrl,
         referenceVideoNotes: job.referenceVideoNotes,
       });
+      // Record exactly which URL/notes this result belongs to, so a later
+      // call can tell whether the input has actually changed.
+      const referenceVideoAnalysis = { ...analysisResult, analyzedUrl: currentUrl, analyzedNotes: currentNotes };
       const updatedJob = await jobStore.updateJob(jobId, { referenceVideoAnalysis });
       return JSON.stringify(updatedJob ? summarizeJobForAgent(updatedJob) : { error: 'job not found' });
     } catch (error) {
