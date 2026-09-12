@@ -21,7 +21,9 @@
     "test:video-assembly": "node test-video-assembly.js",
     "test:video-storage": "node test-video-storage.js",
     "test:assemble-final-video": "node test-assemble-final-video.js",
-    "test:generate-voiceover-tool": "node test-generate-voiceover-tool.js"
+    "test:generate-voiceover-tool": "node test-generate-voiceover-tool.js",
+    "test:reference-video": "node test-reference-video.js",
+    "test:analyze-reference-video-tool": "node test-analyze-reference-video-tool.js"
   },
   "keywords": [],
   "author": "",

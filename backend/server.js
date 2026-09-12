@@ -10,6 +10,7 @@ const voiceoverGeneration = require('./voiceover-generation');
 const videoGeneration = require('./video-generation');
 const videoAssembly = require('./video-assembly');
 const videoStorage = require('./video-storage');
+const referenceVideo = require('./reference-video');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -265,6 +266,8 @@ const UPDATABLE_JOB_FIELDS = [
   'imagePrompts',
   'videoPrompts',
   'voiceStyle',
+  'referenceVideoUrl',
+  'referenceVideoNotes',
   'subtitles',
   'music',
   'thumbnail',
@@ -324,6 +327,19 @@ function summarizeJobForAgent(job) {
     summarized.finalVideo = { status, ...(error ? { error } : {}) };
   }
 
+  if (job.referenceVideoAnalysis && typeof job.referenceVideoAnalysis === 'object') {
+    // analyzedUrl/analyzedNotes are internal bookkeeping (see
+    // analyzeReferenceVideo below) used only to decide whether a fresh
+    // Claude call is needed — they just duplicate referenceVideoUrl/
+    // referenceVideoNotes already in the summary, so strip them here.
+    const { status, summary, error } = job.referenceVideoAnalysis;
+    summarized.referenceVideoAnalysis = {
+      status,
+      ...(summary ? { summary } : {}),
+      ...(error ? { error } : {}),
+    };
+  }
+
   return summarized;
 }
 
@@ -368,11 +384,49 @@ const TOOLS = [
         // that voiceover-generation.js's VOICE_MAP would then just fall
         // back to a default voice for, without telling anyone.
         voiceStyle: { type: 'string', enum: [...VOICE_STYLE_OPTIONS, 'none'] },
+        // Optional "Reference Video / Inspiration Mode" — see
+        // backend/reference-video.js. Setting referenceVideoUrl alone does
+        // NOT trigger analysis; call analyzeReferenceVideo separately once
+        // both are set the way the user wants.
+        referenceVideoUrl: { type: 'string' },
+        referenceVideoNotes: { type: 'string' },
         subtitles: { type: 'string' },
         music: { type: 'string' },
         thumbnail: { type: 'string' },
         description: { type: 'string' },
       },
+      additionalProperties: false,
+    },
+  },
+  {
+    name: 'analyzeReferenceVideo',
+    description:
+      'Analyze the current job\'s referenceVideoUrl (and referenceVideoNotes, if set) to extract ONLY ' +
+      'general, high-level storytelling format elements — story type/theme, pacing, approximate ' +
+      'duration, approximate number/length of scenes, dialogue vs. narration style, visual/camera ' +
+      'style, emotional tone, and moral/lesson structure — for use as inspiration when writing a ' +
+      'completely new, original script. This is part of the OPTIONAL "Reference Video / Inspiration ' +
+      'Mode" — only call it when the user has actually provided a reference video URL (via ' +
+      'updateVideoJob\'s referenceVideoUrl) and wants it used; never call it otherwise, and never call ' +
+      'it if referenceVideoUrl is empty. Uses only free, keyless YouTube metadata plus whatever ' +
+      'referenceVideoNotes the user provided, plus one Claude call to summarize — no Runway/OpenAI ' +
+      'call, no new paid service. Refuses with a clear reason if the URL isn\'t a recognizable YouTube ' +
+      'link, or if there is no real information to analyze at all (no metadata, no captions, and no ' +
+      'notes) — when that happens, ask the user to paste a short synopsis into referenceVideoNotes ' +
+      '(via updateVideoJob) rather than guessing. The result (referenceVideoAnalysis.summary) is ' +
+      'ONLY a high-level format description — never treat it as, or repeat, the original video\'s ' +
+      'actual transcript, dialogue, character names/designs, exact scenes, title, thumbnail, or music. ' +
+      'Once you have it, write an entirely original English script/scenes/characters inspired only by ' +
+      'that general format, with different characters, appearances, clothing, locations, dialogue, and ' +
+      'scene details — then continue the normal production flow exactly as usual. Calling this again ' +
+      'with the exact same referenceVideoUrl and referenceVideoNotes as the last successful analysis ' +
+      'is a safe no-op that returns the existing analysis unchanged — no extra Claude call is made, so ' +
+      'feel free to call it to check the current state without worrying about repeat cost. It only ' +
+      'actually re-analyzes when referenceVideoUrl or referenceVideoNotes have changed (set via ' +
+      'updateVideoJob) since the last successful analysis.',
+    input_schema: {
+      type: 'object',
+      properties: {},
       additionalProperties: false,
     },
   },
@@ -530,6 +584,67 @@ async function executeTool(name, jobId, input) {
     }
     const job = await jobStore.updateJob(jobId, updates);
     return JSON.stringify(job ? summarizeJobForAgent(job) : { error: 'job not found' });
+  }
+
+  if (name === 'analyzeReferenceVideo') {
+    const job = await jobStore.getJob(jobId);
+
+    if (!job) {
+      return JSON.stringify({ error: 'job not found' });
+    }
+
+    if (!job.referenceVideoUrl || !job.referenceVideoUrl.trim()) {
+      return JSON.stringify({
+        error: 'referenceVideoUrl is not set yet. Use updateVideoJob to set it first (only if the user actually provided a reference video URL).',
+      });
+    }
+
+    const currentUrl = job.referenceVideoUrl.trim();
+    const currentNotes = typeof job.referenceVideoNotes === 'string' ? job.referenceVideoNotes.trim() : '';
+    const existingAnalysis = job.referenceVideoAnalysis;
+
+    // Never re-spend a real Claude call analyzing the exact same reference
+    // video/notes that were already successfully analyzed — return the
+    // existing result unchanged instead. A failed or pending analysis is
+    // NOT cached here (it always re-tries), only a completed one; changing
+    // referenceVideoUrl or referenceVideoNotes (via updateVideoJob) is what
+    // forces a fresh analysis.
+    if (
+      existingAnalysis &&
+      existingAnalysis.status === 'completed' &&
+      existingAnalysis.analyzedUrl === currentUrl &&
+      (existingAnalysis.analyzedNotes || '') === currentNotes
+    ) {
+      return JSON.stringify(summarizeJobForAgent(job));
+    }
+
+    if (!process.env.ANTHROPIC_API_KEY) {
+      return JSON.stringify({
+        error:
+          'Reference video analysis is not configured on the server right now. Tell the user this is ' +
+          'temporarily unavailable — do not say the video was analyzed.',
+      });
+    }
+
+    try {
+      const analysisResult = await referenceVideo.analyzeReferenceVideo({
+        referenceVideoUrl: job.referenceVideoUrl,
+        referenceVideoNotes: job.referenceVideoNotes,
+      });
+      // Record exactly which URL/notes this result belongs to, so a later
+      // call can tell whether the input has actually changed.
+      const referenceVideoAnalysis = { ...analysisResult, analyzedUrl: currentUrl, analyzedNotes: currentNotes };
+      const updatedJob = await jobStore.updateJob(jobId, { referenceVideoAnalysis });
+      return JSON.stringify(updatedJob ? summarizeJobForAgent(updatedJob) : { error: 'job not found' });
+    } catch (error) {
+      console.error(
+        'Unexpected error analyzing reference video (agent tool):',
+        JSON.stringify({ name: error?.name, message: error?.message }, null, 2)
+      );
+      return JSON.stringify({
+        error: 'Reference video analysis failed unexpectedly. Tell the user to try again in a moment.',
+      });
+    }
   }
 
   if (name === 'generateSceneImages') {

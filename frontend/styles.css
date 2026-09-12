@@ -232,7 +232,8 @@ a {
 }
 
 .form-field textarea,
-.form-field select {
+.form-field select,
+.form-field input {
   font-family: inherit;
   font-size: 1rem;
   padding: 12px 14px;
@@ -244,9 +245,17 @@ a {
 }
 
 .form-field textarea:focus,
-.form-field select:focus {
+.form-field select:focus,
+.form-field input:focus {
   outline: 2px solid var(--color-primary);
   outline-offset: 1px;
+}
+
+.field-hint {
+  margin: 0;
+  color: var(--color-muted);
+  font-size: 0.85rem;
+  font-weight: 400;
 }
 
 .form-field-action {
