@@ -258,6 +258,17 @@ a {
   font-weight: 400;
 }
 
+.checkbox-field {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-weight: 600;
+}
+
+.checkbox-field input {
+  width: auto;
+}
+
 .form-field-action {
   align-items: flex-start;
 }
@@ -448,11 +459,37 @@ a {
   margin-bottom: 12px;
 }
 
+.review-thumbnail-image {
+  width: 100%;
+  aspect-ratio: 16 / 9;
+  object-fit: cover;
+  border-radius: var(--radius);
+  margin-bottom: 12px;
+}
+
+.youtube-titles-list {
+  margin: 0;
+  padding-left: 20px;
+  color: var(--color-text);
+}
+
+.youtube-titles-list li {
+  margin-bottom: 6px;
+}
+
+.youtube-description-text {
+  white-space: pre-line;
+  margin: 0 0 8px;
+}
+
 /* .review-placeholder sets its own `display`, which otherwise overrides the
    native [hidden] behavior — without this, toggling .hidden in JS wouldn't
    actually hide this specific placeholder once it has that class. */
 #voiceover-placeholder[hidden],
-#final-video-placeholder[hidden] {
+#final-video-placeholder[hidden],
+#youtube-thumbnail-placeholder[hidden],
+#youtube-titles-placeholder[hidden],
+#youtube-description-placeholder[hidden] {
   display: none;
 }
 
@@ -522,6 +559,10 @@ a {
 
   .review-grid {
     grid-template-columns: repeat(2, 1fr);
+  }
+
+  .review-card-wide {
+    grid-column: 1 / -1;
   }
 }
 

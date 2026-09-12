@@ -23,7 +23,9 @@
     "test:assemble-final-video": "node test-assemble-final-video.js",
     "test:generate-voiceover-tool": "node test-generate-voiceover-tool.js",
     "test:reference-video": "node test-reference-video.js",
-    "test:analyze-reference-video-tool": "node test-analyze-reference-video-tool.js"
+    "test:analyze-reference-video-tool": "node test-analyze-reference-video-tool.js",
+    "test:youtube-package": "node test-youtube-package.js",
+    "test:generate-youtube-package-tool": "node test-generate-youtube-package-tool.js"
   },
   "keywords": [],
   "author": "",
