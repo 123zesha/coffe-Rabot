@@ -22,7 +22,11 @@
 // Upstash per-request payload-size limit — exactly the class of bug fixed
 // in job-store.js's per-job-key rework. Keeping ffmpeg processing and
 // storage as two separate, independently testable steps means either one
-// can change without touching the other.
+// can change without touching the other. (This module does read
+// video-storage.js's GENERATED_DIR constant — see fetchToFile below — but
+// only to resolve an INPUT it was already handed, a scene clip whose real
+// bytes video-generation.js already stored there; it still never decides
+// where the final video it produces gets stored.)
 //
 // Callers (backend/server.js) are responsible for checking that every scene
 // clip is actually 'completed' before calling this — see
@@ -36,6 +40,8 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const { execFile } = require('child_process');
+
+const videoStorage = require('./video-storage');
 
 const ffmpegPath = process.env.FFMPEG_PATH || require('ffmpeg-static');
 
@@ -95,13 +101,17 @@ function getMediaDuration(filePath) {
 }
 
 // Resolves one clip/audio URL to real bytes on disk at destPath. Supports
-// exactly the two shapes this app's job records actually use — a base64
-// data: URI (voiceover.url, and any future locally-stored clip) and a real
-// http(s) URL (job.videoGeneration.clips[i].url, as returned by the Runway
-// provider) — plus a plain local filesystem path, which is never produced
-// by a real generation call but is what this module's own tests use to
-// exercise ffmpeg against real, local sample media with no network or paid
-// API involved at all.
+// every shape this app's job records actually use: a base64 data: URI
+// (voiceover.url), a real http(s) URL (a scene clip stored in Vercel Blob,
+// or the final video's own storage in production), a /generated/... local
+// reference (a scene clip stored via video-storage.js's no-Blob-token
+// dev/test fallback — see video-generation.js's ensureClipStored; resolved
+// straight from disk via GENERATED_DIR rather than fetched over HTTP, since
+// this server has no fixed, known base URL to fetch its own static route
+// from) — plus a plain local filesystem path, which is never produced by a
+// real generation call but is what this module's own tests use to exercise
+// ffmpeg against real, local sample media with no network or paid API
+// involved at all.
 async function fetchToFile(url, destPath) {
   if (url.startsWith('data:')) {
     const commaIndex = url.indexOf(',');
@@ -111,6 +121,12 @@ async function fetchToFile(url, destPath) {
       throw new Error('data: URI did not decode to any media bytes.');
     }
     fs.writeFileSync(destPath, buffer);
+    return;
+  }
+
+  if (url.startsWith('/generated/')) {
+    const filePath = path.join(videoStorage.GENERATED_DIR, url.slice('/generated/'.length));
+    fs.copyFileSync(filePath, destPath);
     return;
   }
 
