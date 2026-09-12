@@ -15,6 +15,8 @@
   const videoDurationSelect = document.getElementById('video-duration');
   const videoLanguageSelect = document.getElementById('video-language');
   const videoStyleSelect = document.getElementById('video-style');
+  const referenceVideoUrlInput = document.getElementById('reference-video-url');
+  const referenceVideoNotesInput = document.getElementById('reference-video-notes');
 
   const voiceoverPlaceholder = document.getElementById('voiceover-placeholder');
   const voiceoverPanel = document.getElementById('voiceover-panel');
@@ -171,6 +173,18 @@
     if (videoDurationSelect.value) details.push(`Duration: ${durationOption.textContent}`);
     if (videoLanguageSelect.value) details.push(`Language: ${languageOption.textContent}`);
     if (videoStyleSelect.value) details.push(`Style: ${styleOption.textContent}`);
+
+    // Both optional — "Reference Video / Inspiration Mode" only kicks in
+    // when a URL is actually provided; omitting both leaves this message
+    // identical to the existing flow.
+    const referenceVideoUrl = referenceVideoUrlInput.value.trim();
+    const referenceVideoNotes = referenceVideoNotesInput.value.trim();
+    if (referenceVideoUrl) {
+      details.push(`Reference video URL (use only as general storytelling-format inspiration, never copy it): ${referenceVideoUrl}`);
+    }
+    if (referenceVideoNotes) {
+      details.push(`Reference notes: ${referenceVideoNotes}`);
+    }
 
     const message = "I'd like to create a YouTube video with these details:\n" + details.join('\n');
 

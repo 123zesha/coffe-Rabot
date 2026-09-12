@@ -90,6 +90,9 @@ const JOB_FIELDS = [
   'voiceover',
   'videoGeneration',
   'finalVideo',
+  'referenceVideoUrl',
+  'referenceVideoNotes',
+  'referenceVideoAnalysis',
   'subtitles',
   'music',
   'thumbnail',
@@ -264,6 +267,28 @@ function createDefaultJob(id) {
     // comment). Not writable by the conversational agent, same as
     // images/voiceover — nothing may ever fabricate a value here.
     finalVideo: { url: null, status: 'pending' },
+    // Optional "Reference Video / Inspiration Mode" input: a YouTube URL the
+    // user wants used only as high-level storytelling inspiration (pacing,
+    // tone, structure — never its transcript, dialogue, character names, or
+    // exact scenes). Both writable by the conversational agent like
+    // topic/videoTitle — they're just user-supplied preferences, not
+    // generation results. Leaving referenceVideoUrl empty (the default)
+    // means this feature is not in use at all; nothing about the rest of
+    // the pipeline changes in that case.
+    referenceVideoUrl: '',
+    // Optional free-text notes (a synopsis, description, or transcript
+    // excerpt) the user can paste alongside the URL — see
+    // backend/reference-video.js for why a bare URL alone often isn't
+    // enough to honestly infer pacing/dialogue-style/scene structure.
+    referenceVideoNotes: '',
+    // Populated by backend/reference-video.js's real analysis (triggered via
+    // the analyzeReferenceVideo Agent tool): { status, summary, error? },
+    // where status is 'pending' | 'completed' | 'failed'. summary is a
+    // real, high-level-only extraction the Agent uses as inspiration when
+    // writing an ORIGINAL script — never a transcript, and never something
+    // to copy from. Not writable by the conversational agent — only the
+    // real analysis call populates this, same as images/voiceover.
+    referenceVideoAnalysis: { status: 'pending', summary: null, error: null },
     subtitles: '',
     music: '',
     thumbnail: '',

@@ -120,6 +120,21 @@
             </select>
           </div>
 
+          <div class="form-field form-field-wide">
+            <label for="reference-video-url">Reference video URL (optional)</label>
+            <input type="url" id="reference-video-url" placeholder="e.g. https://www.youtube.com/watch?v=...">
+            <p class="field-hint">
+              Optional. The agent uses only its general storytelling format (pacing, structure, tone) as
+              inspiration for a brand-new original video — never its transcript, dialogue, characters,
+              exact scenes, title, or music.
+            </p>
+          </div>
+
+          <div class="form-field form-field-wide">
+            <label for="reference-video-notes">Reference notes (optional)</label>
+            <textarea id="reference-video-notes" rows="3" placeholder="A short synopsis or description of the reference video's story/pacing helps a lot — a bare URL alone often isn't enough to analyze accurately."></textarea>
+          </div>
+
           <div class="form-field form-field-action">
             <button type="button" id="generate-video-btn" class="btn btn-primary btn-generate">Generate Video</button>
           </div>
