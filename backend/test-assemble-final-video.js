@@ -26,6 +26,7 @@ process.env.ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY || 'test-key';
 
 const app = require('./server');
 const jobStore = require('./job-store');
+const videoGeneration = require('./video-generation');
 const { ffmpegPath, getMediaDuration } = require('./video-assembly');
 const { GENERATED_DIR } = require('./video-storage');
 
@@ -54,8 +55,14 @@ function makeClip(name) {
   return outPath;
 }
 
+// `stored: true` marks this as already permanently stored (mirrors what
+// video-generation.js's ensureClipStored sets once a clip is really
+// downloaded and saved) — these tests are about assembleFinalVideo's own
+// logic, not about clip-storage healing (see test-video-generation.js and
+// test-generate-scene-video-tool.js for that), so the fixture represents a
+// clip already ready to assemble, trusted as-is with no extra work.
 function completedClip(clipPath) {
-  return { status: 'completed', url: clipPath, externalJobId: 'ext', error: null, attempts: 1 };
+  return { status: 'completed', url: clipPath, stored: true, externalJobId: 'ext', error: null, attempts: 1 };
 }
 
 function makeAudio(name, durationSeconds) {
@@ -129,6 +136,127 @@ async function main() {
       `expected a /generated/ reference, got: ${persisted.finalVideo.url}`
     );
     assert.ok(!persisted.finalVideo.url.startsWith('data:'), 'the video bytes must never be embedded in the job record');
+  });
+
+  // Regression test for the real, live production failure this fix
+  // addresses: assembly failed with "Failed to download media (HTTP 401)"
+  // from Runway's own CloudFront/JWT link — confirmed via Runway's own docs
+  // to expire within 24-48 hours of the API call that produced it, even
+  // though the underlying video stays retrievable via the same task for up
+  // to 14 days. A clip completed before permanent clip storage existed (no
+  // `stored` field) has exactly this shape: a dead url, but a real,
+  // still-usable externalJobId. assembleFinalVideo must heal it via a FREE
+  // re-fetch (never a new paid submission) before assembling, and persist
+  // the recovery so it never has to happen again for this clip.
+  await test('assembleFinalVideo heals a legacy scene clip (dead link, not yet stored) via a free externalJobId re-fetch before assembling', async () => {
+    const freshClipDataUri = `data:video/mp4;base64,${fs.readFileSync(clipPath).toString('base64')}`;
+    let checkCalls = 0;
+
+    videoGeneration.PROVIDERS.fake = {
+      name: 'fake',
+      async submitVideoGeneration() {
+        throw new Error('must never submit a new (paid) generation to heal an already-completed clip');
+      },
+      async checkVideoGenerationStatus() {
+        checkCalls++;
+        return { status: 'completed', clips: [] };
+      },
+      async retrieveGeneratedVideo() {
+        return { status: 'completed', url: freshClipDataUri };
+      },
+    };
+    process.env.VIDEO_GENERATION_PROVIDER = 'fake';
+
+    try {
+      const job = await jobStore.createJob();
+      await jobStore.updateJob(job.id, {
+        videoPrompts: ['Scene 1 motion'],
+        videoGeneration: {
+          provider: 'fake',
+          status: 'completed',
+          error: null,
+          // No `stored` field, and a url that can never be downloaded —
+          // exactly what a clip completed before this fix looks like once
+          // Runway's real link has expired.
+          clips: [
+            {
+              status: 'completed',
+              url: 'http://localhost:1/expired-runway-link.mp4',
+              externalJobId: 'ext-legacy',
+              error: null,
+              attempts: 1,
+            },
+          ],
+        },
+      });
+
+      const result = JSON.parse(await app.executeTool('assembleFinalVideo', job.id, {}));
+      assert.strictEqual(result.finalVideo.status, 'completed', JSON.stringify(result));
+      assert.strictEqual(checkCalls, 1, 'expected exactly one free status re-check to heal the legacy clip');
+
+      const persisted = await jobStore.getJob(job.id);
+      assert.strictEqual(persisted.videoGeneration.clips[0].stored, true, 'the legacy clip must now be marked permanently stored');
+      assert.ok(
+        persisted.videoGeneration.clips[0].url.startsWith('/generated/scene-clip-'),
+        'the clip must now point at a permanent reference, not the old dead link'
+      );
+      assert.strictEqual(persisted.finalVideo.status, 'completed');
+    } finally {
+      delete videoGeneration.PROVIDERS.fake;
+      delete process.env.VIDEO_GENERATION_PROVIDER;
+    }
+  });
+
+  await test('assembleFinalVideo fails with a clear, scene-specific reason when a legacy clip cannot be healed at all', async () => {
+    videoGeneration.PROVIDERS.fake = {
+      name: 'fake',
+      async submitVideoGeneration() {
+        throw new Error('must never submit a new (paid) generation');
+      },
+      async checkVideoGenerationStatus() {
+        return { status: 'failed', clips: [], error: 'task no longer exists' };
+      },
+      async retrieveGeneratedVideo() {
+        throw new Error('must never be called once the status re-check already failed');
+      },
+    };
+    process.env.VIDEO_GENERATION_PROVIDER = 'fake';
+
+    try {
+      const job = await jobStore.createJob();
+      await jobStore.updateJob(job.id, {
+        videoPrompts: ['Scene 1 motion'],
+        videoGeneration: {
+          provider: 'fake',
+          status: 'completed',
+          error: null,
+          clips: [
+            {
+              status: 'completed',
+              url: 'http://localhost:1/expired-runway-link.mp4',
+              externalJobId: 'ext-gone',
+              error: null,
+              attempts: 1,
+            },
+          ],
+        },
+      });
+
+      const result = JSON.parse(await app.executeTool('assembleFinalVideo', job.id, {}));
+      assert.strictEqual(result.finalVideo.status, 'failed');
+      assert.ok(result.finalVideo.error.includes('Scene 1'), `expected the error to name the scene, got: ${result.finalVideo.error}`);
+      assert.ok(result.finalVideo.error.toLowerCase().includes('regenerate'));
+
+      const persisted = await jobStore.getJob(job.id);
+      assert.strictEqual(
+        persisted.videoGeneration.clips[0].status,
+        'failed',
+        'an unrecoverable legacy clip must be marked failed so the Agent knows to regenerate it'
+      );
+    } finally {
+      delete videoGeneration.PROVIDERS.fake;
+      delete process.env.VIDEO_GENERATION_PROVIDER;
+    }
   });
 
   // End-to-end proof (through the real tool + storage, not just the

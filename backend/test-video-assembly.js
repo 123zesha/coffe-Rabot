@@ -134,6 +134,25 @@ async function main() {
     assert.ok(Buffer.isBuffer(result.buffer) && result.buffer.length > 0);
   });
 
+  await test('assembleFinalVideo resolves a /generated/ clip url from disk (video-storage.js\'s local-dev reference), not as an HTTP fetch or a literal path', async () => {
+    const { GENERATED_DIR } = require('./video-storage');
+    fs.mkdirSync(GENERATED_DIR, { recursive: true });
+    const storedFilename = `test-generated-clip-${Date.now()}.mp4`;
+    fs.copyFileSync(redClipPath, path.join(GENERATED_DIR, storedFilename));
+
+    try {
+      const result = await assembleFinalVideo({
+        clips: [{ status: 'completed', url: `/generated/${storedFilename}` }],
+        voiceover: null,
+      });
+
+      assert.strictEqual(result.status, 'completed', JSON.stringify(result));
+      assert.ok(Buffer.isBuffer(result.buffer) && result.buffer.length > 0);
+    } finally {
+      fs.rmSync(path.join(GENERATED_DIR, storedFilename), { force: true });
+    }
+  });
+
   await test('assembleFinalVideo mixes in the existing voice-over audio track when one is completed', async () => {
     const voiceoverDataUri = `data:audio/mpeg;base64,${fs.readFileSync(audioPath).toString('base64')}`;
 

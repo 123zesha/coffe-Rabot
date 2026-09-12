@@ -20,8 +20,22 @@
 // never 'completed'. A real, playable video is only ever established by
 // retrieveGeneratedVideo actually returning one; nothing upstream of that
 // may be treated as completion.
+//
+// A provider's retrieveGeneratedVideo URL is not assumed to last forever —
+// Runway's own docs confirm its task-output URL (a signed CloudFront/JWT
+// link) expires within 24-48 hours of the API call that produced it, even
+// though the underlying video stays retrievable through the same task
+// (externalJobId) for up to 14 days. So a clip is never left pointing at
+// that temporary link: the moment it's retrieved as 'completed', its real
+// bytes are downloaded and stored permanently via backend/video-storage.js
+// (see ensureClipStored/downloadAndStoreClip below), and `clip.stored`
+// records that this has happened. A legacy clip from before this existed,
+// or one whose permanent storage somehow became unreachable, is healed
+// opportunistically (and for free — a re-fetch of the same completed task,
+// never a new paid submission) the next time anything asks for it.
 
 const RUNWAY_PROVIDER = require('./video-providers/runway');
+const videoStorage = require('./video-storage');
 
 const NONE_PROVIDER = {
   name: 'none',
@@ -103,6 +117,131 @@ async function retrieveGeneratedVideo({ externalJobId }, provider = getProvider(
   };
 }
 
+// Downloads real bytes from a provider-returned url — a real http(s) link
+// (every real provider's actual output) or a data: URI (never produced by
+// a real provider today, but handled the same way backend/video-assembly.js
+// already does, so a test's fake provider can return one instead of
+// standing up a real HTTP server just to exercise this path). Returns null
+// rather than throwing on any failure (network error, non-2xx, empty body,
+// an unrecognized url shape) — callers treat a null as "this link is no
+// good", which is exactly the expired-link case this exists to detect, not
+// a bug to crash on.
+async function downloadClipBytes(url) {
+  if (!url) {
+    return null;
+  }
+
+  if (url.startsWith('data:')) {
+    const commaIndex = url.indexOf(',');
+    const base64 = commaIndex === -1 ? '' : url.slice(commaIndex + 1);
+    const buffer = Buffer.from(base64, 'base64');
+    return buffer.length > 0 ? buffer : null;
+  }
+
+  try {
+    const response = await fetch(url);
+    if (!response.ok) {
+      return null;
+    }
+    const buffer = Buffer.from(await response.arrayBuffer());
+    return buffer.length > 0 ? buffer : null;
+  } catch (error) {
+    return null;
+  }
+}
+
+// Downloads `url` and persists it permanently via video-storage.js,
+// returning the new permanent url. Throws (with a clear reason) if either
+// step fails — callers decide how that becomes a clip's failed state.
+async function downloadAndStoreClip(url, jobId, sceneIndex) {
+  const buffer = await downloadClipBytes(url);
+  if (!buffer) {
+    throw new Error(`Could not download the clip's video from the provider (the link may have expired).`);
+  }
+  return videoStorage.storeSceneClip(buffer, jobId, sceneIndex);
+}
+
+// Ensures a 'completed' clip's url is a REAL, PERMANENTLY-stored reference
+// (Vercel Blob or a local file — see video-storage.js), never a provider's
+// own temporary output link. A clip already marked `stored: true` is
+// trusted completely and returned unchanged — no re-download, no provider
+// call, exactly like the original "a completed clip is free to check on
+// forever" contract, just now scoped to clips already migrated to
+// permanent storage (our own storage doesn't expire the way a provider's
+// temporary link does, so there is nothing to re-verify).
+//
+// A clip that is NOT yet stored — a clip this session just retrieved, or a
+// legacy clip from before permanent storage existed — is healed: its
+// current url is downloaded once and stored. If that direct download fails
+// (the provider's temporary link already expired), falls back to a FREE
+// re-fetch of the same completed task via clip.externalJobId
+// (checkVideoGenerationStatus + retrieveGeneratedVideo — plain GETs, never
+// a new submission) to get a fresh temporary link, then stores that. Only
+// when even that isn't possible (task no longer retrievable, no
+// externalJobId, etc.) does this return a real 'failed' clip explaining
+// that a new, paid regeneration is needed — it never fabricates a url.
+//
+// A clip that isn't 'completed' is returned completely unchanged — this
+// never turns a processing/failed/not_started clip into anything else, and
+// never makes a provider call for one.
+async function ensureClipStored({ clip, jobId, sceneIndex }, provider = getProvider()) {
+  if (!clip || clip.status !== 'completed' || clip.stored) {
+    return clip;
+  }
+
+  try {
+    const url = await downloadAndStoreClip(clip.url, jobId, sceneIndex);
+    return { ...clip, url, stored: true, error: null };
+  } catch (error) {
+    // Fall through to the externalJobId recovery path below.
+  }
+
+  if (!clip.externalJobId) {
+    return {
+      ...clip,
+      status: 'failed',
+      url: null,
+      stored: false,
+      error: "This clip's video could not be downloaded and there is no externalJobId to recover it from — it must be regenerated.",
+    };
+  }
+
+  const statusResult = await checkVideoGenerationStatus({ externalJobId: clip.externalJobId }, provider);
+  if (statusResult.status !== 'completed') {
+    return {
+      ...clip,
+      status: 'failed',
+      url: null,
+      stored: false,
+      error: `This clip's stored video is no longer reachable, and the provider no longer reports the original task as completed (status: ${statusResult.status}) — it must be regenerated.`,
+    };
+  }
+
+  const retrieved = await retrieveGeneratedVideo({ externalJobId: clip.externalJobId }, provider);
+  if (retrieved.status !== 'completed' || !retrieved.url) {
+    return {
+      ...clip,
+      status: 'failed',
+      url: null,
+      stored: false,
+      error: retrieved.error || "This clip's video expired and could not be re-fetched from the provider — it must be regenerated.",
+    };
+  }
+
+  try {
+    const url = await downloadAndStoreClip(retrieved.url, jobId, sceneIndex);
+    return { ...clip, url, stored: true, error: null };
+  } catch (error) {
+    return {
+      ...clip,
+      status: 'failed',
+      url: null,
+      stored: false,
+      error: `The provider re-issued a fresh link for this clip, but it could not be saved permanently: ${error.message}`,
+    };
+  }
+}
+
 // Runs the submit -> check -> retrieve pipeline for ONE scene, resuming
 // from whatever state that scene's clip was already in (retry-safe):
 //   - already 'completed'  -> returned unchanged, no provider call at all
@@ -112,13 +251,16 @@ async function retrieveGeneratedVideo({ externalJobId }, provider = getProvider(
 //   - 'not_started'/'failed' (or no prior state) -> freshly submitted
 // `attempts` is incremented exactly once per real submission call, never on
 // a pure poll.
-async function generateClip({ imageDataUri, prompt, durationSeconds, ratio, existingClip }, provider = getProvider()) {
+async function generateClip(
+  { imageDataUri, prompt, durationSeconds, ratio, existingClip, jobId, sceneIndex },
+  provider = getProvider()
+) {
   const clip = existingClip
     ? { ...existingClip }
-    : { status: 'not_started', externalJobId: null, url: null, error: null, attempts: 0 };
+    : { status: 'not_started', externalJobId: null, url: null, stored: false, error: null, attempts: 0 };
 
   if (clip.status === 'completed') {
-    return clip;
+    return ensureClipStored({ clip, jobId, sceneIndex }, provider);
   }
 
   if (clip.status !== 'processing') {
@@ -146,7 +288,21 @@ async function generateClip({ imageDataUri, prompt, durationSeconds, ratio, exis
   const retrieved = await retrieveGeneratedVideo({ externalJobId: clip.externalJobId }, provider);
 
   if (retrieved.status === 'completed' && retrieved.url) {
-    return { ...clip, status: 'completed', url: retrieved.url, error: null };
+    try {
+      // Never store the provider's own temporary link as the lasting
+      // reference (see the module comment on why) — download and persist
+      // the real bytes immediately, while the link is still fresh.
+      const url = await downloadAndStoreClip(retrieved.url, jobId, sceneIndex);
+      return { ...clip, status: 'completed', url, stored: true, error: null };
+    } catch (error) {
+      return {
+        ...clip,
+        status: 'failed',
+        url: null,
+        stored: false,
+        error: `The clip finished rendering but could not be saved permanently: ${error.message}`,
+      };
+    }
   }
 
   // The provider claimed 'completed' at the status-check step but retrieval
@@ -201,6 +357,7 @@ async function generateVideoForScenes(
     durationSeconds = DEFAULT_CLIP_DURATION_SECONDS,
     ratio = DEFAULT_ASPECT_RATIO,
     sceneIndex = null,
+    jobId = null,
   },
   provider = getProvider()
 ) {
@@ -212,7 +369,7 @@ async function generateVideoForScenes(
 
     if (sceneIndex !== null && i !== sceneIndex) {
       clips.push(
-        existingClip || { status: 'not_started', externalJobId: null, url: null, error: null, attempts: 0 }
+        existingClip || { status: 'not_started', externalJobId: null, url: null, stored: false, error: null, attempts: 0 }
       );
       continue;
     }
@@ -236,6 +393,7 @@ async function generateVideoForScenes(
         status: 'failed',
         externalJobId: null,
         url: null,
+        stored: false,
         error: 'No completed scene image is available to generate a video clip from.',
         attempts: (existingClip && existingClip.attempts) || 0,
       };
@@ -245,7 +403,7 @@ async function generateVideoForScenes(
     }
 
     const clip = await generateClip(
-      { imageDataUri: sourceImage.url, prompt, durationSeconds, ratio, existingClip },
+      { imageDataUri: sourceImage.url, prompt, durationSeconds, ratio, existingClip, jobId, sceneIndex: i },
       provider
     );
     if (clip.status === 'failed') {
@@ -261,6 +419,7 @@ module.exports = {
   submitVideoGeneration,
   checkVideoGenerationStatus,
   retrieveGeneratedVideo,
+  ensureClipStored,
   generateClip,
   generateVideoForScenes,
   getProvider,

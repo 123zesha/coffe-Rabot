@@ -139,9 +139,42 @@ function findFinalVideoBlocker(job) {
 // assembled multi-scene video must never be embedded directly in
 // job.finalVideo.url the way images/voiceover are. Shared by the
 // assembleFinalVideo Agent tool and its REST route so the two never drift.
+//
+// Before assembling, every clip is passed through
+// videoGeneration.ensureClipStored — a real production failure this caught
+// live: findFinalVideoBlocker already guarantees every clip's STATUS reads
+// 'completed', but a clip completed before permanent clip storage existed
+// still pointed at the provider's own temporary output link, which Runway's
+// own docs confirm expires within 24-48 hours. Assembly would then fail
+// trying to download an already-dead link. ensureClipStored heals that for
+// free (a re-fetch of the same completed task, never a new paid
+// submission) — see its own comment in video-generation.js — and any
+// healed/recovered clip is persisted back onto the job immediately, so this
+// self-heals at most once per clip.
 async function assembleAndStoreFinalVideo(job, jobId) {
+  const originalClips = job.videoGeneration.clips;
+  const healedClips = [];
+  for (let i = 0; i < originalClips.length; i++) {
+    healedClips.push(await videoGeneration.ensureClipStored({ clip: originalClips[i], jobId, sceneIndex: i }));
+  }
+
+  if (healedClips.some((clip, i) => clip !== originalClips[i])) {
+    await jobStore.updateJob(jobId, { videoGeneration: { ...job.videoGeneration, clips: healedClips } });
+  }
+
+  const brokenIndex = healedClips.findIndex((clip) => clip.status !== 'completed');
+  if (brokenIndex !== -1) {
+    return {
+      url: null,
+      status: 'failed',
+      error:
+        `Scene ${brokenIndex + 1}'s video clip could not be verified or recovered before assembly ` +
+        `(${healedClips[brokenIndex].error || 'unknown error'}) — regenerate it with generateSceneVideo.`,
+    };
+  }
+
   const assembly = await videoAssembly.assembleFinalVideo({
-    clips: job.videoGeneration.clips,
+    clips: healedClips,
     voiceover: job.voiceover,
   });
 

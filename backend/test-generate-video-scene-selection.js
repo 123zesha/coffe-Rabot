@@ -29,6 +29,14 @@ fs.writeFileSync(JOBS_FILE, '[]\n');
 process.env.ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY || 'test-key';
 
 const videoGeneration = require('./video-generation');
+const { GENERATED_DIR } = require('./video-storage');
+
+// Stand-in for a provider's temporary output link — video-generation.js now
+// downloads and permanently stores it the moment a clip completes (Runway's
+// own docs confirm the real link expires), so a fake provider needs to
+// return something actually downloadable. A data: URI is decoded the same
+// way an http(s) fetch would be — no real network call, no cost.
+const FAKE_PROVIDER_CLIP_URL = 'data:video/mp4;base64,ZmFrZSBjbGlwIGJ5dGVz';
 
 let failures = 0;
 
@@ -75,7 +83,7 @@ async function main() {
         return { status: 'completed', clips: [] };
       },
       async retrieveGeneratedVideo() {
-        return { status: 'completed', url: 'https://example.test/scene-1.mp4' };
+        return { status: 'completed', url: FAKE_PROVIDER_CLIP_URL };
       },
     });
 
@@ -93,7 +101,8 @@ async function main() {
     assert.deepStrictEqual(submittedPrompts, ['Pan across Scene 1'], 'only Scene 1 must ever be submitted to the provider');
     assert.strictEqual(result.clips.length, 2);
     assert.strictEqual(result.clips[0].status, 'completed');
-    assert.strictEqual(result.clips[0].url, 'https://example.test/scene-1.mp4');
+    assert.notStrictEqual(result.clips[0].url, FAKE_PROVIDER_CLIP_URL, 'the provider\'s own link must never be the lasting reference');
+    assert.ok(result.clips[0].url.startsWith('/generated/scene-clip-'));
     assert.strictEqual(result.clips[1].status, 'not_started', 'Scene 2 must be left completely untouched');
     assert.strictEqual(result.clips[1].externalJobId, null);
     assert.strictEqual(result.clips[1].url, null);
@@ -110,7 +119,7 @@ async function main() {
         return { status: 'completed', clips: [] };
       },
       async retrieveGeneratedVideo() {
-        return { status: 'completed', url: 'https://example.test/scene-1.mp4' };
+        return { status: 'completed', url: FAKE_PROVIDER_CLIP_URL };
       },
     });
 
@@ -142,7 +151,7 @@ async function main() {
         return { status: 'completed', clips: [] };
       },
       async retrieveGeneratedVideo() {
-        return { status: 'completed', url: 'https://example.test/clip.mp4' };
+        return { status: 'completed', url: FAKE_PROVIDER_CLIP_URL };
       },
     });
 
@@ -176,7 +185,7 @@ async function main() {
       return { status: 'completed', clips: [] };
     },
     async retrieveGeneratedVideo() {
-      return { status: 'completed', url: 'https://example.test/route-scene.mp4' };
+      return { status: 'completed', url: FAKE_PROVIDER_CLIP_URL };
     },
   });
   process.env.VIDEO_GENERATION_PROVIDER = 'fake';
@@ -274,6 +283,7 @@ async function main() {
   server.close();
   delete videoGeneration.PROVIDERS.fake;
   delete process.env.VIDEO_GENERATION_PROVIDER;
+  fs.rmSync(GENERATED_DIR, { recursive: true, force: true });
 
   if (originalJobsFile !== null) {
     fs.writeFileSync(JOBS_FILE, originalJobsFile);

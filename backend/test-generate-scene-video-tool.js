@@ -33,6 +33,15 @@ process.env.ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY || 'test-key';
 const app = require('./server');
 const jobStore = require('./job-store');
 const videoGeneration = require('./video-generation');
+const { GENERATED_DIR } = require('./video-storage');
+
+// Stand-in for a provider's temporary output link — video-generation.js now
+// downloads and permanently stores it the moment a clip completes (Runway's
+// own docs confirm the real link expires), so the fake provider needs to
+// return something actually downloadable. A data: URI is decoded the same
+// way an http(s) fetch would be (see video-generation.js's
+// downloadClipBytes) — no real network call, no cost.
+const FAKE_PROVIDER_CLIP_URL = 'data:video/mp4;base64,ZmFrZSBjbGlwIGJ5dGVz';
 
 let failures = 0;
 
@@ -63,7 +72,7 @@ function fakeProvider(overrides) {
       return { status: 'completed', clips: [] };
     },
     async retrieveGeneratedVideo() {
-      return { status: 'completed', url: 'https://example.test/scene.mp4' };
+      return { status: 'completed', url: FAKE_PROVIDER_CLIP_URL };
     },
     ...overrides,
   };
@@ -91,7 +100,9 @@ async function main() {
 
     const persisted = await jobStore.getJob(job.id);
     assert.strictEqual(persisted.videoGeneration.clips[0].status, 'completed');
-    assert.strictEqual(persisted.videoGeneration.clips[0].url, 'https://example.test/scene.mp4');
+    assert.strictEqual(persisted.videoGeneration.clips[0].stored, true);
+    assert.notStrictEqual(persisted.videoGeneration.clips[0].url, FAKE_PROVIDER_CLIP_URL, 'the provider\'s own link must never be the lasting reference');
+    assert.ok(persisted.videoGeneration.clips[0].url.startsWith('/generated/scene-clip-'));
     assert.strictEqual(persisted.videoGeneration.clips[1].status, 'not_started', 'Scene 2 must be left completely untouched');
     assert.strictEqual(persisted.videoGeneration.status, 'not_started', 'overall status must not read as failed just because Scene 2 was never attempted');
   });
@@ -298,6 +309,7 @@ async function main() {
 
   delete videoGeneration.PROVIDERS.fake;
   delete process.env.VIDEO_GENERATION_PROVIDER;
+  fs.rmSync(GENERATED_DIR, { recursive: true, force: true });
 
   if (originalJobsFile !== null) {
     fs.writeFileSync(JOBS_FILE, originalJobsFile);

@@ -81,7 +81,11 @@ async function main() {
       return { status: 'completed', clips: [] };
     },
     async retrieveGeneratedVideo() {
-      return { status: 'completed', url: 'https://example.test/scene.mp4' };
+      // video-generation.js now downloads and permanently stores a
+      // provider's output the moment a clip completes (Runway's own docs
+      // confirm the real link expires) — a data: URI is decoded the same
+      // way an http(s) fetch would be, no real network call needed here.
+      return { status: 'completed', url: 'data:video/mp4;base64,ZmFrZSBjbGlwIGJ5dGVz' };
     },
   };
   process.env.VIDEO_GENERATION_PROVIDER = 'fake';
@@ -254,6 +258,7 @@ async function main() {
   delete videoGeneration.PROVIDERS.fake;
   delete process.env.VIDEO_GENERATION_PROVIDER;
   mockOpenAi.server.close();
+  fs.rmSync(require('./video-storage').GENERATED_DIR, { recursive: true, force: true });
 
   if (originalJobsFile !== null) {
     fs.writeFileSync(JOBS_FILE, originalJobsFile);

@@ -28,6 +28,17 @@ fs.writeFileSync(JOBS_FILE, '[]\n');
 
 const jobStore = require('./job-store');
 const videoGen = require('./video-generation');
+const { GENERATED_DIR } = require('./video-storage');
+
+// A stand-in for a real provider's temporary output link — since Runway's
+// own docs confirm those expire, video-generation.js now downloads and
+// permanently stores whatever a provider hands back the moment a clip
+// completes (see backend/video-storage.js), rather than trusting the link
+// itself to stay valid. A data: URI lets these tests exercise that real
+// download+store step without standing up an HTTP server (video-generation.js
+// decodes a data: URI exactly like an http(s) fetch — see downloadClipBytes)
+// — no real network call, no cost.
+const FAKE_PROVIDER_CLIP_URL = 'data:video/mp4;base64,ZmFrZSBjbGlwIGJ5dGVz';
 
 let failures = 0;
 
@@ -131,33 +142,96 @@ async function main() {
     assert.strictEqual(result.url, null);
   });
 
-  await test('a real completed retrieval with a URL is the only way to get a completed clip', async () => {
+  await test('a real completed retrieval with a URL is downloaded and stored permanently, never left as the provider\'s own link', async () => {
     const provider = fakeProvider({
       async checkVideoGenerationStatus() {
         return { status: 'completed', clips: [] };
       },
       async retrieveGeneratedVideo() {
-        return { status: 'completed', url: 'https://example.test/clip.mp4' };
+        return { status: 'completed', url: FAKE_PROVIDER_CLIP_URL };
       },
     });
 
-    const result = await videoGen.generateClip({ imageDataUri: 'x', prompt: 'x', durationSeconds: 5, ratio: '16:9' }, provider);
+    const result = await videoGen.generateClip(
+      { imageDataUri: 'x', prompt: 'x', durationSeconds: 5, ratio: '16:9', jobId: 'job-1', sceneIndex: 0 },
+      provider
+    );
 
     assert.strictEqual(result.status, 'completed');
-    assert.strictEqual(result.url, 'https://example.test/clip.mp4');
+    assert.strictEqual(result.stored, true);
+    assert.notStrictEqual(result.url, FAKE_PROVIDER_CLIP_URL, 'the provider\'s own link must never be the lasting reference');
+    assert.ok(result.url.startsWith('/generated/scene-clip-job-1-0-'), `expected a permanently-stored reference, got: ${result.url}`);
   });
 
-  await test('an already-completed clip is returned unchanged, never re-submitted', async () => {
+  await test('an already-STORED completed clip is returned unchanged, never re-submitted or re-downloaded', async () => {
     const provider = fakeProvider({
       async submitVideoGeneration() {
         throw new Error('must never be called for an already-completed clip');
       },
+      async checkVideoGenerationStatus() {
+        throw new Error('must never be called for an already-stored clip');
+      },
     });
-    const existingClip = { status: 'completed', externalJobId: 'ext-old', url: 'https://example.test/old.mp4', error: null, attempts: 1 };
+    const existingClip = {
+      status: 'completed',
+      externalJobId: 'ext-old',
+      url: '/generated/scene-clip-job-1-0-alreadystored.mp4',
+      stored: true,
+      error: null,
+      attempts: 1,
+    };
 
     const result = await videoGen.generateClip({ imageDataUri: 'x', prompt: 'x', durationSeconds: 5, ratio: '16:9', existingClip }, provider);
 
     assert.deepStrictEqual(result, existingClip);
+  });
+
+  // Regression coverage for the real production failure: Runway's own docs
+  // confirm its task-output link expires within 24-48 hours, even though
+  // the underlying video stays retrievable via the same task for up to 14
+  // days. A clip completed before permanent storage existed (or whose
+  // storage somehow became unreachable) has no `stored: true` — this must
+  // heal it via a FREE re-fetch (checkVideoGenerationStatus +
+  // retrieveGeneratedVideo on the same externalJobId), never a new
+  // submission, and then store the result permanently so it can't happen
+  // again.
+  await test('a completed-but-not-yet-stored clip is healed via a free re-fetch, never resubmitted', async () => {
+    let submitCalls = 0;
+    let checkCalls = 0;
+    const provider = fakeProvider({
+      async submitVideoGeneration() {
+        submitCalls++;
+        return { status: 'processing', externalJobId: 'should-not-happen', clips: [] };
+      },
+      async checkVideoGenerationStatus() {
+        checkCalls++;
+        return { status: 'completed', clips: [] };
+      },
+      async retrieveGeneratedVideo() {
+        return { status: 'completed', url: FAKE_PROVIDER_CLIP_URL };
+      },
+    });
+    // No `stored` field — simulates a clip completed before permanent
+    // storage existed. Its old url is deliberately unfetchable (like an
+    // expired Runway link), forcing the externalJobId recovery path.
+    const existingClip = {
+      status: 'completed',
+      externalJobId: 'ext-legacy',
+      url: 'http://localhost:1/expired-link.mp4',
+      error: null,
+      attempts: 1,
+    };
+
+    const result = await videoGen.generateClip(
+      { imageDataUri: 'x', prompt: 'x', durationSeconds: 5, ratio: '16:9', existingClip, jobId: 'job-2', sceneIndex: 0 },
+      provider
+    );
+
+    assert.strictEqual(submitCalls, 0, 'healing a legacy completed clip must never trigger a new (paid) submission');
+    assert.strictEqual(checkCalls, 1, 'expected exactly one free status re-check');
+    assert.strictEqual(result.status, 'completed');
+    assert.strictEqual(result.stored, true);
+    assert.ok(result.url.startsWith('/generated/scene-clip-job-2-0-'));
   });
 
   await test('an already-processing clip is only polled, never resubmitted (no double charge)', async () => {
@@ -171,7 +245,7 @@ async function main() {
         return { status: 'completed', clips: [] };
       },
       async retrieveGeneratedVideo() {
-        return { status: 'completed', url: 'https://example.test/resumed.mp4' };
+        return { status: 'completed', url: FAKE_PROVIDER_CLIP_URL };
       },
     });
     const existingClip = { status: 'processing', externalJobId: 'ext-existing', url: null, error: null, attempts: 1 };
@@ -180,7 +254,7 @@ async function main() {
 
     assert.strictEqual(submitCalls, 0, 'a processing clip must never trigger a new submission');
     assert.strictEqual(result.status, 'completed');
-    assert.strictEqual(result.url, 'https://example.test/resumed.mp4');
+    assert.strictEqual(result.stored, true);
     assert.strictEqual(result.attempts, 1, 'attempts must not increment on a pure poll');
   });
 
@@ -190,7 +264,7 @@ async function main() {
         return { status: 'completed', clips: [] };
       },
       async retrieveGeneratedVideo() {
-        return { status: 'completed', url: 'https://example.test/retry.mp4' };
+        return { status: 'completed', url: FAKE_PROVIDER_CLIP_URL };
       },
     });
     const existingClip = { status: 'failed', externalJobId: null, url: null, error: 'earlier failure', attempts: 1 };
@@ -207,7 +281,7 @@ async function main() {
         return { status: 'completed', clips: [] };
       },
       async retrieveGeneratedVideo() {
-        return { status: 'completed', url: 'https://example.test/scene.mp4' };
+        return { status: 'completed', url: FAKE_PROVIDER_CLIP_URL };
       },
     });
 
@@ -219,12 +293,16 @@ async function main() {
           { prompt: 'The boat at sea', url: 'data:image/png;base64,boat', status: 'completed' },
         ],
         existingClips: [],
+        jobId: 'job-scenes',
       },
       provider
     );
 
     assert.strictEqual(result.clips.length, 2);
-    assert.ok(result.clips.every((clip) => clip.status === 'completed' && clip.url === 'https://example.test/scene.mp4'));
+    assert.ok(result.clips.every((clip) => clip.status === 'completed' && clip.stored === true));
+    assert.ok(result.clips[0].url.startsWith('/generated/scene-clip-job-scenes-0-'));
+    assert.ok(result.clips[1].url.startsWith('/generated/scene-clip-job-scenes-1-'));
+    assert.notStrictEqual(result.clips[0].url, result.clips[1].url, 'each scene must get its own stored clip, not a shared reference');
   });
 
   // Regression test for the real production failure: Scene 1's image was
@@ -246,7 +324,7 @@ async function main() {
         return { status: 'completed', clips: [] };
       },
       async retrieveGeneratedVideo() {
-        return { status: 'completed', url: 'https://example.test/scene.mp4' };
+        return { status: 'completed', url: FAKE_PROVIDER_CLIP_URL };
       },
     });
 
@@ -260,13 +338,14 @@ async function main() {
         videoPrompts: ['Slow pan across Mira'],
         images: [{ prompt: 'Mira at the lighthouse', url: 'data:image/png;base64,mira', status: 'completed' }],
         existingClips: [],
+        jobId: 'job-reworded',
       },
       provider
     );
 
     assert.strictEqual(result.clips.length, 1);
     assert.strictEqual(result.clips[0].status, 'completed', 'the completed image must still be found by position, despite the reworded imagePrompts text');
-    assert.strictEqual(result.clips[0].url, 'https://example.test/scene.mp4');
+    assert.ok(result.clips[0].url.startsWith('/generated/scene-clip-job-reworded-0-'));
   });
 
   await test('a scene with no completed source image gets a failed clip, never skipped or fabricated', async () => {
@@ -340,7 +419,7 @@ async function main() {
         return { status: 'completed', clips: [] };
       },
       async retrieveGeneratedVideo() {
-        return { status: 'completed', url: 'https://example.test/final-scene.mp4' };
+        return { status: 'completed', url: FAKE_PROVIDER_CLIP_URL };
       },
     });
 
@@ -403,6 +482,8 @@ async function main() {
     assert.strictEqual(result.error, undefined);
     assert.strictEqual(result.job.status, 'COMPLETED');
   });
+
+  fs.rmSync(GENERATED_DIR, { recursive: true, force: true });
 
   if (originalJobsFile !== null) {
     fs.writeFileSync(JOBS_FILE, originalJobsFile);
