@@ -27,7 +27,8 @@
     "test:youtube-package": "node test-youtube-package.js",
     "test:generate-youtube-package-tool": "node test-generate-youtube-package-tool.js",
     "test:subtitles-generation": "node test-subtitles-generation.js",
-    "test:generate-subtitles-tool": "node test-generate-subtitles-tool.js"
+    "test:generate-subtitles-tool": "node test-generate-subtitles-tool.js",
+    "test:output-format": "node test-output-format.js"
   },
   "keywords": [],
   "author": "",

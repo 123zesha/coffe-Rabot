@@ -181,7 +181,15 @@ async function main() {
       attempts: 1,
     };
 
-    const result = await videoGen.generateClip({ imageDataUri: 'x', prompt: 'x', durationSeconds: 5, ratio: '16:9', existingClip }, provider);
+    // This clip predates output-format support (no `.ratio` field) — such a
+    // clip was only ever produced at the original, single default ratio, so
+    // requesting that same real default here (never the '16:9' placeholder
+    // used elsewhere in this file, which Runway itself rejects) must still
+    // reuse it unchanged, not treat it as a format mismatch.
+    const result = await videoGen.generateClip(
+      { imageDataUri: 'x', prompt: 'x', durationSeconds: 5, ratio: videoGen.DEFAULT_ASPECT_RATIO, existingClip },
+      provider
+    );
 
     assert.deepStrictEqual(result, existingClip);
   });
@@ -222,8 +230,11 @@ async function main() {
       attempts: 1,
     };
 
+    // Same reasoning as the already-STORED test above: this legacy clip has
+    // no `.ratio` field, so it must be treated as compatible with the real
+    // original default ratio, not force-regenerated as a "format mismatch".
     const result = await videoGen.generateClip(
-      { imageDataUri: 'x', prompt: 'x', durationSeconds: 5, ratio: '16:9', existingClip, jobId: 'job-2', sceneIndex: 0 },
+      { imageDataUri: 'x', prompt: 'x', durationSeconds: 5, ratio: videoGen.DEFAULT_ASPECT_RATIO, existingClip, jobId: 'job-2', sceneIndex: 0 },
       provider
     );
 

@@ -22,7 +22,7 @@ const http = require('http');
 const assert = require('assert');
 const { execFileSync, spawnSync } = require('child_process');
 
-const { assembleFinalVideo, getMediaDuration, ffmpegPath } = require('./video-assembly');
+const { assembleFinalVideo, getMediaDuration, ffmpegPath, OUTPUT_DIMENSIONS_BY_FORMAT } = require('./video-assembly');
 
 let failures = 0;
 
@@ -68,6 +68,16 @@ function probe(filePath) {
   const result = spawnSync(ffmpegPath, ['-y', '-i', filePath, '-f', 'null', '-'], { encoding: 'utf8' });
   assert.strictEqual(result.status, 0, `ffmpeg could not decode ${filePath}:\n${result.stderr}`);
   return result.stderr || '';
+}
+
+// Extracts the real, decoded video stream's pixel dimensions (e.g. "1280x720")
+// from probe()'s own ffmpeg log — the only trustworthy source of the
+// ACTUAL output shape, never assumed from what was merely requested.
+function probeResolution(filePath) {
+  const log = probe(filePath);
+  const match = log.match(/Video:.*?(\d{2,5})x(\d{2,5})/);
+  assert.ok(match, `ffmpeg log did not report a video resolution for ${filePath}:\n${log}`);
+  return { width: Number(match[1]), height: Number(match[2]) };
 }
 
 async function main() {
@@ -320,6 +330,65 @@ async function main() {
     const log = probe(tmpOut);
     assert.ok(log.includes('Video:'));
     assert.ok(log.includes('Audio:'), 'the voice-over must still be mixed in when subtitles are also burned in');
+  });
+
+  // --- Output format (job.outputFormat: horizontal/vertical/square) ---
+  // Proves the real, final EXPORTED video's actual pixel dimensions (read
+  // back from ffmpeg's own decode log, never assumed) match the requested
+  // format — and that omitting outputFormat entirely still produces
+  // exactly today's 1280x720 output, unchanged.
+
+  await test('assembleFinalVideo defaults to the original 1280x720 output when outputFormat is omitted (no regression)', async () => {
+    const result = await assembleFinalVideo({
+      clips: [
+        { status: 'completed', url: redClipPath },
+        { status: 'completed', url: blueClipPath },
+      ],
+      voiceover: null,
+    });
+
+    assert.strictEqual(result.status, 'completed');
+    const tmpOut = path.join(fixturesDir, 'check-format-default.mp4');
+    fs.writeFileSync(tmpOut, result.buffer);
+    assert.deepStrictEqual(probeResolution(tmpOut), { width: 1280, height: 720 });
+  });
+
+  for (const [outputFormat, [expectedWidth, expectedHeight]] of Object.entries(OUTPUT_DIMENSIONS_BY_FORMAT)) {
+    await test(`assembleFinalVideo exports a real ${expectedWidth}x${expectedHeight} video for outputFormat '${outputFormat}'`, async () => {
+      const result = await assembleFinalVideo({
+        clips: [
+          { status: 'completed', url: redClipPath },
+          { status: 'completed', url: blueClipPath },
+        ],
+        voiceover: null,
+        outputFormat,
+      });
+
+      assert.strictEqual(result.status, 'completed', JSON.stringify(result));
+      const tmpOut = path.join(fixturesDir, `check-format-${outputFormat}.mp4`);
+      fs.writeFileSync(tmpOut, result.buffer);
+      assert.deepStrictEqual(probeResolution(tmpOut), { width: expectedWidth, height: expectedHeight });
+    });
+  }
+
+  await test('assembleFinalVideo exports the correct vertical 9:16 dimensions with a real mixed-in voice-over too', async () => {
+    const voiceoverDataUri = `data:audio/mpeg;base64,${fs.readFileSync(audioPath).toString('base64')}`;
+
+    const result = await assembleFinalVideo({
+      clips: [
+        { status: 'completed', url: redClipPath },
+        { status: 'completed', url: blueClipPath },
+      ],
+      voiceover: { status: 'completed', url: voiceoverDataUri },
+      outputFormat: 'vertical',
+    });
+
+    assert.strictEqual(result.status, 'completed', JSON.stringify(result));
+    const tmpOut = path.join(fixturesDir, 'check-format-vertical-with-audio.mp4');
+    fs.writeFileSync(tmpOut, result.buffer);
+    assert.deepStrictEqual(probeResolution(tmpOut), { width: 720, height: 1280 });
+    const log = probe(tmpOut);
+    assert.ok(log.includes('Audio:'));
   });
 
   await test('assembleFinalVideo returns a real failure, never a fabricated buffer, when a clip cannot be fetched', async () => {

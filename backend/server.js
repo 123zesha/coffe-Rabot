@@ -202,6 +202,7 @@ async function assembleAndStoreFinalVideo(job, jobId, desiredSubtitlesContent) {
     clips: healedClips,
     voiceover: job.voiceover,
     burnInSubtitlesContent: desiredSubtitlesContent,
+    outputFormat: job.outputFormat,
   });
 
   if (assembly.status !== 'completed') {
@@ -496,6 +497,7 @@ const UPDATABLE_JOB_FIELDS = [
   'description',
   'generateYoutubePackage',
   'burnInSubtitles',
+  'outputFormat',
 ];
 
 // job.images[].url and job.voiceover.url each hold a full base64-encoded
@@ -670,6 +672,14 @@ const TOOLS = [
         // way. Set this true when the user asks for burned-in/hardcoded
         // captions rather than a separate downloadable caption file.
         burnInSubtitles: { type: 'boolean' },
+        // Which shape the video renders at throughout image generation,
+        // Runway video generation, and final assembly. Optional — defaults
+        // to 'horizontal' (16:9) if never set. Changing this AFTER some
+        // scene images/clips already exist forces those scenes to
+        // regenerate for real the next time generateSceneImages/
+        // generateSceneVideo runs (a wrong-shaped asset is never reused
+        // just to save a call).
+        outputFormat: { type: 'string', enum: jobStore.OUTPUT_FORMATS },
       },
       additionalProperties: false,
     },
@@ -717,7 +727,9 @@ const TOOLS = [
       'videoPrompt for the same scene, and preparing it only after images already exist wastes a full ' +
       'round trip; this tool refuses to run at all until both are set with matching lengths. Any ' +
       'imagePrompt that already has a completed image is skipped automatically and is never ' +
-      'regenerated or charged again. This can take a little while; let the user know generation is in ' +
+      'regenerated or charged again — UNLESS the job\'s outputFormat has changed since that image was ' +
+      'generated, in which case it is regenerated for real at the new shape (a wrong-shaped image is ' +
+      'never kept just to save a call). This can take a little while; let the user know generation is in ' +
       'progress. Only tell the user images were generated if this tool reports them as completed — ' +
       'report any failures honestly instead of assuming success.',
     input_schema: {
@@ -785,7 +797,11 @@ const TOOLS = [
       'missing or mismatched, fix it yourself with updateVideoJob (never ask the user to manually edit ' +
       'job data) and only then try again — that is preparing prerequisite data, not retrying a failed ' +
       'paid call. Only tell the user a clip was generated if this tool reports that scene as completed ' +
-      '— report a failure or still-processing result honestly instead of assuming success.',
+      '— report a failure or still-processing result honestly instead of assuming success. The clip is ' +
+      'rendered at the job\'s outputFormat (horizontal 16:9 / vertical 9:16 / square 1:1, default ' +
+      'horizontal) — if outputFormat changes after a scene\'s clip already completed, calling this again ' +
+      'submits a real, fresh Runway request at the new shape rather than keeping the old, now wrong-' +
+      'shaped clip.',
     input_schema: {
       type: 'object',
       properties: {
@@ -834,7 +850,8 @@ const TOOLS = [
       'be completed; if any scene is missing or not yet completed, this refuses with a clear reason — ' +
       'generate the missing scene(s) with generateSceneVideo and try again, never ask the user to fix ' +
       'it manually. If there is no voice-over yet, the final video is produced silently (video only), ' +
-      'which is expected, not a failure. If burnInSubtitles is on, this ALSO requires real subtitles to ' +
+      'which is expected, not a failure. The output is sized to the job\'s outputFormat (horizontal ' +
+      '16:9 / vertical 9:16 / square 1:1). If burnInSubtitles is on, this ALSO requires real subtitles to ' +
       'already exist (call generateSubtitles first) and burns them into the video — it refuses rather ' +
       'than producing a caption-less video that silently doesn\'t match that setting. Calling this again ' +
       'is a safe no-op that returns the existing final video unchanged ONLY while it still matches the ' +
@@ -1020,6 +1037,7 @@ async function executeTool(name, jobId, input) {
         imagePrompts: job.imagePrompts,
         characters: job.characters,
         existingImages: job.images,
+        outputFormat: job.outputFormat,
       });
       const updatedJob = await jobStore.updateJob(jobId, { images });
       return JSON.stringify(updatedJob ? summarizeJobForAgent(updatedJob) : { error: 'job not found' });
@@ -1137,6 +1155,7 @@ async function executeTool(name, jobId, input) {
         images: job.images,
         existingClips,
         sceneIndex,
+        outputFormat: job.outputFormat,
       });
 
       const allCompleted = result.clips.length > 0 && result.clips.every((clip) => clip.status === 'completed');
@@ -1557,6 +1576,7 @@ app.post('/api/jobs/:id/generate-images', async (req, res) => {
       imagePrompts: job.imagePrompts,
       characters: job.characters,
       existingImages: job.images,
+      outputFormat: job.outputFormat,
     });
 
     const updatedJob = await jobStore.updateJob(job.id, { images });
@@ -1737,6 +1757,7 @@ app.post('/api/jobs/:id/generate-video', async (req, res) => {
       images: job.images,
       existingClips,
       sceneIndex,
+      outputFormat: job.outputFormat,
     });
 
     const allCompleted = result.clips.length > 0 && result.clips.every((clip) => clip.status === 'completed');

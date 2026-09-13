@@ -36,6 +36,7 @@
 
 const RUNWAY_PROVIDER = require('./video-providers/runway');
 const videoStorage = require('./video-storage');
+const { OUTPUT_FORMATS, DEFAULT_OUTPUT_FORMAT } = require('./job-store');
 
 const NONE_PROVIDER = {
   name: 'none',
@@ -57,11 +58,12 @@ const NONE_PROVIDER = {
 
 const PROVIDERS = { none: NONE_PROVIDER, runway: RUNWAY_PROVIDER };
 
-// Default clip length/aspect ratio used until a per-video-type shot-planning
-// feature (deciding which scenes get real video vs. still+pan/zoom, and
-// what duration/ratio fits the video type) is built — that's a separate,
-// not-yet-implemented piece of work. For now every scene with a completed
-// source image gets one 5-second, 16:9-landscape clip.
+// Default clip length used until a per-video-type shot-planning feature
+// (deciding which scenes get real video vs. still+pan/zoom, and what
+// duration fits the video type) is built — that's a separate, not-yet-
+// implemented piece of work. For now every scene with a completed source
+// image gets one 5-second clip, at whichever aspect ratio job.outputFormat
+// selects (see ASPECT_RATIO_BY_FORMAT below).
 const DEFAULT_CLIP_DURATION_SECONDS = 5;
 // Runway's image_to_video endpoint, on the API version pinned in
 // video-providers/runway.js (2024-11-06), rejects the simplified aspect
@@ -71,7 +73,19 @@ const DEFAULT_CLIP_DURATION_SECONDS = 5;
 // 720:1280, 832:1104; square: 960:960), not a reduced ratio string. This
 // is confirmed by Runway's own Node SDK examples, which pass '1280:720'
 // for a 16:9 landscape gen4_turbo request. 1280:720 is that literal value.
+// The three entries below map this app's own OUTPUT_FORMATS directly onto
+// one literal ratio each — 'horizontal' keeps the original default value
+// unchanged.
 const DEFAULT_ASPECT_RATIO = '1280:720';
+const ASPECT_RATIO_BY_FORMAT = {
+  horizontal: '1280:720',
+  vertical: '720:1280',
+  square: '960:960',
+};
+
+function resolveAspectRatio(outputFormat) {
+  return ASPECT_RATIO_BY_FORMAT[outputFormat] || DEFAULT_ASPECT_RATIO;
+}
 
 function getProvider(name) {
   const requested = name || process.env.VIDEO_GENERATION_PROVIDER;
@@ -251,13 +265,39 @@ async function ensureClipStored({ clip, jobId, sceneIndex }, provider = getProvi
 //   - 'not_started'/'failed' (or no prior state) -> freshly submitted
 // `attempts` is incremented exactly once per real submission call, never on
 // a pure poll.
+//
+// A 'completed' clip whose own recorded ratio no longer matches the
+// currently-desired one (job.outputFormat changed after this scene already
+// finished) is deliberately NOT reused via the fast path above — it is
+// treated exactly like a fresh scene and resubmitted for real, so a final
+// video can never end up mixing clips of different shapes just to avoid a
+// paid call. A missing/legacy ratio on an old clip record is treated as
+// this app's original, only-ever-produced ratio ('1280:720'), since that
+// predates output-format support entirely. (A 'processing' clip whose
+// in-flight request was submitted under a since-changed format is NOT
+// specially handled — cancelling/resubmitting a live provider task for
+// that rare race is out of scope; it resolves as a normal completed clip
+// once Runway finishes, and any real mismatch is caught the next time this
+// job's images/clips are regenerated.)
 async function generateClip(
   { imageDataUri, prompt, durationSeconds, ratio, existingClip, jobId, sceneIndex },
   provider = getProvider()
 ) {
-  const clip = existingClip
+  let clip = existingClip
     ? { ...existingClip }
-    : { status: 'not_started', externalJobId: null, url: null, stored: false, error: null, attempts: 0 };
+    : { status: 'not_started', externalJobId: null, url: null, stored: false, error: null, attempts: 0, ratio: null };
+
+  if (clip.status === 'completed' && (clip.ratio || DEFAULT_ASPECT_RATIO) !== ratio) {
+    clip = {
+      status: 'not_started',
+      externalJobId: null,
+      url: null,
+      stored: false,
+      error: null,
+      attempts: clip.attempts || 0,
+      ratio: null,
+    };
+  }
 
   if (clip.status === 'completed') {
     return ensureClipStored({ clip, jobId, sceneIndex }, provider);
@@ -268,11 +308,12 @@ async function generateClip(
     clip.attempts = (clip.attempts || 0) + 1;
 
     if (submission.status === 'failed') {
-      return { ...clip, status: 'failed', externalJobId: null, url: null, error: submission.error };
+      return { ...clip, status: 'failed', externalJobId: null, url: null, ratio, error: submission.error };
     }
 
     clip.externalJobId = submission.externalJobId;
     clip.status = 'processing';
+    clip.ratio = ratio;
   }
 
   const statusResult = await checkVideoGenerationStatus({ externalJobId: clip.externalJobId }, provider);
@@ -355,12 +396,18 @@ async function generateVideoForScenes(
     images,
     existingClips,
     durationSeconds = DEFAULT_CLIP_DURATION_SECONDS,
-    ratio = DEFAULT_ASPECT_RATIO,
+    // ratio, when explicitly given, wins outright (existing tests and any
+    // future caller that wants a specific literal ratio keep working
+    // unchanged). Otherwise it's resolved from outputFormat, and omitting
+    // both keeps the original, pre-output-format-support default.
+    ratio,
+    outputFormat,
     sceneIndex = null,
     jobId = null,
   },
   provider = getProvider()
 ) {
+  const resolvedRatio = ratio || resolveAspectRatio(outputFormat);
   const scenesCount = Array.isArray(videoPrompts) ? videoPrompts.length : 0;
   const clips = [];
 
@@ -403,7 +450,7 @@ async function generateVideoForScenes(
     }
 
     const clip = await generateClip(
-      { imageDataUri: sourceImage.url, prompt, durationSeconds, ratio, existingClip, jobId, sceneIndex: i },
+      { imageDataUri: sourceImage.url, prompt, durationSeconds, ratio: resolvedRatio, existingClip, jobId, sceneIndex: i },
       provider
     );
     if (clip.status === 'failed') {
@@ -426,4 +473,5 @@ module.exports = {
   PROVIDERS,
   DEFAULT_CLIP_DURATION_SECONDS,
   DEFAULT_ASPECT_RATIO,
+  ASPECT_RATIO_BY_FORMAT,
 };
