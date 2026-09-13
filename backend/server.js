@@ -13,6 +13,7 @@ const videoStorage = require('./video-storage');
 const referenceVideo = require('./reference-video');
 const youtubePackage = require('./youtube-package');
 const subtitlesGeneration = require('./subtitles-generation');
+const musicLibrary = require('./music-library');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -175,7 +176,11 @@ function findFinalVideoBlocker(job) {
 // served just because assembling again is normally skipped. Assembly calls
 // no paid API, so redoing it whenever burnInSubtitles/subtitles has
 // actually changed costs nothing.
-async function assembleAndStoreFinalVideo(job, jobId, desiredSubtitlesContent) {
+//
+// desiredMusicUsed is the exact music snapshot (see computeDesiredMusicUsed
+// below) THIS assembly should end up reflecting — same role as
+// desiredSubtitlesContent, compared against finalVideo.musicUsed.
+async function assembleAndStoreFinalVideo(job, jobId, desiredSubtitlesContent, desiredMusicUsed) {
   const originalClips = job.videoGeneration.clips;
   const healedClips = [];
   for (let i = 0; i < originalClips.length; i++) {
@@ -192,9 +197,27 @@ async function assembleAndStoreFinalVideo(job, jobId, desiredSubtitlesContent) {
       url: null,
       status: 'failed',
       subtitlesUsed: null,
+      musicUsed: null,
       error:
         `Scene ${brokenIndex + 1}'s video clip could not be verified or recovered before assembly ` +
         `(${healedClips[brokenIndex].error || 'unknown error'}) — regenerate it with generateSceneVideo.`,
+    };
+  }
+
+  // Resolving a job's music settings to a real local file can fail (an
+  // unknown musicTrack, or a library file the user removed after selecting
+  // it) — caught here so that reads as a clear assembly failure with an
+  // actionable message, never an unhandled exception.
+  let musicUrl;
+  try {
+    musicUrl = musicLibrary.resolveJobMusicUrl(job);
+  } catch (error) {
+    return {
+      url: null,
+      status: 'failed',
+      subtitlesUsed: null,
+      musicUsed: null,
+      error: error.message,
     };
   }
 
@@ -203,6 +226,7 @@ async function assembleAndStoreFinalVideo(job, jobId, desiredSubtitlesContent) {
     voiceover: job.voiceover,
     burnInSubtitlesContent: desiredSubtitlesContent,
     outputFormat: job.outputFormat,
+    musicUrl,
   });
 
   if (assembly.status !== 'completed') {
@@ -210,13 +234,14 @@ async function assembleAndStoreFinalVideo(job, jobId, desiredSubtitlesContent) {
       url: null,
       status: 'failed',
       subtitlesUsed: null,
+      musicUsed: null,
       error: assembly.error || 'Final video assembly failed.',
     };
   }
 
   try {
     const url = await videoStorage.storeFinalVideo(assembly.buffer, jobId);
-    return { url, status: 'completed', subtitlesUsed: desiredSubtitlesContent, error: null };
+    return { url, status: 'completed', subtitlesUsed: desiredSubtitlesContent, musicUsed: desiredMusicUsed, error: null };
   } catch (error) {
     console.error(
       'Final video storage error:',
@@ -226,23 +251,42 @@ async function assembleAndStoreFinalVideo(job, jobId, desiredSubtitlesContent) {
       url: null,
       status: 'failed',
       subtitlesUsed: null,
+      musicUsed: null,
       error: `The final video was assembled but could not be stored: ${error.message}`,
     };
   }
 }
 
+// The exact music snapshot THIS job's settings would produce if assembled
+// right now — null when music is off/unset (the default), matching
+// job-store.js's musicEnabled/musicTrack/musicCustomUrl fields exactly.
+// Stored on finalVideo.musicUsed once actually assembled, and recomputed
+// here every time to detect a real settings change (mirrors
+// desiredSubtitlesContent's role for burnInSubtitles/subtitles).
+function computeDesiredMusicUsed(job) {
+  if (!job.musicEnabled || (!job.musicTrack && !job.musicCustomUrl)) {
+    return null;
+  }
+  return { enabled: true, track: job.musicTrack || null, customUrl: job.musicCustomUrl || null };
+}
+
 // Whether an existing job.finalVideo is still accurate and can be served
 // as-is (never re-run ffmpeg unnecessarily), vs. must be reassembled
-// because burnInSubtitles or subtitles.content has changed since it was
-// built — see assembleAndStoreFinalVideo's own comment on subtitlesUsed.
-// Shared by the assembleFinalVideo Agent tool and its REST route.
+// because burnInSubtitles, subtitles.content, or the music settings have
+// changed since it was built — see assembleAndStoreFinalVideo's own
+// comment on subtitlesUsed/musicUsed. Shared by the assembleFinalVideo
+// Agent tool and its REST route.
 function isFinalVideoStillAccurate(job) {
   if (!job.finalVideo || job.finalVideo.status !== 'completed' || !job.finalVideo.url) {
     return false;
   }
   const desiredSubtitlesContent =
     job.burnInSubtitles && job.subtitles && job.subtitles.status === 'completed' ? job.subtitles.content : null;
-  return (job.finalVideo.subtitlesUsed || null) === desiredSubtitlesContent;
+  if ((job.finalVideo.subtitlesUsed || null) !== desiredSubtitlesContent) {
+    return false;
+  }
+  const desiredMusicUsed = computeDesiredMusicUsed(job);
+  return JSON.stringify(job.finalVideo.musicUsed || null) === JSON.stringify(desiredMusicUsed);
 }
 
 // job.script must be a real, complete script and voiceStyle must not be
@@ -450,30 +494,36 @@ async function runGenerateSubtitles(job, jobId, { forceRegenerate } = {}) {
 
 const client = new Anthropic();
 
-const VIDEO_OPTIONS = fs.readFileSync(
-  path.resolve(__dirname, '..', 'data', 'video-options.json'),
-  'utf8'
+// Parsed first (rather than kept as the raw file string) so the user-
+// maintained local music library (backend/music-library.js — never
+// downloaded or generated by this app) can be merged in as
+// musicTrackOptions before this is embedded verbatim in the system prompt
+// and returned by getVideoOptions below. Single source of truth: the
+// actual selectable options in data/video-options.json plus the actual
+// tracks currently listed in data/music/manifest.json, never a separately
+// hardcoded list that could quietly drift out of sync.
+const VIDEO_OPTIONS_DATA = JSON.parse(
+  fs.readFileSync(path.resolve(__dirname, '..', 'data', 'video-options.json'), 'utf8')
 );
-
-// Parsed once for programmatic use (tool schema enums, validation) —
-// VIDEO_OPTIONS itself stays the raw string above since getVideoOptions and
-// the system prompt embed it verbatim. Single source of truth: the actual
-// selectable voice options (data/video-options.json's voiceOverOptions),
-// never a separately hardcoded list that could quietly drift out of sync.
-const VIDEO_OPTIONS_DATA = JSON.parse(VIDEO_OPTIONS);
+VIDEO_OPTIONS_DATA.musicTrackOptions = musicLibrary.getMusicTrackOptions();
+const VIDEO_OPTIONS = JSON.stringify(VIDEO_OPTIONS_DATA, null, 2);
 // 'none' ("No Voice-Over") is a real choice for voiceStyle itself (set via
 // updateVideoJob), but not a valid input to the generateVoiceover tool —
 // generating "no voice" makes no sense, so it's excluded from this list.
 const VOICE_STYLE_OPTIONS = VIDEO_OPTIONS_DATA.voiceOverOptions
   .map((option) => option.value)
   .filter((value) => value !== 'none');
+// Constrains updateVideoJob's musicTrack input the same way voiceStyle is
+// constrained above — never a separately hardcoded list.
+const MUSIC_TRACK_OPTIONS = VIDEO_OPTIONS_DATA.musicTrackOptions.map((option) => option.value);
 
 const SYSTEM_PROMPT_BASE =
   fs.readFileSync(path.resolve(__dirname, '..', 'prompts', 'system-prompt.md'), 'utf8') +
   '\n\n## Available Video Production Options\n' +
   'These are the ONLY video production options you may offer, confirm, or use. ' +
   'Do not invent, assume, or suggest any language, duration, video style, story/video type, ' +
-  'voice-over option, visual style, or output option that is not listed below.\n\n' +
+  'voice-over option, visual style, output option, or music track that is not listed below ' +
+  '(musicTrackOptions may legitimately be empty — no bundled music ships with this app).\n\n' +
   VIDEO_OPTIONS;
 const FALLBACK_REPLY =
   "Sorry, I'm having trouble reaching the AI Agent right now. Please try again in a moment.";
@@ -492,7 +542,9 @@ const UPDATABLE_JOB_FIELDS = [
   'voiceStyle',
   'referenceVideoUrl',
   'referenceVideoNotes',
-  'music',
+  'musicEnabled',
+  'musicTrack',
+  'musicCustomUrl',
   'thumbnail',
   'description',
   'generateYoutubePackage',
@@ -549,11 +601,12 @@ function summarizeJobForAgent(job) {
   }
 
   if (job.finalVideo && typeof job.finalVideo === 'object') {
-    const { status, error, subtitlesUsed } = job.finalVideo;
+    const { status, error, subtitlesUsed, musicUsed } = job.finalVideo;
     summarized.finalVideo = {
       status,
       ...(error ? { error } : {}),
       hasBurnedInSubtitles: Boolean(subtitlesUsed),
+      hasMusic: Boolean(musicUsed),
     };
   }
 
@@ -657,7 +710,22 @@ const TOOLS = [
         // both are set the way the user wants.
         referenceVideoUrl: { type: 'string' },
         referenceVideoNotes: { type: 'string' },
-        music: { type: 'string' },
+        // Optional background-music mixing — see assembleFinalVideo below
+        // and backend/music-library.js. Default off (musicEnabled: false);
+        // this app never downloads or generates music, only mixes in a
+        // local file. musicTrack picks a track from the user-populated
+        // data/music/ library (getVideoOptions' musicTrackOptions);
+        // musicCustomUrl is an alternative one-off track (a data: URI or
+        // local path) not in that shared library, and takes priority over
+        // musicTrack when both are set.
+        musicEnabled: { type: 'boolean' },
+        // An empty enum array is invalid JSON Schema, so only constrain
+        // this when the local library actually has at least one track —
+        // with none configured (the default), any string is technically
+        // accepted here but the system prompt above already tells the
+        // Agent musicTrackOptions is empty and not to invent one.
+        musicTrack: MUSIC_TRACK_OPTIONS.length > 0 ? { type: 'string', enum: MUSIC_TRACK_OPTIONS } : { type: 'string' },
+        musicCustomUrl: { type: 'string' },
         thumbnail: { type: 'string' },
         description: { type: 'string' },
         // Optional "YouTube Publishing Package" toggle — see
@@ -855,13 +923,18 @@ const TOOLS = [
       'already exist (call generateSubtitles first) and burns them into the video — it refuses rather ' +
       'than producing a caption-less video that silently doesn\'t match that setting. Calling this again ' +
       'is a safe no-op that returns the existing final video unchanged ONLY while it still matches the ' +
-      'current burnInSubtitles/subtitles state — turning burnInSubtitles on/off, or regenerating ' +
-      'subtitles, after a final video already exists makes the next call here re-assemble for real (still ' +
-      'no paid API call) to keep it in sync. Only tell the user the final video is ready if this reports ' +
-      'it as completed — background music is still not implemented (never claim it happened). A ' +
-      'title/description/tags/thumbnail package can be generated separately (see generateYoutubePackage ' +
-      'below), but actually publishing/uploading the video to YouTube itself is still not implemented — ' +
-      'never claim a video was published or uploaded.',
+      'current burnInSubtitles/subtitles/music state — turning burnInSubtitles on/off, regenerating ' +
+      'subtitles, or changing the music settings, after a final video already exists makes the next call ' +
+      'here re-assemble for real (still no paid API call) to keep it in sync. If musicEnabled is on (see ' +
+      'updateVideoJob), this loops/trims a local music track (musicTrack from the user-populated local ' +
+      'library, or musicCustomUrl for a one-off track) to the video\'s length, fades it in/out, and mixes ' +
+      'it in quietly ducked under the voice-over (or at a fuller standalone level with no voice-over) — ' +
+      'this is entirely optional and off by default, uses only local ffmpeg processing (no paid API, no ' +
+      'downloaded/generated music), and refuses with a clear error rather than silently skipping music if ' +
+      'the selected track is missing or unreadable. Only tell the user the final video is ready if this ' +
+      'reports it as completed. A title/description/tags/thumbnail package can be generated separately ' +
+      '(see generateYoutubePackage below), but actually publishing/uploading the video to YouTube itself ' +
+      'is still not implemented — never claim a video was published or uploaded.',
     input_schema: {
       type: 'object',
       properties: {},
@@ -1247,7 +1320,7 @@ async function executeTool(name, jobId, input) {
         // before, and no longer reflects this new one. Resetting finalVideo
         // here means assembleFinalVideo's own "already completed, skip"
         // check never keeps serving a stale, out-of-sync video afterward.
-        updates.finalVideo = { url: null, status: 'pending', subtitlesUsed: null };
+        updates.finalVideo = { url: null, status: 'pending', subtitlesUsed: null, musicUsed: null };
         // Existing subtitles were transcribed from the PREVIOUS narration
         // audio and no longer match this new one — resetting them here
         // means generateSubtitles never serves stale captions, and
@@ -1300,7 +1373,8 @@ async function executeTool(name, jobId, input) {
       // clips, already paid for) earlier.
       const desiredSubtitlesContent =
         job.burnInSubtitles && job.subtitles && job.subtitles.status === 'completed' ? job.subtitles.content : null;
-      const finalVideo = await assembleAndStoreFinalVideo(job, jobId, desiredSubtitlesContent);
+      const desiredMusicUsed = computeDesiredMusicUsed(job);
+      const finalVideo = await assembleAndStoreFinalVideo(job, jobId, desiredSubtitlesContent, desiredMusicUsed);
       const updatedJob = await jobStore.updateJob(jobId, { finalVideo });
       return JSON.stringify(updatedJob ? summarizeJobForAgent(updatedJob) : { error: 'job not found' });
     } catch (error) {
@@ -1530,6 +1604,15 @@ app.get('/api/jobs', async (req, res) => {
   res.json(await jobStore.listJobs());
 });
 
+// Lets the static frontend (frontend/app.js) populate its "Create Video"
+// form controls from the same single source of truth the Agent's
+// getVideoOptions tool and system prompt already use — most relevantly
+// musicTrackOptions, which reflects the user-maintained data/music/
+// manifest.json and can change without any frontend code change.
+app.get('/api/video-options', (req, res) => {
+  res.json(VIDEO_OPTIONS_DATA);
+});
+
 app.post('/api/jobs', async (req, res) => {
   const job = await jobStore.createJob();
   res.status(201).json(job);
@@ -1617,7 +1700,7 @@ app.post('/api/jobs/:id/generate-voiceover', async (req, res) => {
       // See the generateVoiceover Agent tool's identical comment: a fresh
       // voice-over invalidates any already-assembled final video and any
       // existing subtitles (transcribed from the previous narration audio).
-      updates.finalVideo = { url: null, status: 'pending', subtitlesUsed: null };
+      updates.finalVideo = { url: null, status: 'pending', subtitlesUsed: null, musicUsed: null };
       updates.subtitles = { status: 'pending', format: 'srt', content: null, error: null, generatedFromVoiceoverUrl: null };
     }
 
@@ -1814,7 +1897,8 @@ app.post('/api/jobs/:id/assemble-video', async (req, res) => {
   try {
     const desiredSubtitlesContent =
       job.burnInSubtitles && job.subtitles && job.subtitles.status === 'completed' ? job.subtitles.content : null;
-    const finalVideo = await assembleAndStoreFinalVideo(job, job.id, desiredSubtitlesContent);
+    const desiredMusicUsed = computeDesiredMusicUsed(job);
+    const finalVideo = await assembleAndStoreFinalVideo(job, job.id, desiredSubtitlesContent, desiredMusicUsed);
     const updatedJob = await jobStore.updateJob(job.id, { finalVideo });
     res.json(updatedJob);
   } catch (error) {

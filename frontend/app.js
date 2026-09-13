@@ -19,6 +19,8 @@
   const referenceVideoUrlInput = document.getElementById('reference-video-url');
   const referenceVideoNotesInput = document.getElementById('reference-video-notes');
   const generateYoutubePackageToggle = document.getElementById('generate-youtube-package-toggle');
+  const musicEnabledToggle = document.getElementById('music-enabled-toggle');
+  const videoMusicTrackSelect = document.getElementById('video-music-track');
 
   const youtubeThumbnailPlaceholder = document.getElementById('youtube-thumbnail-placeholder');
   const youtubeThumbnailPanel = document.getElementById('youtube-thumbnail-panel');
@@ -175,6 +177,43 @@
     }
   });
 
+  // Populates the local music-track picker from the same user-maintained
+  // library (data/music/manifest.json, via GET /api/video-options) the
+  // Agent's getVideoOptions tool uses — this app never bundles, downloads,
+  // or generates music, so the list is often empty; the select/checkbox
+  // stay disabled/off in that case rather than offering a track that
+  // doesn't exist.
+  (async () => {
+    try {
+      const res = await fetch('/api/video-options');
+      if (!res.ok) return;
+      const options = await res.json();
+      const tracks = Array.isArray(options.musicTrackOptions) ? options.musicTrackOptions : [];
+
+      if (tracks.length > 0) {
+        videoMusicTrackSelect.innerHTML = '';
+        for (const track of tracks) {
+          const optionEl = document.createElement('option');
+          optionEl.value = track.value;
+          optionEl.textContent = track.label;
+          videoMusicTrackSelect.appendChild(optionEl);
+        }
+        videoMusicTrackSelect.disabled = !musicEnabledToggle.checked;
+        musicEnabledToggle.disabled = false;
+      } else {
+        musicEnabledToggle.disabled = true;
+        musicEnabledToggle.checked = false;
+      }
+    } catch (error) {
+      // No local video-options available (offline dev, etc.) — leave the
+      // music controls in their default off/disabled state.
+    }
+  })();
+
+  musicEnabledToggle.addEventListener('change', () => {
+    videoMusicTrackSelect.disabled = !musicEnabledToggle.checked;
+  });
+
   function setGenerateStatus(text, type) {
     generateStatus.textContent = text;
     generateStatus.className = 'generate-status' + (type ? ' ' + type : '');
@@ -229,6 +268,16 @@
           'description, tags, and an original thumbnail for this video once it is finished (update the ' +
           'job setting accordingly).'
       );
+    }
+
+    // Optional background music — off by default. Only mentioned when
+    // actually enabled with a real track selected, so an unchecked/empty
+    // state leaves this message identical to the existing flow (see
+    // prompts/system-prompt.md's Background Music section for how the
+    // Agent records/applies this).
+    if (musicEnabledToggle.checked && videoMusicTrackSelect.value) {
+      const trackOption = videoMusicTrackSelect.selectedOptions[0];
+      details.push(`Background music: yes — use the local track "${trackOption.textContent}" for this video.`);
     }
 
     const message = "I'd like to create a YouTube video with these details:\n" + details.join('\n');

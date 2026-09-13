@@ -94,7 +94,9 @@ const JOB_FIELDS = [
   'referenceVideoNotes',
   'referenceVideoAnalysis',
   'subtitles',
-  'music',
+  'musicEnabled',
+  'musicTrack',
+  'musicCustomUrl',
   'thumbnail',
   'description',
   'status',
@@ -308,7 +310,12 @@ function createDefaultJob(id) {
     // burnInSubtitles setting and current subtitles content — or is stale
     // and must be reassembled. Reassembly itself calls no paid API, so
     // there is no cost reason to ever serve a stale result here.
-    finalVideo: { url: null, status: 'pending', subtitlesUsed: null },
+    // musicUsed records a snapshot of the music settings ({ enabled, track,
+    // customUrl }, or null when music was off) that were actually mixed
+    // into THIS assembled video — same "is the cached result still
+    // accurate" role as subtitlesUsed, for the musicEnabled/musicTrack/
+    // musicCustomUrl fields below.
+    finalVideo: { url: null, status: 'pending', subtitlesUsed: null, musicUsed: null },
     // Optional "Reference Video / Inspiration Mode" input: a YouTube URL the
     // user wants used only as high-level storytelling inspiration (pacing,
     // tone, structure — never its transcript, dialogue, character names, or
@@ -365,7 +372,25 @@ function createDefaultJob(id) {
     // each other. Writable by the conversational agent like
     // generateYoutubePackage — it's a preference, not a generation result.
     burnInSubtitles: false,
-    music: '',
+    // Optional background-music mixing — default OFF (musicEnabled: false),
+    // preserving the exact pre-existing silent/video-plus-voiceover-only
+    // behavior for any job that never touches this. Writable by the
+    // conversational agent like burnInSubtitles/outputFormat — a
+    // preference, not a generation result.
+    // - musicTrack: the value of one of backend/music-library.js's
+    //   getMusicTrackOptions() entries — a track from the user-populated
+    //   data/music/ local library (this app never bundles, downloads, or
+    //   generates music itself).
+    // - musicCustomUrl: an alternative to musicTrack — a one-off track not
+    //   in the shared library, given directly as a data: URI or local path
+    //   (the same shapes voiceover.url/images[].url already use). Takes
+    //   priority over musicTrack when both are set.
+    // See backend/music-library.js's resolveJobMusicUrl for exactly how
+    // these two combine, and backend/video-assembly.js for the real ffmpeg
+    // loop/trim/fade/ducking mix applied when music is actually enabled.
+    musicEnabled: false,
+    musicTrack: null,
+    musicCustomUrl: '',
     thumbnail: '',
     description: '',
     status: STAGES[0],

@@ -57,6 +57,40 @@ function makeAudio(name, durationSeconds = 1) {
   return outPath;
 }
 
+// A locally SYNTHESIZED tone (ffmpeg's own lavfi sine generator) — never
+// downloaded or real copyrighted music — standing in for a "music" input in
+// the tests below, at a different, distinguishable frequency from
+// makeAudio's voice-over tone.
+function makeMusic(name, durationSeconds = 1) {
+  const outPath = path.join(fixturesDir, name);
+  execFileSync(ffmpegPath, ['-y', '-f', 'lavfi', '-i', `sine=frequency=220:duration=${durationSeconds}`, outPath], {
+    stdio: 'ignore',
+  });
+  return outPath;
+}
+
+// Reports ffmpeg's own measured mean_volume (dB) for filePath, optionally
+// restricted to a [start, start+duration) window — used below to check
+// music is actually mixed in quietly/ducked relative to the voice-over
+// (never trusted from what was merely requested).
+function measureMeanVolume(filePath, { start, duration } = {}) {
+  const args = ['-y'];
+  if (typeof start === 'number') {
+    args.push('-ss', String(start));
+  }
+  args.push('-i', filePath);
+  if (typeof duration === 'number') {
+    args.push('-t', String(duration));
+  }
+  args.push('-af', 'volumedetect', '-f', 'null', '-');
+
+  const result = spawnSync(ffmpegPath, args, { encoding: 'utf8' });
+  assert.strictEqual(result.status, 0, `ffmpeg volumedetect failed for ${filePath}:\n${result.stderr}`);
+  const match = (result.stderr || '').match(/mean_volume:\s*(-?\d+(?:\.\d+)?)\s*dB/);
+  assert.ok(match, `ffmpeg did not report mean_volume for ${filePath}:\n${result.stderr}`);
+  return Number(match[1]);
+}
+
 // Decodes the given file with ffmpeg (output discarded) purely to prove the
 // bytes are a real, playable media file, and returns ffmpeg's own stderr log
 // (which lists every stream it found, e.g. "Video: h264" / "Audio: aac") so
@@ -408,6 +442,188 @@ async function main() {
     assert.strictEqual(result.status, 'failed');
     assert.strictEqual(result.buffer, null);
     assert.ok(result.error.toLowerCase().includes('clip'));
+  });
+
+  // --- Background music (optional musicUrl parameter) ---
+  // Every OTHER test in this file omits musicUrl entirely and still passes
+  // unchanged (see assembleFinalVideo's own comment on audioForMuxPath) —
+  // that IS the proof this feature adds no regression to the existing
+  // video/voice-over/subtitles/output-format pipeline. These tests only
+  // cover the new behavior itself: off by default, real loop/trim to the
+  // final duration, fade in/out, ducking under a voice-over, and a clear
+  // failure (never silent) for a missing/corrupt music file. Every music
+  // "track" here is a locally synthesized tone (ffmpeg lavfi), never
+  // downloaded or real copyrighted audio.
+
+  await test('assembleFinalVideo loops a short music track to cover the full video when there is no voice-over', async () => {
+    const shortMusicPath = makeMusic('music-short-solo.mp3', 1);
+    const longClip = makeClip('music-solo-clip.mp4', 'teal', 5);
+
+    const result = await assembleFinalVideo({
+      clips: [{ status: 'completed', url: longClip }],
+      voiceover: null,
+      musicUrl: shortMusicPath,
+    });
+
+    assert.strictEqual(result.status, 'completed', JSON.stringify(result));
+    const tmpOut = path.join(fixturesDir, 'check-music-solo-loop.mp4');
+    fs.writeFileSync(tmpOut, result.buffer);
+    const log = probe(tmpOut);
+    assert.ok(log.includes('Video:'));
+    assert.ok(log.includes('Audio:'), 'looped music must produce a real audio track when there is no voice-over');
+
+    const outputDuration = await getMediaDuration(tmpOut);
+    assert.ok(Math.abs(outputDuration - 5) < 0.5, `expected ~5s (the video length), got ${outputDuration}s`);
+
+    // MUSIC_VOLUME_SOLO plays music at a full standalone level (no
+    // voice-over to protect) — not near-silent.
+    const meanVolume = measureMeanVolume(tmpOut);
+    assert.ok(meanVolume > -40, `expected audible standalone music, got mean_volume ${meanVolume}dB`);
+  });
+
+  await test('assembleFinalVideo fades music in at the start (quieter than the sustained middle)', async () => {
+    const musicPath = makeMusic('music-fade-check.mp3', 1);
+    const clip = makeClip('music-fade-clip.mp4', 'teal', 5);
+
+    const result = await assembleFinalVideo({
+      clips: [{ status: 'completed', url: clip }],
+      voiceover: null,
+      musicUrl: musicPath,
+    });
+
+    assert.strictEqual(result.status, 'completed', JSON.stringify(result));
+    const tmpOut = path.join(fixturesDir, 'check-music-fade.mp4');
+    fs.writeFileSync(tmpOut, result.buffer);
+
+    const openingVolume = measureMeanVolume(tmpOut, { start: 0, duration: 0.2 });
+    const sustainedVolume = measureMeanVolume(tmpOut, { start: 2.5, duration: 0.5 });
+    assert.ok(
+      openingVolume < sustainedVolume - 3,
+      `expected a real fade-in (opening quieter than the sustained middle), got opening=${openingVolume}dB sustained=${sustainedVolume}dB`
+    );
+  });
+
+  await test('assembleFinalVideo trims a long music track down to the voice-over\'s real (shorter) duration', async () => {
+    const longMusicPath = makeMusic('music-long-trim.mp3', 10);
+    const clipA = makeClip('music-trim-clip-a.mp4', 'teal', 2);
+    const clipB = makeClip('music-trim-clip-b.mp4', 'navy', 2);
+    const voiceoverPath = makeAudio('music-trim-voice.mp3', 3);
+    const voiceoverDataUri = `data:audio/mpeg;base64,${fs.readFileSync(voiceoverPath).toString('base64')}`;
+
+    const result = await assembleFinalVideo({
+      clips: [
+        { status: 'completed', url: clipA },
+        { status: 'completed', url: clipB },
+      ],
+      voiceover: { status: 'completed', url: voiceoverDataUri },
+      musicUrl: longMusicPath,
+    });
+
+    assert.strictEqual(result.status, 'completed', JSON.stringify(result));
+    const tmpOut = path.join(fixturesDir, 'check-music-trim.mp4');
+    fs.writeFileSync(tmpOut, result.buffer);
+    const outputDuration = await getMediaDuration(tmpOut);
+    assert.ok(
+      Math.abs(outputDuration - 3) < 0.5,
+      `expected the ~3s voice-over duration (music trimmed to match, not its own ~10s), got ${outputDuration}s`
+    );
+  });
+
+  await test('assembleFinalVideo loops a short music track to cover a longer voice-over', async () => {
+    const shortMusicPath = makeMusic('music-short-with-voice.mp3', 1);
+    const clip = makeClip('music-loop-voice-clip.mp4', 'teal', 5);
+    const voiceoverPath = makeAudio('music-loop-voice.mp3', 5);
+    const voiceoverDataUri = `data:audio/mpeg;base64,${fs.readFileSync(voiceoverPath).toString('base64')}`;
+
+    const result = await assembleFinalVideo({
+      clips: [{ status: 'completed', url: clip }],
+      voiceover: { status: 'completed', url: voiceoverDataUri },
+      musicUrl: shortMusicPath,
+    });
+
+    assert.strictEqual(result.status, 'completed', JSON.stringify(result));
+    const tmpOut = path.join(fixturesDir, 'check-music-loop-with-voice.mp4');
+    fs.writeFileSync(tmpOut, result.buffer);
+    const outputDuration = await getMediaDuration(tmpOut);
+    assert.ok(Math.abs(outputDuration - 5) < 0.5, `expected the full ~5s voice-over duration, got ${outputDuration}s`);
+  });
+
+  await test('assembleFinalVideo ducks music under the voice-over so narration stays clearly audible, not overpowered', async () => {
+    const clip = makeClip('music-duck-clip.mp4', 'teal', 4);
+    const voiceoverPath = makeAudio('music-duck-voice.mp3', 4);
+    const musicPath = makeMusic('music-duck-music.mp3', 4);
+    const voiceoverDataUri = `data:audio/mpeg;base64,${fs.readFileSync(voiceoverPath).toString('base64')}`;
+
+    const voiceOnlyResult = await assembleFinalVideo({
+      clips: [{ status: 'completed', url: clip }],
+      voiceover: { status: 'completed', url: voiceoverDataUri },
+    });
+    assert.strictEqual(voiceOnlyResult.status, 'completed');
+    const voiceOnlyPath = path.join(fixturesDir, 'check-music-duck-voice-only.mp4');
+    fs.writeFileSync(voiceOnlyPath, voiceOnlyResult.buffer);
+    const voiceOnlyVolume = measureMeanVolume(voiceOnlyPath);
+
+    const withMusicResult = await assembleFinalVideo({
+      clips: [{ status: 'completed', url: clip }],
+      voiceover: { status: 'completed', url: voiceoverDataUri },
+      musicUrl: musicPath,
+    });
+    assert.strictEqual(withMusicResult.status, 'completed', JSON.stringify(withMusicResult));
+    const withMusicPath = path.join(fixturesDir, 'check-music-duck-with-music.mp4');
+    fs.writeFileSync(withMusicPath, withMusicResult.buffer);
+    const log = probe(withMusicPath);
+    assert.ok(log.includes('Audio:'), 'the voice-over must still be mixed in when music is also added');
+    const withMusicVolume = measureMeanVolume(withMusicPath);
+
+    // "Quietly ducked under the voice-over" means adding music must not
+    // meaningfully overpower/raise the overall level versus voice-over
+    // alone — a real, if imperfect, proxy for "voice-over remains clearly
+    // audible" without needing per-frequency spectral analysis in a test.
+    assert.ok(
+      withMusicVolume < voiceOnlyVolume + 6,
+      `expected ducked music to stay quiet under the voice-over, got voice-only=${voiceOnlyVolume}dB with-music=${withMusicVolume}dB`
+    );
+  });
+
+  await test('assembleFinalVideo defaults to no music/no regression when musicUrl is omitted (existing behavior unchanged)', async () => {
+    const result = await assembleFinalVideo({
+      clips: [{ status: 'completed', url: redClipPath }],
+      voiceover: null,
+    });
+
+    assert.strictEqual(result.status, 'completed');
+    const tmpOut = path.join(fixturesDir, 'check-music-omitted.mp4');
+    fs.writeFileSync(tmpOut, result.buffer);
+    const log = probe(tmpOut);
+    assert.ok(log.includes('Video:'));
+    assert.ok(!log.includes('Audio:'), 'omitting musicUrl (and no voice-over) must still produce a silent, video-only file');
+  });
+
+  await test('assembleFinalVideo returns a real failure, never a fabricated buffer, for a missing music file', async () => {
+    const result = await assembleFinalVideo({
+      clips: [{ status: 'completed', url: redClipPath }],
+      voiceover: null,
+      musicUrl: '/no/such/music-file.mp3',
+    });
+
+    assert.strictEqual(result.status, 'failed');
+    assert.strictEqual(result.buffer, null);
+    assert.ok(result.error && result.error.length > 0);
+  });
+
+  await test('assembleFinalVideo returns a real failure, never a fabricated buffer, for a corrupt music file', async () => {
+    const corruptMusicPath = path.join(fixturesDir, 'corrupt-music.mp3');
+    fs.writeFileSync(corruptMusicPath, 'this is not a real audio file');
+
+    const result = await assembleFinalVideo({
+      clips: [{ status: 'completed', url: redClipPath }],
+      voiceover: null,
+      musicUrl: corruptMusicPath,
+    });
+
+    assert.strictEqual(result.status, 'failed');
+    assert.strictEqual(result.buffer, null);
+    assert.ok(result.error && result.error.length > 0);
   });
 
   fs.rmSync(fixturesDir, { recursive: true, force: true });
