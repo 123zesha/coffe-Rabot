@@ -73,6 +73,84 @@ function resolveOutputDimensions(outputFormat) {
 
 const OUTPUT_FPS = 30;
 
+// Background music constants (see the musicUrl branch in assembleFinalVideo
+// below). Music is looped/trimmed to the final video's own real duration,
+// faded in/out, and — when a voice-over exists — quietly ducked under it
+// rather than mixed at a flat level, so narration always stays clearly
+// audible.
+const MUSIC_FADE_SECONDS = 2;
+// Baseline linear volume multiplier applied to music BEFORE ducking, only
+// used when a voice-over exists — deliberately quiet up front (ffmpeg's
+// sidechaincompress then only has to duck it further during actual speech,
+// rather than doing all the attenuation work itself).
+const MUSIC_VOLUME_WITH_VOICEOVER = 0.35;
+// Music-only (no voice-over to protect) plays at a fuller, standalone
+// background level.
+const MUSIC_VOLUME_SOLO = 0.8;
+// sidechaincompress parameters: how hard/fast music ducks under the
+// voice-over's envelope. A low threshold + high ratio means even normal
+// speech volume triggers strong ducking; a short attack and a longer
+// release avoid audibly chopping music on/off between words.
+const MUSIC_DUCK_THRESHOLD = 0.05;
+const MUSIC_DUCK_RATIO = 8;
+const MUSIC_DUCK_ATTACK_MS = 5;
+const MUSIC_DUCK_RELEASE_MS = 300;
+
+// Loops/trims musicPath to exactly targetDurationSeconds, applies `volume`,
+// and adds a short fade-in/out (clamped so a fade never exceeds half the
+// target duration, which matters for a very short target). `-stream_loop -1`
+// re-reads the input as many times as needed, so this handles a track
+// shorter OR longer than the target with the same call — no separate
+// loop-vs-trim branch needed. Throws (via runFfmpeg) with ffmpeg's own real
+// error on a missing/corrupt music file — never silently skipped.
+async function prepareMusicTrack(musicPath, targetDurationSeconds, volume, outPath) {
+  const fadeSeconds = Math.max(0.05, Math.min(MUSIC_FADE_SECONDS, targetDurationSeconds / 2));
+  const fadeOutStart = Math.max(0, targetDurationSeconds - fadeSeconds);
+
+  await runFfmpeg([
+    '-y',
+    '-stream_loop',
+    '-1',
+    '-i',
+    musicPath,
+    '-t',
+    targetDurationSeconds.toFixed(3),
+    '-af',
+    `volume=${volume},afade=t=in:st=0:d=${fadeSeconds.toFixed(3)},afade=t=out:st=${fadeOutStart.toFixed(3)}:d=${fadeSeconds.toFixed(3)}`,
+    '-c:a',
+    'aac',
+    outPath,
+  ]);
+}
+
+// Ducks preparedMusicPath under voiceoverPath's own envelope (sidechaincompress)
+// and mixes the two into one audio track at outPath. `normalize=0` on amix is
+// deliberate: ffmpeg's default auto-normalize would also quiet down the
+// voice-over to keep the sum from clipping, which is exactly what "voice-over
+// must remain clearly audible" rules out — music is already attenuated/ducked
+// enough on its own that the voice-over can be mixed in at its own full level.
+async function duckAndMixMusicWithVoiceover(preparedMusicPath, voiceoverPath, outPath) {
+  const filterComplex =
+    `[0:a][1:a]sidechaincompress=threshold=${MUSIC_DUCK_THRESHOLD}:ratio=${MUSIC_DUCK_RATIO}:` +
+    `attack=${MUSIC_DUCK_ATTACK_MS}:release=${MUSIC_DUCK_RELEASE_MS}[duckedmusic];` +
+    `[duckedmusic][1:a]amix=inputs=2:duration=first:dropout_transition=0:normalize=0[mixedaudio]`;
+
+  await runFfmpeg([
+    '-y',
+    '-i',
+    preparedMusicPath,
+    '-i',
+    voiceoverPath,
+    '-filter_complex',
+    filterComplex,
+    '-map',
+    '[mixedaudio]',
+    '-c:a',
+    'aac',
+    outPath,
+  ]);
+}
+
 function runFfmpeg(args) {
   return new Promise((resolve, reject) => {
     execFile(ffmpegPath, args, { maxBuffer: 1024 * 1024 * 64 }, (error, stdout, stderr) => {
@@ -198,12 +276,24 @@ async function fetchToFile(url, destPath) {
 // original, unmodified durations — nothing about the video-only path
 // changes.
 //
+// musicUrl: optional, resolved by the caller (backend/music-library.js) from
+// the job's musicEnabled/musicTrack/musicCustomUrl settings — a data: URI,
+// http(s) URL, /generated/ reference, or local path, same shapes fetchToFile
+// already handles for clips/voiceover. Omitted/null (the default — music is
+// off unless a job explicitly enables it) leaves every existing code path
+// byte-for-byte unchanged, exactly like burnInSubtitlesContent above. When
+// provided, it is looped/trimmed to the final video's own real duration,
+// faded in/out, and mixed in — quietly ducked under the voice-over via
+// sidechaincompress if one exists, or played at a fuller standalone level if
+// there is no voice-over to protect. A missing or corrupt music file fails
+// this call clearly (a real ffmpeg/fetch error), never silently ignored.
+//
 // Returns { status: 'completed', buffer: Buffer, error: null } on success —
 // buffer is the real assembled MP4's raw bytes, deliberately NOT a url or
 // data: URI; see the module comment above for why storage is a separate
 // step (backend/video-storage.js) — or { status: 'failed', buffer: null,
 // error } on any real failure. Never fabricates a buffer.
-async function assembleFinalVideo({ clips, voiceover, burnInSubtitlesContent, outputFormat }) {
+async function assembleFinalVideo({ clips, voiceover, burnInSubtitlesContent, outputFormat, musicUrl }) {
   if (!Array.isArray(clips) || clips.length === 0) {
     return { buffer: null, status: 'failed', error: 'No scene video clips were provided to assemble.' };
   }
@@ -222,12 +312,23 @@ async function assembleFinalVideo({ clips, voiceover, burnInSubtitlesContent, ou
     const hasVoiceover = Boolean(voiceover && voiceover.status === 'completed' && voiceover.url);
     let audioPath = null;
     let perSceneDuration = null;
+    let totalAudioDuration = null;
 
     if (hasVoiceover) {
       audioPath = path.join(workDir, 'voiceover-audio');
       await fetchToFile(voiceover.url, audioPath);
-      const totalAudioDuration = await getMediaDuration(audioPath);
+      totalAudioDuration = await getMediaDuration(audioPath);
       perSceneDuration = totalAudioDuration / clipPaths.length;
+    }
+
+    // Fetched up front (before any concat/ffmpeg work) so a missing/corrupt
+    // music file is reported clearly and immediately, same as a bad clip
+    // url above — never silently skipped or discovered only after the rest
+    // of assembly already ran.
+    let musicSourcePath = null;
+    if (musicUrl) {
+      musicSourcePath = path.join(workDir, 'music-input');
+      await fetchToFile(musicUrl, musicSourcePath);
     }
 
     const concatenatedPath = path.join(workDir, 'concatenated.mp4');
@@ -308,19 +409,49 @@ async function assembleFinalVideo({ clips, voiceover, burnInSubtitlesContent, ou
     ]);
 
     let finalPath = concatenatedPath;
+    // The single audio track that ends up muxed with the video below — the
+    // voice-over alone (pre-existing behavior, unchanged when musicUrl is
+    // omitted), the prepared music track alone (no voice-over to protect),
+    // or the two ducked/mixed together. Stays null (video-only output,
+    // exactly as before) when neither exists.
+    let audioForMuxPath = hasVoiceover ? audioPath : null;
 
-    if (hasVoiceover) {
+    if (musicSourcePath) {
+      // Music must match the SAME final duration the video ends up at: the
+      // voice-over's real duration when one exists (the video was already
+      // retimed to match it above), or the concatenated video's own real
+      // duration otherwise.
+      const musicTargetDuration = hasVoiceover ? totalAudioDuration : await getMediaDuration(concatenatedPath);
+      const preparedMusicPath = path.join(workDir, 'music-prepared.m4a');
+      await prepareMusicTrack(
+        musicSourcePath,
+        musicTargetDuration,
+        hasVoiceover ? MUSIC_VOLUME_WITH_VOICEOVER : MUSIC_VOLUME_SOLO,
+        preparedMusicPath
+      );
+
+      if (hasVoiceover) {
+        const mixedAudioPath = path.join(workDir, 'audio-mixed.m4a');
+        await duckAndMixMusicWithVoiceover(preparedMusicPath, audioPath, mixedAudioPath);
+        audioForMuxPath = mixedAudioPath;
+      } else {
+        audioForMuxPath = preparedMusicPath;
+      }
+    }
+
+    if (audioForMuxPath) {
       finalPath = path.join(workDir, 'final.mp4');
       // The concatenated video's total length is now (perSceneDuration *
-      // scene count), which already equals the voice-over's real duration
-      // to within float/frame rounding — -shortest here is only a safety
-      // net for that rounding, not the primary sync mechanism anymore.
+      // scene count) when there's a voice-over, which already equals its
+      // real duration to within float/frame rounding — -shortest here is
+      // only a safety net for that rounding (and, for music prepared
+      // above, for the same reason), not the primary sync mechanism.
       await runFfmpeg([
         '-y',
         '-i',
         concatenatedPath,
         '-i',
-        audioPath,
+        audioForMuxPath,
         '-map',
         '0:v',
         '-map',

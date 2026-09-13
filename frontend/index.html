@@ -156,6 +156,21 @@
             </p>
           </div>
 
+          <div class="form-field form-field-wide">
+            <label class="checkbox-field">
+              <input type="checkbox" id="music-enabled-toggle">
+              Add background music — optional, off by default
+            </label>
+            <p class="field-hint">
+              Mixed in quietly under the voice-over (or at a fuller level with no voice-over) using only
+              local audio — never downloaded or generated. Requires a track in the local music library
+              below.
+            </p>
+            <select id="video-music-track" disabled>
+              <option value="">No local music tracks available</option>
+            </select>
+          </div>
+
           <div class="form-field form-field-action">
             <button type="button" id="generate-video-btn" class="btn btn-primary btn-generate">Generate Video</button>
           </div>
