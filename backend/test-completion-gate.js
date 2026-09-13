@@ -59,7 +59,7 @@ async function main() {
     const job = await jobStore.createJob();
     assert.deepStrictEqual(
       job.finalVideo,
-      { url: null, status: 'pending', subtitlesUsed: null, musicUsed: null },
+      { url: null, status: 'pending', subtitlesUsed: null, musicUsed: null, resolutionUsed: null },
       'new jobs must start with no final video asset'
     );
   });

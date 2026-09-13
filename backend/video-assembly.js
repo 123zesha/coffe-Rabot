@@ -42,7 +42,7 @@ const path = require('path');
 const { execFile } = require('child_process');
 
 const videoStorage = require('./video-storage');
-const { OUTPUT_FORMATS, DEFAULT_OUTPUT_FORMAT } = require('./job-store');
+const { OUTPUT_FORMATS, DEFAULT_OUTPUT_FORMAT, DEFAULT_RESOLUTION_TIER } = require('./job-store');
 
 const ffmpegPath = process.env.FFMPEG_PATH || require('ffmpeg-static');
 
@@ -61,14 +61,34 @@ const ffmpegPath = process.env.FFMPEG_PATH || require('ffmpeg-static');
 // degraded to fit.
 const OUTPUT_WIDTH = 1280;
 const OUTPUT_HEIGHT = 720;
-const OUTPUT_DIMENSIONS_BY_FORMAT = {
-  horizontal: [1280, 720],
-  vertical: [720, 1280],
-  square: [960, 960],
+
+// resolutionTier is a FINAL-ASSEMBLY-ONLY setting (see job-store.js's own
+// comment on RESOLUTION_TIERS) — every clip is still generated at its
+// job's outputFormat canvas below regardless of tier, so this table only
+// changes what the last scale/pad/concat pass upscales that same source
+// footage to. 1080p/4K are exact 1.5x/3x linear multiples of the 720p
+// canvas for each format, preserving the identical aspect ratio at every
+// tier. '4k' in particular is a real, honest upscale of 720p-equivalent
+// source material — the exported file's pixel dimensions genuinely match
+// 3840x2160, but that is not the same as native 4K-captured detail (see
+// prompts/system-prompt.md's Video Resolution section for how this must be
+// communicated to the user).
+const OUTPUT_DIMENSIONS_BY_FORMAT_AND_TIER = {
+  horizontal: { '720p': [1280, 720], '1080p': [1920, 1080], '4k': [3840, 2160] },
+  vertical: { '720p': [720, 1280], '1080p': [1080, 1920], '4k': [2160, 3840] },
+  square: { '720p': [960, 960], '1080p': [1080, 1080], '4k': [2160, 2160] },
 };
 
-function resolveOutputDimensions(outputFormat) {
-  return OUTPUT_DIMENSIONS_BY_FORMAT[outputFormat] || [OUTPUT_WIDTH, OUTPUT_HEIGHT];
+// Kept as the plain format -> 720p-tier dimensions map — this is exactly
+// today's pre-existing shape/values, still used wherever only the default
+// tier matters (e.g. this module's own tests).
+const OUTPUT_DIMENSIONS_BY_FORMAT = Object.fromEntries(
+  Object.entries(OUTPUT_DIMENSIONS_BY_FORMAT_AND_TIER).map(([format, tiers]) => [format, tiers[DEFAULT_RESOLUTION_TIER]])
+);
+
+function resolveOutputDimensions(outputFormat, resolutionTier) {
+  const tiers = OUTPUT_DIMENSIONS_BY_FORMAT_AND_TIER[outputFormat] || OUTPUT_DIMENSIONS_BY_FORMAT_AND_TIER[DEFAULT_OUTPUT_FORMAT];
+  return tiers[resolutionTier] || tiers[DEFAULT_RESOLUTION_TIER];
 }
 
 const OUTPUT_FPS = 30;
@@ -288,17 +308,27 @@ async function fetchToFile(url, destPath) {
 // there is no voice-over to protect. A missing or corrupt music file fails
 // this call clearly (a real ffmpeg/fetch error), never silently ignored.
 //
+// resolutionTier: optional, one of job-store.js's RESOLUTION_TIERS
+// ('720p'/'1080p'/'4k'). Omitted/null defaults to '720p' — the exact
+// pre-existing pixel dimensions for outputFormat, unchanged. A higher tier
+// only changes the target canvas the scale/pad stage below upscales the
+// SAME source clips to (via a lanczos scale, for a materially better
+// upscale than the default bilinear) — it never requests larger source
+// footage from any provider. The returned buffer's real, decoded
+// dimensions always match the resolved tier exactly (verified by this
+// module's own tests via a real ffmpeg decode, never merely assumed).
+//
 // Returns { status: 'completed', buffer: Buffer, error: null } on success —
 // buffer is the real assembled MP4's raw bytes, deliberately NOT a url or
 // data: URI; see the module comment above for why storage is a separate
 // step (backend/video-storage.js) — or { status: 'failed', buffer: null,
 // error } on any real failure. Never fabricates a buffer.
-async function assembleFinalVideo({ clips, voiceover, burnInSubtitlesContent, outputFormat, musicUrl }) {
+async function assembleFinalVideo({ clips, voiceover, burnInSubtitlesContent, outputFormat, musicUrl, resolutionTier }) {
   if (!Array.isArray(clips) || clips.length === 0) {
     return { buffer: null, status: 'failed', error: 'No scene video clips were provided to assemble.' };
   }
 
-  const [outputWidth, outputHeight] = resolveOutputDimensions(outputFormat);
+  const [outputWidth, outputHeight] = resolveOutputDimensions(outputFormat, resolutionTier);
   const workDir = fs.mkdtempSync(path.join(os.tmpdir(), 'video-assembly-'));
 
   try {
@@ -355,7 +385,7 @@ async function assembleFinalVideo({ clips, voiceover, burnInSubtitlesContent, ou
           // already normalizes timestamps across segments on its own, so
           // no reset is needed here.
           return (
-            `[${i}:v]scale=${outputWidth}:${outputHeight}:force_original_aspect_ratio=decrease,` +
+            `[${i}:v]scale=${outputWidth}:${outputHeight}:force_original_aspect_ratio=decrease:flags=lanczos,` +
             `pad=${outputWidth}:${outputHeight}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=${OUTPUT_FPS},` +
             `trim=duration=${trimTo},` +
             `tpad=stop_mode=clone:stop_duration=${padBy}[v${i}]`
@@ -366,7 +396,7 @@ async function assembleFinalVideo({ clips, voiceover, burnInSubtitlesContent, ou
       normalizeFilters = clipPaths
         .map(
           (_, i) =>
-            `[${i}:v]scale=${outputWidth}:${outputHeight}:force_original_aspect_ratio=decrease,` +
+            `[${i}:v]scale=${outputWidth}:${outputHeight}:force_original_aspect_ratio=decrease:flags=lanczos,` +
             `pad=${outputWidth}:${outputHeight}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=${OUTPUT_FPS}[v${i}]`
         )
         .join(';');
@@ -480,4 +510,10 @@ async function assembleFinalVideo({ clips, voiceover, burnInSubtitlesContent, ou
   }
 }
 
-module.exports = { assembleFinalVideo, getMediaDuration, ffmpegPath, OUTPUT_DIMENSIONS_BY_FORMAT };
+module.exports = {
+  assembleFinalVideo,
+  getMediaDuration,
+  ffmpegPath,
+  OUTPUT_DIMENSIONS_BY_FORMAT,
+  OUTPUT_DIMENSIONS_BY_FORMAT_AND_TIER,
+};

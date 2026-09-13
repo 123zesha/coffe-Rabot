@@ -16,6 +16,7 @@
   const videoLanguageSelect = document.getElementById('video-language');
   const videoStyleSelect = document.getElementById('video-style');
   const videoOutputFormatSelect = document.getElementById('video-output-format');
+  const videoResolutionSelect = document.getElementById('video-resolution');
   const referenceVideoUrlInput = document.getElementById('reference-video-url');
   const referenceVideoNotesInput = document.getElementById('reference-video-notes');
   const generateYoutubePackageToggle = document.getElementById('generate-youtube-package-toggle');
@@ -244,6 +245,14 @@
     if (videoOutputFormatSelect.value) {
       const outputFormatOption = videoOutputFormatSelect.selectedOptions[0];
       details.push(`Output format: ${outputFormatOption.textContent}`);
+    }
+
+    // Same "only mention if non-default" pattern as output format above —
+    // resolutionTier only upscales the final export (see index.html's field
+    // hint); omitting this leaves the job at its default '720p'.
+    if (videoResolutionSelect.value) {
+      const resolutionOption = videoResolutionSelect.selectedOptions[0];
+      details.push(`Resolution: ${resolutionOption.value} (an upscale of the same generated footage, not higher-detail source video)`);
     }
 
     // Both optional — "Reference Video / Inspiration Mode" only kicks in

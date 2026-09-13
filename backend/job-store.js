@@ -105,19 +105,32 @@ const JOB_FIELDS = [
   'youtubePackage',
   'burnInSubtitles',
   'outputFormat',
+  'resolutionTier',
 ];
 
 // The only real, supported output-format values — 'horizontal' (16:9),
 // 'vertical' (9:16 Shorts), 'square' (1:1) — mirroring
-// data/video-options.json's outputOptions orientation values exactly
-// (its resolution entries, mp4-1080p/mp4-4k, are NOT covered: Runway's
-// gen4_turbo has no literal 1080p/4K output size at all, only the fixed
-// dimensions below, so a resolution tier is a separate, larger feature).
+// data/video-options.json's outputOptions orientation values exactly.
 // Exported so image-generation.js/video-generation.js/video-assembly.js
 // each validate against this same list rather than trusting an arbitrary
 // string through to a provider call.
 const OUTPUT_FORMATS = ['horizontal', 'vertical', 'square'];
 const DEFAULT_OUTPUT_FORMAT = 'horizontal';
+
+// The only real, supported resolution-tier values — mirroring
+// data/video-options.json's outputOptions resolution entries (mp4-1080p/
+// mp4-4k) exactly. This is a FINAL-ASSEMBLY-ONLY setting: Runway's
+// gen4_turbo has no literal 1080p/4K output size, so image generation and
+// Runway video generation are untouched by this — they keep generating at
+// their existing fixed per-outputFormat canvas regardless of tier (no new
+// paid-API cost). Only backend/video-assembly.js's final ffmpeg pass
+// upscales to the selected tier's real pixel dimensions. '4k' in
+// particular is a real ~3x linear upscale of that same 720p-equivalent
+// source footage — the exported FILE genuinely has 4K dimensions, but not
+// genuinely 4K-captured detail; this must be told to the user honestly
+// (see prompts/system-prompt.md), never implied to be sharper source video.
+const RESOLUTION_TIERS = ['720p', '1080p', '4k'];
+const DEFAULT_RESOLUTION_TIER = '720p';
 
 // Local (no-Redis) fallback only, from here down to saveJobs — the whole
 // job list really is just one small JSON file on disk, so there is no
@@ -254,6 +267,12 @@ function createDefaultJob(id) {
     // (16:9), preserving the exact pre-existing behavior for any job that
     // never sets this.
     outputFormat: DEFAULT_OUTPUT_FORMAT,
+    // Which of RESOLUTION_TIERS (above) the FINAL assembled MP4 is exported
+    // at — independent of outputFormat (orientation) and applied only in
+    // video-assembly.js's last ffmpeg pass. Writable by the conversational
+    // agent like outputFormat. Defaults to '720p', preserving the exact
+    // pre-existing pixel dimensions for any job that never sets this.
+    resolutionTier: DEFAULT_RESOLUTION_TIER,
     // Which named voice-over option (see data/video-options.json ->
     // voiceOverOptions) the user picked; writable by the agent like
     // topic/language/storyStyle, since it's just a preference, not a
@@ -315,7 +334,10 @@ function createDefaultJob(id) {
     // into THIS assembled video — same "is the cached result still
     // accurate" role as subtitlesUsed, for the musicEnabled/musicTrack/
     // musicCustomUrl fields below.
-    finalVideo: { url: null, status: 'pending', subtitlesUsed: null, musicUsed: null },
+    // resolutionUsed records which RESOLUTION_TIERS value THIS assembled
+    // video's real pixel dimensions actually reflect — same role again, for
+    // the resolutionTier field above.
+    finalVideo: { url: null, status: 'pending', subtitlesUsed: null, musicUsed: null, resolutionUsed: null },
     // Optional "Reference Video / Inspiration Mode" input: a YouTube URL the
     // user wants used only as high-level storytelling inspiration (pacing,
     // tone, structure — never its transcript, dialogue, character names, or
@@ -624,6 +646,8 @@ module.exports = {
   MIN_SCRIPT_LENGTH,
   OUTPUT_FORMATS,
   DEFAULT_OUTPUT_FORMAT,
+  RESOLUTION_TIERS,
+  DEFAULT_RESOLUTION_TIER,
   listJobs,
   createJob,
   getJob,

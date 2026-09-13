@@ -129,6 +129,19 @@
             </select>
           </div>
 
+          <div class="form-field">
+            <label for="video-resolution">Resolution</label>
+            <select id="video-resolution">
+              <option value="">720p (default)</option>
+              <option value="1080p">1080p</option>
+              <option value="4k">4K (upscaled — see note below)</option>
+            </select>
+            <p class="field-hint">
+              1080p/4K upscale the same generated footage in the final export — the file's dimensions
+              genuinely match, but scenes aren't captured/generated at higher detail.
+            </p>
+          </div>
+
           <div class="form-field form-field-wide">
             <label for="reference-video-url">Reference video URL (optional)</label>
             <input type="url" id="reference-video-url" placeholder="e.g. https://www.youtube.com/watch?v=...">
