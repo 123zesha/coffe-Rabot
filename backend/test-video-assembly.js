@@ -273,6 +273,55 @@ async function main() {
     }
   });
 
+  // --- Burned-in subtitles (optional burnInSubtitlesContent parameter) ---
+  // Proves the new subtitles-filter stage produces valid ffmpeg syntax and
+  // a real, decodable output — every OTHER test in this file omits this
+  // parameter entirely and still passes unchanged, which is itself the
+  // proof that adding it never alters existing behavior (see the module's
+  // own comment on concatOutputLabel/subtitlesStage).
+  const SAMPLE_SRT =
+    '1\n00:00:00,000 --> 00:00:01,000\nHello there.\n\n2\n00:00:01,000 --> 00:00:02,000\nA second caption line.\n';
+
+  await test('assembleFinalVideo burns real subtitles into the output when burnInSubtitlesContent is provided', async () => {
+    const result = await assembleFinalVideo({
+      clips: [
+        { status: 'completed', url: redClipPath },
+        { status: 'completed', url: blueClipPath },
+      ],
+      voiceover: null,
+      burnInSubtitlesContent: SAMPLE_SRT,
+    });
+
+    assert.strictEqual(result.status, 'completed', JSON.stringify(result));
+    assert.ok(Buffer.isBuffer(result.buffer) && result.buffer.length > 0);
+
+    const tmpOut = path.join(fixturesDir, 'check-burned-in-subtitles.mp4');
+    fs.writeFileSync(tmpOut, result.buffer);
+    const log = probe(tmpOut);
+    assert.ok(log.includes('Video:'), 'ffmpeg must still produce a real, decodable video stream with subtitles burned in');
+  });
+
+  await test('assembleFinalVideo also burns subtitles in correctly alongside a real voice-over track', async () => {
+    const voiceoverDataUri = `data:audio/mpeg;base64,${fs.readFileSync(audioPath).toString('base64')}`;
+
+    const result = await assembleFinalVideo({
+      clips: [
+        { status: 'completed', url: redClipPath },
+        { status: 'completed', url: blueClipPath },
+      ],
+      voiceover: { status: 'completed', url: voiceoverDataUri },
+      burnInSubtitlesContent: SAMPLE_SRT,
+    });
+
+    assert.strictEqual(result.status, 'completed', JSON.stringify(result));
+
+    const tmpOut = path.join(fixturesDir, 'check-burned-in-subtitles-with-audio.mp4');
+    fs.writeFileSync(tmpOut, result.buffer);
+    const log = probe(tmpOut);
+    assert.ok(log.includes('Video:'));
+    assert.ok(log.includes('Audio:'), 'the voice-over must still be mixed in when subtitles are also burned in');
+  });
+
   await test('assembleFinalVideo returns a real failure, never a fabricated buffer, when a clip cannot be fetched', async () => {
     const result = await assembleFinalVideo({
       clips: [{ status: 'completed', url: 'http://localhost:1/does-not-exist.mp4' }],
