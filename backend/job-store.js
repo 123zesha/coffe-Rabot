@@ -99,6 +99,8 @@ const JOB_FIELDS = [
   'description',
   'status',
   'confirmed',
+  'generateYoutubePackage',
+  'youtubePackage',
 ];
 
 // Local (no-Redis) fallback only, from here down to saveJobs — the whole
@@ -300,6 +302,44 @@ function createDefaultJob(id) {
     description: '',
     status: STAGES[0],
     confirmed: false,
+    // Optional "YouTube Publishing Package" toggle. Default OFF: with this
+    // false, nothing in that feature ever runs and no extra paid API call
+    // is ever made — the user normally writes their own title/description/
+    // thumbnail. Writable by the conversational agent like topic/
+    // videoTitle, since it's just a preference, not a generation result. It
+    // can be turned on either via the "Create Video" form checkbox or by
+    // the user directly asking in chat for a title/description/thumbnail
+    // to be created — see prompts/system-prompt.md.
+    generateYoutubePackage: false,
+    // Populated by the real YouTube-package generation (see
+    // backend/youtube-package.js for the text half — titles/description/
+    // tags/thumbnail concept — and backend/image-generation.js's
+    // generateThumbnailImage for the thumbnail image itself): { status,
+    // titles, description, tags, thumbnailConcept, thumbnailText,
+    // thumbnailUrl, error, generatedFromScript }, where status is
+    // 'pending' | 'completed' | 'failed'. thumbnailUrl is a base64 data URI
+    // exactly like images[].url, or null if image generation wasn't
+    // configured/failed (the rest of the package can still be 'completed'
+    // in that case). generatedFromScript records exactly which job.script
+    // this result was generated from, so server.js's generateYoutubePackage
+    // handler can skip a redundant real API call when asked again with an
+    // unchanged script (mirrors referenceVideoAnalysis's analyzedUrl/
+    // analyzedNotes pattern above). Deliberately generated WITHOUT ever
+    // reading referenceVideoAnalysis/referenceVideoUrl — see
+    // youtube-package.js's own comment for why. Not writable by the
+    // conversational agent — only the real generation call populates this,
+    // same as images/voiceover/referenceVideoAnalysis.
+    youtubePackage: {
+      status: 'pending',
+      titles: [],
+      description: null,
+      tags: [],
+      thumbnailConcept: null,
+      thumbnailText: null,
+      thumbnailUrl: null,
+      error: null,
+      generatedFromScript: null,
+    },
   };
 }
 

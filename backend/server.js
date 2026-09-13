@@ -11,6 +11,7 @@ const videoGeneration = require('./video-generation');
 const videoAssembly = require('./video-assembly');
 const videoStorage = require('./video-storage');
 const referenceVideo = require('./reference-video');
+const youtubePackage = require('./youtube-package');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -224,6 +225,112 @@ function findVoiceoverBlocker(job) {
   return null;
 }
 
+// job.script must be a real, complete script before generating an optional
+// YouTube publishing package from it — checked once here so the
+// generateYoutubePackage Agent tool and its REST route
+// (POST /api/jobs/:id/generate-youtube-package) can never diverge (mirrors
+// findVoiceoverBlocker's role for its own pipeline). Deliberately does NOT
+// check job.generateYoutubePackage here — that toggle is a prompt-level
+// consent gate (see prompts/system-prompt.md), not a hard code refusal, so
+// an explicit chat request ("create the title and thumbnail for this
+// video") or a direct REST/button call still works even if the checkbox was
+// never turned on; the Agent is instructed to record that consent via
+// updateVideoJob when it happens.
+function findYoutubePackageBlocker(job) {
+  if (!job.script || !job.script.trim()) {
+    return 'job has no finished script yet to base a YouTube package on';
+  }
+
+  if (job.script.trim().length < jobStore.MIN_SCRIPT_LENGTH) {
+    return (
+      `the script is too short to be an approved, complete script (needs at least ` +
+      `${jobStore.MIN_SCRIPT_LENGTH} characters) — finish scripting before generating a YouTube package`
+    );
+  }
+
+  return null;
+}
+
+// Runs the real text (Claude) + thumbnail image (OpenAI, best-effort)
+// generation and persists the result. Shared by the generateYoutubePackage
+// Agent tool and its REST route so the two never drift (mirrors
+// assembleAndStoreFinalVideo's role for its own pipeline). Skips the real
+// calls entirely — returning the existing job unchanged — when the job
+// already has a completed package generated from this exact script and
+// forceRegenerate wasn't requested, so asking again for an unchanged video
+// never re-spends real API credits. A failed generation is never cached
+// (generatedFromScript is left null on failure), so it always retries.
+async function runGenerateYoutubePackage(job, jobId, { forceRegenerate } = {}) {
+  const currentScript = job.script.trim();
+  const existingPackage = job.youtubePackage;
+
+  if (
+    !forceRegenerate &&
+    existingPackage &&
+    existingPackage.status === 'completed' &&
+    existingPackage.generatedFromScript === currentScript
+  ) {
+    return job;
+  }
+
+  const textResult = await youtubePackage.generateYoutubeTextPackage({
+    topic: job.topic,
+    duration: job.duration,
+    language: job.language,
+    storyStyle: job.storyStyle,
+    script: job.script,
+  });
+
+  if (textResult.status !== 'completed') {
+    const failedPackage = {
+      status: 'failed',
+      titles: [],
+      description: null,
+      tags: [],
+      thumbnailConcept: null,
+      thumbnailText: null,
+      thumbnailUrl: null,
+      error: textResult.error || 'YouTube package generation failed.',
+      generatedFromScript: null,
+    };
+    return jobStore.updateJob(jobId, { youtubePackage: failedPackage });
+  }
+
+  // The thumbnail IMAGE is best-effort: OpenAI may not be configured, or the
+  // real call may fail, but the rest of the package (titles/description/
+  // tags/thumbnail concept) still came from a real, successful Claude call
+  // and should still be reported as completed — never discarded just
+  // because the optional image step didn't work.
+  let thumbnailUrl = null;
+  let thumbnailError = null;
+  if (process.env.OPENAI_API_KEY) {
+    const thumbnailResult = await imageGeneration.generateThumbnailImage({
+      thumbnailConcept: textResult.thumbnailConcept,
+      thumbnailText: textResult.thumbnailText,
+    });
+    thumbnailUrl = thumbnailResult.status === 'completed' ? thumbnailResult.url : null;
+    thumbnailError = thumbnailResult.status === 'failed' ? thumbnailResult.error : null;
+  } else {
+    thumbnailError =
+      'Thumbnail image generation is not configured on the server (OPENAI_API_KEY missing) — ' +
+      'titles/description/tags/thumbnail concept were still generated.';
+  }
+
+  const youtubePackageField = {
+    status: 'completed',
+    titles: textResult.titles,
+    description: textResult.description,
+    tags: textResult.tags,
+    thumbnailConcept: textResult.thumbnailConcept,
+    thumbnailText: textResult.thumbnailText,
+    thumbnailUrl,
+    error: thumbnailError,
+    generatedFromScript: currentScript,
+  };
+
+  return jobStore.updateJob(jobId, { youtubePackage: youtubePackageField });
+}
+
 const client = new Anthropic();
 
 const VIDEO_OPTIONS = fs.readFileSync(
@@ -272,6 +379,7 @@ const UPDATABLE_JOB_FIELDS = [
   'music',
   'thumbnail',
   'description',
+  'generateYoutubePackage',
 ];
 
 // job.images[].url and job.voiceover.url each hold a full base64-encoded
@@ -340,6 +448,27 @@ function summarizeJobForAgent(job) {
     };
   }
 
+  if (job.youtubePackage && typeof job.youtubePackage === 'object') {
+    // thumbnailUrl holds a full base64-encoded image (same size concern as
+    // images[].url above) — the agent only needs to know whether a
+    // thumbnail image exists, not its actual bytes. generatedFromScript is
+    // internal bookkeeping (mirrors referenceVideoAnalysis's analyzedUrl/
+    // analyzedNotes) used only to decide whether a fresh generation is
+    // needed, so it's stripped here too.
+    const { status, titles, description, tags, thumbnailConcept, thumbnailText, thumbnailUrl, error } =
+      job.youtubePackage;
+    summarized.youtubePackage = {
+      status,
+      ...(Array.isArray(titles) && titles.length ? { titles } : {}),
+      ...(description ? { description } : {}),
+      ...(Array.isArray(tags) && tags.length ? { tags } : {}),
+      ...(thumbnailConcept ? { thumbnailConcept } : {}),
+      ...(thumbnailText ? { thumbnailText } : {}),
+      ...(error ? { error } : {}),
+      hasThumbnailImage: Boolean(thumbnailUrl),
+    };
+  }
+
   return summarized;
 }
 
@@ -394,6 +523,12 @@ const TOOLS = [
         music: { type: 'string' },
         thumbnail: { type: 'string' },
         description: { type: 'string' },
+        // Optional "YouTube Publishing Package" toggle — see
+        // generateYoutubePackage below. Default false; set this true when
+        // the user checks the "Generate YouTube Package" option, or right
+        // before calling generateYoutubePackage in response to a direct
+        // chat request, so the choice is recorded on the job.
+        generateYoutubePackage: { type: 'boolean' },
       },
       additionalProperties: false,
     },
@@ -560,11 +695,45 @@ const TOOLS = [
       'it manually. If there is no voice-over yet, the final video is produced silently (video only), ' +
       'which is expected, not a failure. Calling this again after it already succeeded is a safe no-op ' +
       'that returns the existing final video unchanged. Only tell the user the final video is ready if ' +
-      'this reports it as completed — subtitles, background music, thumbnail generation, and YouTube ' +
-      'publishing are still not implemented, so never claim any of those happened.',
+      'this reports it as completed — subtitles and background music are still not implemented (never ' +
+      'claim either happened). A title/description/tags/thumbnail package can be generated separately ' +
+      '(see generateYoutubePackage below), but actually publishing/uploading the video to YouTube ' +
+      'itself is still not implemented — never claim a video was published or uploaded.',
     input_schema: {
       type: 'object',
       properties: {},
+      additionalProperties: false,
+    },
+  },
+  {
+    name: 'generateYoutubePackage',
+    description:
+      'Generate an OPTIONAL YouTube publishing package for the current job — 3 title options, an ' +
+      'SEO-friendly description, relevant tags, a thumbnail concept/text, and (when the image ' +
+      'generation provider is configured) an original 16:9 thumbnail image — based ONLY on this job\'s ' +
+      'own final script/topic/style, never on any reference video. This is entirely optional: only call ' +
+      'it when the job\'s generateYoutubePackage setting is turned on (see updateVideoJob), OR the user ' +
+      'has directly asked, right now, for a title/description/thumbnail/YouTube package to be created ' +
+      '(e.g. "create the title, description and thumbnail for this video") — if they ask directly while ' +
+      'the setting is still off, call updateVideoJob to turn generateYoutubePackage on first so the ' +
+      'choice is recorded, then call this. Never call it automatically otherwise, and never call it ' +
+      'before a real, complete script exists — it refuses with a clear reason if the script is missing ' +
+      'or incomplete. This costs a real Claude call, plus a real OpenAI image call for the thumbnail ' +
+      'image if OPENAI_API_KEY is configured — both reuse the exact same providers already used ' +
+      'elsewhere in this app, not a new paid service. Calling this again with the exact same script as ' +
+      'the last successfully generated package is a free no-op that returns the existing package ' +
+      'unchanged; pass forceRegenerate: true if the user explicitly asks to regenerate/redo it even ' +
+      'though the script hasn\'t changed (e.g. "give me different title options"). If a Reference Video ' +
+      'URL was used for storytelling-format inspiration, this package is still based only on the new ' +
+      'original script — never the reference video\'s own title, thumbnail, wording, characters, ' +
+      'artwork, or composition. Only tell the user the package was generated if this reports it as ' +
+      'completed — report a failure honestly instead of assuming success, and note if only the ' +
+      'thumbnail image failed while the rest succeeded.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        forceRegenerate: { type: 'boolean' },
+      },
       additionalProperties: false,
     },
   },
@@ -942,6 +1111,41 @@ async function executeTool(name, jobId, input) {
     }
   }
 
+  if (name === 'generateYoutubePackage') {
+    const job = await jobStore.getJob(jobId);
+
+    if (!job) {
+      return JSON.stringify({ error: 'job not found' });
+    }
+
+    const blocker = findYoutubePackageBlocker(job);
+    if (blocker) {
+      return JSON.stringify({ error: blocker });
+    }
+
+    if (!process.env.ANTHROPIC_API_KEY) {
+      return JSON.stringify({
+        error:
+          'YouTube package generation is not configured on the server right now. Tell the user this is ' +
+          'temporarily unavailable — do not say a title/description/thumbnail was generated.',
+      });
+    }
+
+    try {
+      const forceRegenerate = Boolean(input && input.forceRegenerate);
+      const updatedJob = await runGenerateYoutubePackage(job, jobId, { forceRegenerate });
+      return JSON.stringify(updatedJob ? summarizeJobForAgent(updatedJob) : { error: 'job not found' });
+    } catch (error) {
+      console.error(
+        'Unexpected error generating YouTube package (agent tool):',
+        JSON.stringify({ name: error?.name, message: error?.message }, null, 2)
+      );
+      return JSON.stringify({
+        error: 'YouTube package generation failed unexpectedly. Tell the user to try again in a moment.',
+      });
+    }
+  }
+
   return JSON.stringify({ error: `Unknown tool: ${name}` });
 }
 
@@ -1184,6 +1388,35 @@ app.post('/api/jobs/:id/generate-voiceover', async (req, res) => {
       JSON.stringify({ name: error?.name, message: error?.message }, null, 2)
     );
     res.status(502).json({ error: 'Voice-over generation failed unexpectedly.' });
+  }
+});
+
+app.post('/api/jobs/:id/generate-youtube-package', async (req, res) => {
+  const job = await jobStore.getJob(req.params.id);
+
+  if (!job) {
+    return res.status(404).json({ error: 'job not found' });
+  }
+
+  const blocker = findYoutubePackageBlocker(job);
+  if (blocker) {
+    return res.status(400).json({ error: blocker });
+  }
+
+  if (!process.env.ANTHROPIC_API_KEY) {
+    return res.status(500).json({ error: 'ANTHROPIC_API_KEY is not configured' });
+  }
+
+  try {
+    const forceRegenerate = Boolean(req.body && req.body.forceRegenerate);
+    const updatedJob = await runGenerateYoutubePackage(job, job.id, { forceRegenerate });
+    res.json(updatedJob);
+  } catch (error) {
+    console.error(
+      'Unexpected error generating YouTube package:',
+      JSON.stringify({ name: error?.name, message: error?.message }, null, 2)
+    );
+    res.status(502).json({ error: 'YouTube package generation failed unexpectedly.' });
   }
 });
 

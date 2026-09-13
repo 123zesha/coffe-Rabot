@@ -17,6 +17,20 @@
   const videoStyleSelect = document.getElementById('video-style');
   const referenceVideoUrlInput = document.getElementById('reference-video-url');
   const referenceVideoNotesInput = document.getElementById('reference-video-notes');
+  const generateYoutubePackageToggle = document.getElementById('generate-youtube-package-toggle');
+
+  const youtubeThumbnailPlaceholder = document.getElementById('youtube-thumbnail-placeholder');
+  const youtubeThumbnailPanel = document.getElementById('youtube-thumbnail-panel');
+  const youtubeThumbnailImage = document.getElementById('youtube-thumbnail-image');
+  const youtubeThumbnailConcept = document.getElementById('youtube-thumbnail-concept');
+  const youtubeTitlesPlaceholder = document.getElementById('youtube-titles-placeholder');
+  const youtubeTitlesList = document.getElementById('youtube-titles-list');
+  const youtubeDescriptionPlaceholder = document.getElementById('youtube-description-placeholder');
+  const youtubeDescriptionPanel = document.getElementById('youtube-description-panel');
+  const youtubeDescriptionText = document.getElementById('youtube-description-text');
+  const youtubeTagsText = document.getElementById('youtube-tags-text');
+  const generateYoutubePackageBtn = document.getElementById('generate-youtube-package-btn');
+  const youtubePackageStatus = document.getElementById('youtube-package-status');
 
   const voiceoverPlaceholder = document.getElementById('voiceover-placeholder');
   const voiceoverPanel = document.getElementById('voiceover-panel');
@@ -147,6 +161,7 @@
       refreshVoiceoverCard();
       refreshSceneClipsCard();
       refreshFinalVideoCard();
+      refreshYoutubePackageCard();
     }
   });
 
@@ -186,6 +201,18 @@
       details.push(`Reference notes: ${referenceVideoNotes}`);
     }
 
+    // Optional "YouTube Publishing Package" — off by default. Described in
+    // plain text like every other preference here; the Agent (per
+    // prompts/system-prompt.md) records it with updateVideoJob and only
+    // generates the package once a real script exists.
+    if (generateYoutubePackageToggle.checked) {
+      details.push(
+        'Generate YouTube Package: yes — please also prepare 3 YouTube title options, an SEO-friendly ' +
+          'description, tags, and an original thumbnail for this video once it is finished (update the ' +
+          'job setting accordingly).'
+      );
+    }
+
     const message = "I'd like to create a YouTube video with these details:\n" + details.join('\n');
 
     generateBtn.disabled = true;
@@ -201,6 +228,7 @@
       refreshVoiceoverCard();
       refreshSceneClipsCard();
       refreshFinalVideoCard();
+      refreshYoutubePackageCard();
     }
   });
 
@@ -445,6 +473,136 @@
     renderFinalVideoCard(await fetchCurrentJob());
   }
 
+  // --- YouTube Publishing Package (Final Review) ---
+  // Mirrors the voice-over card's generate/status pattern. job.youtubePackage
+  // is returned in full (thumbnailUrl included) by GET /api/jobs/:id — the
+  // same read-only route already used for voiceover.url/finalVideo.url —
+  // and calls the same POST /api/jobs/:id/generate-youtube-package route the
+  // generateYoutubePackage Agent tool also uses. Nothing here changes when
+  // the toggle is off: the button is simply never clicked, so no call is
+  // ever made unless the user explicitly asks for one.
+  let youtubePackageGenerating = false;
+
+  function setYoutubePackageStatus(text, type) {
+    youtubePackageStatus.textContent = text;
+    youtubePackageStatus.className = 'generate-status' + (type ? ' ' + type : '');
+    youtubePackageStatus.hidden = false;
+  }
+
+  function clearYoutubePackageStatus() {
+    youtubePackageStatus.hidden = true;
+    youtubePackageStatus.textContent = '';
+  }
+
+  function renderYoutubePackageCard(job) {
+    const hasScript = Boolean(job && typeof job.script === 'string' && job.script.trim().length > 0);
+    const pkg = job && job.youtubePackage && typeof job.youtubePackage === 'object' ? job.youtubePackage : null;
+
+    generateYoutubePackageBtn.disabled = youtubePackageGenerating || !hasScript;
+    generateYoutubePackageBtn.textContent = youtubePackageGenerating
+      ? 'Generating…'
+      : pkg && pkg.status === 'completed'
+      ? 'Regenerate YouTube Package'
+      : 'Generate YouTube Package';
+
+    const titles = pkg && Array.isArray(pkg.titles) ? pkg.titles : [];
+    if (titles.length > 0) {
+      youtubeTitlesPlaceholder.hidden = true;
+      youtubeTitlesList.hidden = false;
+      youtubeTitlesList.innerHTML = '';
+      titles.forEach((title) => {
+        const item = document.createElement('li');
+        item.textContent = title;
+        youtubeTitlesList.appendChild(item);
+      });
+    } else {
+      youtubeTitlesPlaceholder.hidden = false;
+      youtubeTitlesList.hidden = true;
+    }
+
+    if (pkg && pkg.description) {
+      youtubeDescriptionPlaceholder.hidden = true;
+      youtubeDescriptionPanel.hidden = false;
+      youtubeDescriptionText.textContent = pkg.description;
+      youtubeTagsText.textContent =
+        Array.isArray(pkg.tags) && pkg.tags.length > 0 ? `Tags: ${pkg.tags.join(', ')}` : '';
+    } else {
+      youtubeDescriptionPlaceholder.hidden = false;
+      youtubeDescriptionPanel.hidden = true;
+    }
+
+    if (pkg && pkg.thumbnailUrl) {
+      youtubeThumbnailPlaceholder.hidden = true;
+      youtubeThumbnailPanel.hidden = false;
+      youtubeThumbnailImage.src = pkg.thumbnailUrl;
+      youtubeThumbnailImage.hidden = false;
+      youtubeThumbnailConcept.textContent = pkg.thumbnailConcept || '';
+    } else if (pkg && pkg.thumbnailConcept) {
+      // The text package succeeded but no thumbnail image exists (e.g. the
+      // image provider isn't configured, or it failed) — still show the
+      // real concept text rather than falling back to the empty placeholder.
+      youtubeThumbnailPlaceholder.hidden = true;
+      youtubeThumbnailPanel.hidden = false;
+      youtubeThumbnailImage.hidden = true;
+      youtubeThumbnailImage.removeAttribute('src');
+      youtubeThumbnailConcept.textContent = pkg.thumbnailConcept;
+    } else {
+      youtubeThumbnailPlaceholder.hidden = false;
+      youtubeThumbnailPanel.hidden = true;
+    }
+
+    if (pkg && pkg.status === 'failed' && pkg.error) {
+      setYoutubePackageStatus(pkg.error, 'error');
+    }
+  }
+
+  async function refreshYoutubePackageCard() {
+    renderYoutubePackageCard(await fetchCurrentJob());
+  }
+
+  generateYoutubePackageBtn.addEventListener('click', async () => {
+    if (youtubePackageGenerating || !jobId) {
+      return;
+    }
+
+    const currentJob = await fetchCurrentJob();
+    // Clicking again after a package already exists is an explicit request
+    // to redo it — pass forceRegenerate so the backend's skip-if-unchanged
+    // guard doesn't just return the same result again.
+    const alreadyCompleted = Boolean(
+      currentJob && currentJob.youtubePackage && currentJob.youtubePackage.status === 'completed'
+    );
+
+    youtubePackageGenerating = true;
+    clearYoutubePackageStatus();
+    renderYoutubePackageCard(currentJob);
+
+    try {
+      const res = await fetch(`/api/jobs/${jobId}/generate-youtube-package`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ forceRegenerate: alreadyCompleted }),
+      });
+      const data = await res.json();
+
+      if (!res.ok) {
+        setYoutubePackageStatus(data.error || 'Could not generate the YouTube package.', 'error');
+      } else if (data.youtubePackage && data.youtubePackage.status === 'completed') {
+        setYoutubePackageStatus('YouTube package generated successfully.', 'success');
+      } else {
+        setYoutubePackageStatus(
+          (data.youtubePackage && data.youtubePackage.error) || 'Could not generate the YouTube package.',
+          'error'
+        );
+      }
+    } catch (error) {
+      setYoutubePackageStatus('Could not generate the YouTube package. Please try again.', 'error');
+    } finally {
+      youtubePackageGenerating = false;
+      await refreshYoutubePackageCard();
+    }
+  });
+
   generateVoiceoverBtn.addEventListener('click', async () => {
     if (voiceoverGenerating || !jobId) {
       return;
@@ -477,4 +635,5 @@
   refreshVoiceoverCard();
   refreshSceneClipsCard();
   refreshFinalVideoCard();
+  refreshYoutubePackageCard();
 })();

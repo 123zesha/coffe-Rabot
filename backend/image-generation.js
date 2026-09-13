@@ -201,4 +201,44 @@ async function generateImagesForPrompts({ imagePrompts, characters, existingImag
   return images;
 }
 
-module.exports = { generateImagesForPrompts, IMAGE_MODEL, IMAGE_SIZE, IMAGE_QUALITY };
+// Generates a single, original thumbnail image for the optional "YouTube
+// Publishing Package" feature (see backend/youtube-package.js for the text
+// half of that package). Reuses this same OpenAI image backend/model/size —
+// no new paid provider — via the same generateSceneImage used for scene
+// stills, just with no character-consistency reference image (a thumbnail
+// is a standalone composition, not part of the scene sequence). Never given
+// any reference-video content — see youtube-package.js's own comment for
+// why. Returns { url, status, error? }, the same shape as one entry of
+// generateImagesForPrompts, and never fabricates a url on failure.
+async function generateThumbnailImage({ thumbnailConcept, thumbnailText }) {
+  const promptParts = [
+    'Cinematic, eye-catching YouTube thumbnail image, bold composition, widescreen (16:9) framing, ' +
+      'high contrast, vibrant colors.',
+    `Concept: ${thumbnailConcept}`,
+  ];
+  if (thumbnailText) {
+    promptParts.push(
+      `If including text, render exactly this short text prominently and legibly: "${thumbnailText}"`
+    );
+  }
+  const prompt = promptParts.join('\n');
+
+  try {
+    const url = await generateSceneImage({ prompt, characterContext: '', referenceDataUri: null });
+    return { url, status: 'completed', error: null };
+  } catch (error) {
+    console.error(
+      'OpenAI thumbnail image generation error:',
+      JSON.stringify({ message: describeError(error) }, null, 2)
+    );
+    return { url: null, status: 'failed', error: describeError(error) };
+  }
+}
+
+module.exports = {
+  generateImagesForPrompts,
+  generateThumbnailImage,
+  IMAGE_MODEL,
+  IMAGE_SIZE,
+  IMAGE_QUALITY,
+};

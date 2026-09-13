@@ -135,6 +135,18 @@
             <textarea id="reference-video-notes" rows="3" placeholder="A short synopsis or description of the reference video's story/pacing helps a lot — a bare URL alone often isn't enough to analyze accurately."></textarea>
           </div>
 
+          <div class="form-field form-field-wide">
+            <label class="checkbox-field">
+              <input type="checkbox" id="generate-youtube-package-toggle">
+              Generate YouTube Package (title, description, tags &amp; thumbnail) — optional, off by default
+            </label>
+            <p class="field-hint">
+              When enabled, the agent will also prepare 3 title options, an SEO-friendly description, tags, and
+              an original thumbnail based on your finished video. You can also ask for this anytime in chat, or
+              generate it later from the Final Review section below.
+            </p>
+          </div>
+
           <div class="form-field form-field-action">
             <button type="button" id="generate-video-btn" class="btn btn-primary btn-generate">Generate Video</button>
           </div>
@@ -210,8 +222,11 @@
 
           <article class="review-card">
             <h3>Thumbnail</h3>
-            <div class="review-placeholder thumbnail-placeholder" aria-hidden="true">🖼️</div>
-            <p class="review-note">Your generated thumbnail will appear here.</p>
+            <div id="youtube-thumbnail-placeholder" class="review-placeholder thumbnail-placeholder" aria-hidden="true">🖼️</div>
+            <div id="youtube-thumbnail-panel" hidden>
+              <img id="youtube-thumbnail-image" class="review-thumbnail-image" alt="Generated YouTube thumbnail" hidden>
+              <p id="youtube-thumbnail-concept" class="review-note"></p>
+            </div>
           </article>
 
           <article class="review-card">
@@ -228,16 +243,31 @@
 
           <article class="review-card">
             <h3>YouTube Title</h3>
-            <div class="review-placeholder text-placeholder">
+            <div id="youtube-titles-placeholder" class="review-placeholder text-placeholder">
               <p>Your generated video title will appear here.</p>
             </div>
+            <ul id="youtube-titles-list" class="youtube-titles-list" hidden></ul>
           </article>
 
           <article class="review-card">
             <h3>YouTube Description</h3>
-            <div class="review-placeholder text-placeholder text-placeholder-tall">
+            <div id="youtube-description-placeholder" class="review-placeholder text-placeholder text-placeholder-tall">
               <p>Your generated video description will appear here.</p>
             </div>
+            <div id="youtube-description-panel" hidden>
+              <p id="youtube-description-text" class="youtube-description-text"></p>
+              <p id="youtube-tags-text" class="review-note"></p>
+            </div>
+          </article>
+
+          <article class="review-card review-card-wide">
+            <h3>YouTube Publishing Package</h3>
+            <p class="review-note">
+              Generates the title, description, tags, and thumbnail above from your finished video — optional, and
+              never based on any reference video you may have used for inspiration.
+            </p>
+            <button type="button" id="generate-youtube-package-btn" class="btn btn-primary btn-generate">Generate YouTube Package</button>
+            <p id="youtube-package-status" class="generate-status" hidden aria-live="polite"></p>
           </article>
         </div>
       </div>
