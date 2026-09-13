@@ -42,18 +42,35 @@ const path = require('path');
 const { execFile } = require('child_process');
 
 const videoStorage = require('./video-storage');
+const { OUTPUT_FORMATS, DEFAULT_OUTPUT_FORMAT } = require('./job-store');
 
 const ffmpegPath = process.env.FFMPEG_PATH || require('ffmpeg-static');
 
-// Every scene clip is generated at this fixed size (see
-// video-generation.js's DEFAULT_ASPECT_RATIO), but a job's clips could in
-// principle differ (a future per-scene aspect ratio, or clips generated
-// before that default existed) — ffmpeg's concat filter requires every
-// joined segment to share identical dimensions and frame rate, so each clip
-// is normalized to this canvas (letterboxed, never cropped or stretched)
-// before concatenation rather than assuming they already match.
+// Every scene clip is generated at the job's own outputFormat (see
+// video-generation.js's ASPECT_RATIO_BY_FORMAT), but a job's clips could in
+// principle differ (clips generated before output-format support existed,
+// or — in the rare in-flight-request race documented in
+// video-generation.js's generateClip — a clip whose request predates a
+// since-changed format) — ffmpeg's concat filter requires every joined
+// segment to share identical dimensions and frame rate, so each clip is
+// normalized to this canvas (letterboxed, never cropped or stretched)
+// before concatenation rather than assuming they already match. The
+// canvas itself matches Runway's own literal output dimensions for the
+// job's outputFormat, so normalizing is a no-op scale/pad in the common
+// case (every clip already exactly this size) — never resized down or
+// degraded to fit.
 const OUTPUT_WIDTH = 1280;
 const OUTPUT_HEIGHT = 720;
+const OUTPUT_DIMENSIONS_BY_FORMAT = {
+  horizontal: [1280, 720],
+  vertical: [720, 1280],
+  square: [960, 960],
+};
+
+function resolveOutputDimensions(outputFormat) {
+  return OUTPUT_DIMENSIONS_BY_FORMAT[outputFormat] || [OUTPUT_WIDTH, OUTPUT_HEIGHT];
+}
+
 const OUTPUT_FPS = 30;
 
 function runFfmpeg(args) {
@@ -186,11 +203,12 @@ async function fetchToFile(url, destPath) {
 // data: URI; see the module comment above for why storage is a separate
 // step (backend/video-storage.js) — or { status: 'failed', buffer: null,
 // error } on any real failure. Never fabricates a buffer.
-async function assembleFinalVideo({ clips, voiceover, burnInSubtitlesContent }) {
+async function assembleFinalVideo({ clips, voiceover, burnInSubtitlesContent, outputFormat }) {
   if (!Array.isArray(clips) || clips.length === 0) {
     return { buffer: null, status: 'failed', error: 'No scene video clips were provided to assemble.' };
   }
 
+  const [outputWidth, outputHeight] = resolveOutputDimensions(outputFormat);
   const workDir = fs.mkdtempSync(path.join(os.tmpdir(), 'video-assembly-'));
 
   try {
@@ -236,8 +254,8 @@ async function assembleFinalVideo({ clips, voiceover, burnInSubtitlesContent }) 
           // already normalizes timestamps across segments on its own, so
           // no reset is needed here.
           return (
-            `[${i}:v]scale=${OUTPUT_WIDTH}:${OUTPUT_HEIGHT}:force_original_aspect_ratio=decrease,` +
-            `pad=${OUTPUT_WIDTH}:${OUTPUT_HEIGHT}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=${OUTPUT_FPS},` +
+            `[${i}:v]scale=${outputWidth}:${outputHeight}:force_original_aspect_ratio=decrease,` +
+            `pad=${outputWidth}:${outputHeight}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=${OUTPUT_FPS},` +
             `trim=duration=${trimTo},` +
             `tpad=stop_mode=clone:stop_duration=${padBy}[v${i}]`
           );
@@ -247,8 +265,8 @@ async function assembleFinalVideo({ clips, voiceover, burnInSubtitlesContent }) 
       normalizeFilters = clipPaths
         .map(
           (_, i) =>
-            `[${i}:v]scale=${OUTPUT_WIDTH}:${OUTPUT_HEIGHT}:force_original_aspect_ratio=decrease,` +
-            `pad=${OUTPUT_WIDTH}:${OUTPUT_HEIGHT}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=${OUTPUT_FPS}[v${i}]`
+            `[${i}:v]scale=${outputWidth}:${outputHeight}:force_original_aspect_ratio=decrease,` +
+            `pad=${outputWidth}:${outputHeight}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=${OUTPUT_FPS}[v${i}]`
         )
         .join(';');
     }
@@ -331,4 +349,4 @@ async function assembleFinalVideo({ clips, voiceover, burnInSubtitlesContent }) 
   }
 }
 
-module.exports = { assembleFinalVideo, getMediaDuration, ffmpegPath };
+module.exports = { assembleFinalVideo, getMediaDuration, ffmpegPath, OUTPUT_DIMENSIONS_BY_FORMAT };

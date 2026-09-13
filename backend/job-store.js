@@ -102,7 +102,20 @@ const JOB_FIELDS = [
   'generateYoutubePackage',
   'youtubePackage',
   'burnInSubtitles',
+  'outputFormat',
 ];
+
+// The only real, supported output-format values — 'horizontal' (16:9),
+// 'vertical' (9:16 Shorts), 'square' (1:1) — mirroring
+// data/video-options.json's outputOptions orientation values exactly
+// (its resolution entries, mp4-1080p/mp4-4k, are NOT covered: Runway's
+// gen4_turbo has no literal 1080p/4K output size at all, only the fixed
+// dimensions below, so a resolution tier is a separate, larger feature).
+// Exported so image-generation.js/video-generation.js/video-assembly.js
+// each validate against this same list rather than trusting an arbitrary
+// string through to a provider call.
+const OUTPUT_FORMATS = ['horizontal', 'vertical', 'square'];
+const DEFAULT_OUTPUT_FORMAT = 'horizontal';
 
 // Local (no-Redis) fallback only, from here down to saveJobs — the whole
 // job list really is just one small JSON file on disk, so there is no
@@ -220,12 +233,25 @@ function createDefaultJob(id) {
     videoPrompts: [],
     // Populated by the OpenAI image-generation integration (see
     // backend/image-generation.js), one entry per imagePrompts item it has
-    // processed: { prompt, url, status, error? }, where status is
-    // 'completed' | 'failed' and error is only present on failure. url is
-    // only set when the API actually returned image data. Not writable by
-    // the conversational agent (see UPDATABLE_JOB_FIELDS in server.js) —
-    // only the real generation call populates this.
+    // processed: { prompt, url, status, outputFormat, error? }, where
+    // status is 'completed' | 'failed' and error is only present on
+    // failure. url is only set when the API actually returned image data.
+    // outputFormat records which of OUTPUT_FORMATS this specific image was
+    // actually generated at, so generateImagesForPrompts's own "already
+    // completed, skip" reuse check can tell a real format change (job.
+    // outputFormat edited after this scene was already generated) from a
+    // genuine no-op — an image generated at the wrong format is never
+    // silently kept just to save a call. Not writable by the conversational
+    // agent (see UPDATABLE_JOB_FIELDS in server.js) — only the real
+    // generation call populates this.
     images: [],
+    // Which of OUTPUT_FORMATS (above) this job renders at throughout image
+    // generation, Runway video generation, and final ffmpeg assembly.
+    // Writable by the conversational agent like topic/language/storyStyle —
+    // it's a preference, not a generation result. Defaults to 'horizontal'
+    // (16:9), preserving the exact pre-existing behavior for any job that
+    // never sets this.
+    outputFormat: DEFAULT_OUTPUT_FORMAT,
     // Which named voice-over option (see data/video-options.json ->
     // voiceOverOptions) the user picked; writable by the agent like
     // topic/language/storyStyle, since it's just a preference, not a
@@ -245,12 +271,18 @@ function createDefaultJob(id) {
     // request (e.g. 'runway'); status is 'not_started' | 'processing' |
     // 'completed' | 'failed' for the job as a whole ('completed' only once
     // every scene's clip is completed); clips is one entry per scene,
-    // { status, externalJobId, url, error, attempts }, url only ever set
-    // once a real playable clip was retrieved. Not writable by the
-    // conversational agent — only the real generation route populates
-    // this. IMPORTANT: even when every clip is completed, that is many
-    // separate short clips, not one final assembled video — turning them
-    // into one is the separate assembleFinalVideo step below.
+    // { status, externalJobId, url, error, attempts, ratio }, url only ever
+    // set once a real playable clip was retrieved. ratio records the exact
+    // Runway aspect-ratio string (e.g. '1280:720') this specific clip was
+    // actually submitted at, so generateClip's own "already completed,
+    // never resubmit" reuse check can tell a real format change (job.
+    // outputFormat edited after this scene's clip already completed) from a
+    // genuine no-op — a clip generated at the wrong ratio is never silently
+    // kept just to save a Runway call. Not writable by the conversational
+    // agent — only the real generation route populates this. IMPORTANT:
+    // even when every clip is completed, that is many separate short
+    // clips, not one final assembled video — turning them into one is the
+    // separate assembleFinalVideo step below.
     videoGeneration: { provider: null, status: 'not_started', clips: [], error: null },
     // The real, final, single playable output video: { url, status,
     // error? }, where status is 'pending' | 'completed' | 'failed'. Only
@@ -565,6 +597,8 @@ module.exports = {
   STAGES,
   JOB_FIELDS,
   MIN_SCRIPT_LENGTH,
+  OUTPUT_FORMATS,
+  DEFAULT_OUTPUT_FORMAT,
   listJobs,
   createJob,
   getJob,

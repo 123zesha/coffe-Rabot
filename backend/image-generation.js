@@ -6,15 +6,29 @@
 
 const OpenAI = require('openai');
 const { toFile } = require('openai');
+const { OUTPUT_FORMATS, DEFAULT_OUTPUT_FORMAT } = require('./job-store');
 
 // gpt-image-2 is OpenAI's current general-purpose image model (verified
 // against the OpenAI API docs/SDK type definitions at integration time).
 // OpenAI's image API does not offer an exact 16:9 preset — the supported
 // sizes are 1024x1024, 1536x1024, and 1024x1536. 1536x1024 (3:2) is the
 // widest landscape size available and the closest match to a 16:9
-// widescreen composition.
+// widescreen composition; 1024x1536 (2:3) is the matching portrait size,
+// used for job.outputFormat 'vertical' (9:16 Shorts); 1024x1024 is used
+// for 'square' (1:1). These three sizes are the ONLY ones OpenAI's image
+// API offers, so they are also the only three job.outputFormat values
+// this app supports (see job-store.js's OUTPUT_FORMATS).
 const IMAGE_MODEL = 'gpt-image-2';
 const IMAGE_SIZE = '1536x1024';
+const IMAGE_SIZE_BY_FORMAT = {
+  horizontal: '1536x1024',
+  vertical: '1024x1536',
+  square: '1024x1024',
+};
+
+function resolveImageSize(outputFormat) {
+  return IMAGE_SIZE_BY_FORMAT[outputFormat] || IMAGE_SIZE_BY_FORMAT[DEFAULT_OUTPUT_FORMAT];
+}
 // 'medium', not 'high': at 'high' quality, a single gpt-image-2 generation
 // can take from tens of seconds up to ~3-4 minutes. generateImagesForPrompts
 // runs one real, synchronous OpenAI call per prompt in sequence, and — since
@@ -61,9 +75,21 @@ function buildCharacterContext(characters) {
   return 'These characters must look the same in every scene: ' + descriptions.join('; ') + '.';
 }
 
-function buildPrompt(scenePrompt, characterContext) {
-  const styleDirective =
-    'Cinematic, photorealistic film still, dramatic lighting, widescreen composition.';
+// The composition described to the model must actually match the frame
+// shape it's being asked to fill — sizing a request correctly but still
+// prompting it as "widescreen" would reliably produce a badly-composed
+// portrait/square image (e.g. a wide scene awkwardly cropped), not just a
+// technically-wrong-shaped one. Each directive keeps the same cinematic/
+// lighting language, only the framing description changes.
+const FRAME_DIRECTIVE_BY_FORMAT = {
+  horizontal: 'widescreen composition',
+  vertical: 'vertical portrait composition, subject centered and framed for a tall 9:16 frame',
+  square: 'square 1:1 composition, subject centered',
+};
+
+function buildPrompt(scenePrompt, characterContext, outputFormat) {
+  const frameDirective = FRAME_DIRECTIVE_BY_FORMAT[outputFormat] || FRAME_DIRECTIVE_BY_FORMAT[DEFAULT_OUTPUT_FORMAT];
+  const styleDirective = `Cinematic, photorealistic film still, dramatic lighting, ${frameDirective}.`;
 
   return [styleDirective, characterContext, `Scene: ${scenePrompt}`]
     .filter((part) => part && part.trim().length > 0)
@@ -105,9 +131,10 @@ function describeError(error) {
   return (error && error.message) || 'Unknown error generating image.';
 }
 
-async function generateSceneImage({ prompt, characterContext, referenceDataUri }) {
+async function generateSceneImage({ prompt, characterContext, referenceDataUri, outputFormat }) {
   const client = getClient();
-  const fullPrompt = buildPrompt(prompt, characterContext);
+  const fullPrompt = buildPrompt(prompt, characterContext, outputFormat);
+  const size = resolveImageSize(outputFormat);
 
   let response;
   if (referenceDataUri) {
@@ -125,14 +152,14 @@ async function generateSceneImage({ prompt, characterContext, referenceDataUri }
       model: IMAGE_MODEL,
       image: referenceFile,
       prompt: fullPrompt,
-      size: IMAGE_SIZE,
+      size,
       quality: IMAGE_QUALITY,
     });
   } else {
     response = await client.images.generate({
       model: IMAGE_MODEL,
       prompt: fullPrompt,
-      size: IMAGE_SIZE,
+      size,
       quality: IMAGE_QUALITY,
     });
   }
@@ -152,7 +179,10 @@ async function generateSceneImage({ prompt, characterContext, referenceDataUri }
 // A prompt is only ever marked 'completed' when the API actually returned
 // image data; any failure is recorded as 'failed' with an error message,
 // never a fabricated URL.
-async function generateImagesForPrompts({ imagePrompts, characters, existingImages }) {
+async function generateImagesForPrompts({ imagePrompts, characters, existingImages, outputFormat }) {
+  const resolvedFormat = OUTPUT_FORMATS.includes(outputFormat) ? outputFormat : DEFAULT_OUTPUT_FORMAT;
+  const size = resolveImageSize(resolvedFormat);
+
   // Diagnostic logging so a real production failure (or a request that
   // never finishes at all, e.g. a serverless timeout) is visible in server
   // logs instead of silently looking like "image generation unavailable"
@@ -161,7 +191,7 @@ async function generateImagesForPrompts({ imagePrompts, characters, existingImag
   // text already produced below.
   console.log(
     `Starting image generation for ${imagePrompts.length} prompt(s) ` +
-      `(model=${IMAGE_MODEL}, size=${IMAGE_SIZE}, quality=${IMAGE_QUALITY}).`
+      `(model=${IMAGE_MODEL}, size=${size}, quality=${IMAGE_QUALITY}, format=${resolvedFormat}).`
   );
 
   const characterContext = buildCharacterContext(characters);
@@ -169,8 +199,20 @@ async function generateImagesForPrompts({ imagePrompts, characters, existingImag
   let referenceDataUri = findReferenceDataUri(existingImages);
 
   for (const prompt of imagePrompts) {
+    // Only reuse an already-completed image for this exact prompt if it was
+    // ALSO generated at the currently-desired outputFormat — a job whose
+    // outputFormat changed after this scene already completed must
+    // regenerate it for real, never silently keep a wrong-shaped image just
+    // to save a call (a missing/legacy outputFormat on an old image record
+    // is treated as 'horizontal', its true original default).
     const existing = Array.isArray(existingImages)
-      ? existingImages.find((image) => image && image.prompt === prompt && image.status === 'completed')
+      ? existingImages.find(
+          (image) =>
+            image &&
+            image.prompt === prompt &&
+            image.status === 'completed' &&
+            (image.outputFormat || DEFAULT_OUTPUT_FORMAT) === resolvedFormat
+        )
       : null;
 
     if (existing) {
@@ -179,8 +221,8 @@ async function generateImagesForPrompts({ imagePrompts, characters, existingImag
     }
 
     try {
-      const url = await generateSceneImage({ prompt, characterContext, referenceDataUri });
-      images.push({ prompt, url, status: 'completed' });
+      const url = await generateSceneImage({ prompt, characterContext, referenceDataUri, outputFormat: resolvedFormat });
+      images.push({ prompt, url, status: 'completed', outputFormat: resolvedFormat });
       referenceDataUri = url;
     } catch (error) {
       console.error(
@@ -240,5 +282,6 @@ module.exports = {
   generateThumbnailImage,
   IMAGE_MODEL,
   IMAGE_SIZE,
+  IMAGE_SIZE_BY_FORMAT,
   IMAGE_QUALITY,
 };

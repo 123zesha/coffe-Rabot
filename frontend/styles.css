@@ -381,6 +381,9 @@ a {
   border-radius: var(--radius);
   aspect-ratio: 16 / 9;
   background: #000;
+  /* A real vertical/square clip (job.outputFormat) must never be
+     stretched to fill this box — contain letterboxes it instead. */
+  object-fit: contain;
 }
 
 .scene-clip-status {
@@ -463,6 +466,9 @@ a {
   border-radius: var(--radius);
   background: #000;
   margin-bottom: 12px;
+  /* A real vertical/square final video (job.outputFormat) must never be
+     stretched to fill this box — contain letterboxes it instead. */
+  object-fit: contain;
 }
 
 .review-thumbnail-image {

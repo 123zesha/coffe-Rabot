@@ -15,6 +15,7 @@
   const videoDurationSelect = document.getElementById('video-duration');
   const videoLanguageSelect = document.getElementById('video-language');
   const videoStyleSelect = document.getElementById('video-style');
+  const videoOutputFormatSelect = document.getElementById('video-output-format');
   const referenceVideoUrlInput = document.getElementById('reference-video-url');
   const referenceVideoNotesInput = document.getElementById('reference-video-notes');
   const generateYoutubePackageToggle = document.getElementById('generate-youtube-package-toggle');
@@ -197,6 +198,14 @@
     if (videoDurationSelect.value) details.push(`Duration: ${durationOption.textContent}`);
     if (videoLanguageSelect.value) details.push(`Language: ${languageOption.textContent}`);
     if (videoStyleSelect.value) details.push(`Style: ${styleOption.textContent}`);
+
+    // Omitting this (the empty "Horizontal (16:9, default)" option) leaves
+    // the job at its default outputFormat — only mentioned at all when the
+    // user actually picked Vertical or Square.
+    if (videoOutputFormatSelect.value) {
+      const outputFormatOption = videoOutputFormatSelect.selectedOptions[0];
+      details.push(`Output format: ${outputFormatOption.textContent}`);
+    }
 
     // Both optional — "Reference Video / Inspiration Mode" only kicks in
     // when a URL is actually provided; omitting both leaves this message
