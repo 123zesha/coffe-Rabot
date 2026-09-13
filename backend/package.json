@@ -25,7 +25,9 @@
     "test:reference-video": "node test-reference-video.js",
     "test:analyze-reference-video-tool": "node test-analyze-reference-video-tool.js",
     "test:youtube-package": "node test-youtube-package.js",
-    "test:generate-youtube-package-tool": "node test-generate-youtube-package-tool.js"
+    "test:generate-youtube-package-tool": "node test-generate-youtube-package-tool.js",
+    "test:subtitles-generation": "node test-subtitles-generation.js",
+    "test:generate-subtitles-tool": "node test-generate-subtitles-tool.js"
   },
   "keywords": [],
   "author": "",

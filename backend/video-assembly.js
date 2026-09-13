@@ -152,6 +152,17 @@ async function fetchToFile(url, destPath) {
 // and it has a url; any other voiceover state (pending/failed/missing)
 // produces a real, playable, video-only final file instead, exactly as
 // required — a missing voice-over is never treated as an assembly failure.
+// burnInSubtitlesContent: optional real .srt file text (backend/
+// subtitles-generation.js's own output — the caller in server.js is
+// responsible for only ever passing real, completed subtitle content,
+// never inventing any). When omitted/null, the output is byte-for-byte
+// identical to what this function has always produced — this parameter
+// only ever ADDS one more ffmpeg filter step, never changes any existing
+// behavior. When provided, it is written to a real .srt file and burned
+// into the video via ffmpeg's own `subtitles` filter, applied AFTER the
+// scale/pad/trim/concat steps below so captions are rendered onto the
+// final, already-composed frame — never mid-normalization, where per-clip
+// coordinates wouldn't line up with the concatenated timeline.
 //
 // Scene sync: the voice-over is one continuous track generated from the
 // whole script (backend/voiceover-generation.js) — there is no per-scene
@@ -175,7 +186,7 @@ async function fetchToFile(url, destPath) {
 // data: URI; see the module comment above for why storage is a separate
 // step (backend/video-storage.js) — or { status: 'failed', buffer: null,
 // error } on any real failure. Never fabricates a buffer.
-async function assembleFinalVideo({ clips, voiceover }) {
+async function assembleFinalVideo({ clips, voiceover, burnInSubtitlesContent }) {
   if (!Array.isArray(clips) || clips.length === 0) {
     return { buffer: null, status: 'failed', error: 'No scene video clips were provided to assemble.' };
   }
@@ -242,8 +253,27 @@ async function assembleFinalVideo({ clips, voiceover }) {
         .join(';');
     }
 
+    // Burning in subtitles is an ADDITIONAL filter stage applied to the
+    // concat output, never a change to the normalize/concat stages above —
+    // when burnInSubtitlesContent is omitted, concatOutputLabel stays
+    // 'outv' and subtitlesStage stays '', making filterComplex byte-for-
+    // byte identical to the pre-existing behavior. The .srt file is written
+    // into this same call's own workDir (removed with it afterward), and
+    // ffmpeg's subtitles filter is applied after concatenation so captions
+    // are burned onto the final, already-composed frame/timeline — never
+    // per-clip, before concat has established the real final timing.
+    let concatOutputLabel = 'outv';
+    let srtPath = null;
+    if (burnInSubtitlesContent) {
+      srtPath = path.join(workDir, 'captions.srt');
+      fs.writeFileSync(srtPath, burnInSubtitlesContent, 'utf8');
+      concatOutputLabel = 'concatv';
+    }
+
     const concatRefs = clipPaths.map((_, i) => `[v${i}]`).join('');
-    const filterComplex = `${normalizeFilters};${concatRefs}concat=n=${clipPaths.length}:v=1:a=0[outv]`;
+    const subtitlesStage = srtPath ? `;[${concatOutputLabel}]subtitles=${srtPath}[outv]` : '';
+    const filterComplex =
+      `${normalizeFilters};${concatRefs}concat=n=${clipPaths.length}:v=1:a=0[${concatOutputLabel}]` + subtitlesStage;
 
     await runFfmpeg([
       '-y',

@@ -12,6 +12,7 @@ const videoAssembly = require('./video-assembly');
 const videoStorage = require('./video-storage');
 const referenceVideo = require('./reference-video');
 const youtubePackage = require('./youtube-package');
+const subtitlesGeneration = require('./subtitles-generation');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -132,6 +133,18 @@ function findFinalVideoBlocker(job) {
     );
   }
 
+  // burnInSubtitles is an explicit request for captions to actually be
+  // baked into the video — assembling without them in that case would
+  // silently produce a final video that doesn't match what was asked for.
+  // Never invents captions to satisfy this; the real .srt must already
+  // exist (via generateSubtitles) first.
+  if (job.burnInSubtitles && (!job.subtitles || job.subtitles.status !== 'completed' || !job.subtitles.content)) {
+    return (
+      'burnInSubtitles is enabled but no real subtitles have been generated yet. Use generateSubtitles ' +
+      'first (it requires a completed voice-over), or turn burnInSubtitles off with updateVideoJob.'
+    );
+  }
+
   return null;
 }
 
@@ -153,7 +166,16 @@ function findFinalVideoBlocker(job) {
 // submission) — see its own comment in video-generation.js — and any
 // healed/recovered clip is persisted back onto the job immediately, so this
 // self-heals at most once per clip.
-async function assembleAndStoreFinalVideo(job, jobId) {
+//
+// desiredSubtitlesContent is the exact .srt text (or null) THIS assembly
+// should end up reflecting, computed by the caller from the job's current
+// burnInSubtitles setting and subtitles.content — see the skip-check
+// below, which compares this against the existing finalVideo.subtitlesUsed
+// so a stale caption-less (or stale-captioned) video is never silently
+// served just because assembling again is normally skipped. Assembly calls
+// no paid API, so redoing it whenever burnInSubtitles/subtitles has
+// actually changed costs nothing.
+async function assembleAndStoreFinalVideo(job, jobId, desiredSubtitlesContent) {
   const originalClips = job.videoGeneration.clips;
   const healedClips = [];
   for (let i = 0; i < originalClips.length; i++) {
@@ -169,6 +191,7 @@ async function assembleAndStoreFinalVideo(job, jobId) {
     return {
       url: null,
       status: 'failed',
+      subtitlesUsed: null,
       error:
         `Scene ${brokenIndex + 1}'s video clip could not be verified or recovered before assembly ` +
         `(${healedClips[brokenIndex].error || 'unknown error'}) — regenerate it with generateSceneVideo.`,
@@ -178,15 +201,21 @@ async function assembleAndStoreFinalVideo(job, jobId) {
   const assembly = await videoAssembly.assembleFinalVideo({
     clips: healedClips,
     voiceover: job.voiceover,
+    burnInSubtitlesContent: desiredSubtitlesContent,
   });
 
   if (assembly.status !== 'completed') {
-    return { url: null, status: 'failed', error: assembly.error || 'Final video assembly failed.' };
+    return {
+      url: null,
+      status: 'failed',
+      subtitlesUsed: null,
+      error: assembly.error || 'Final video assembly failed.',
+    };
   }
 
   try {
     const url = await videoStorage.storeFinalVideo(assembly.buffer, jobId);
-    return { url, status: 'completed', error: null };
+    return { url, status: 'completed', subtitlesUsed: desiredSubtitlesContent, error: null };
   } catch (error) {
     console.error(
       'Final video storage error:',
@@ -195,9 +224,24 @@ async function assembleAndStoreFinalVideo(job, jobId) {
     return {
       url: null,
       status: 'failed',
+      subtitlesUsed: null,
       error: `The final video was assembled but could not be stored: ${error.message}`,
     };
   }
+}
+
+// Whether an existing job.finalVideo is still accurate and can be served
+// as-is (never re-run ffmpeg unnecessarily), vs. must be reassembled
+// because burnInSubtitles or subtitles.content has changed since it was
+// built — see assembleAndStoreFinalVideo's own comment on subtitlesUsed.
+// Shared by the assembleFinalVideo Agent tool and its REST route.
+function isFinalVideoStillAccurate(job) {
+  if (!job.finalVideo || job.finalVideo.status !== 'completed' || !job.finalVideo.url) {
+    return false;
+  }
+  const desiredSubtitlesContent =
+    job.burnInSubtitles && job.subtitles && job.subtitles.status === 'completed' ? job.subtitles.content : null;
+  return (job.finalVideo.subtitlesUsed || null) === desiredSubtitlesContent;
 }
 
 // job.script must be a real, complete script and voiceStyle must not be
@@ -331,6 +375,78 @@ async function runGenerateYoutubePackage(job, jobId, { forceRegenerate } = {}) {
   return jobStore.updateJob(jobId, { youtubePackage: youtubePackageField });
 }
 
+// A real, completed voice-over is the ONLY honest source of subtitle
+// timing (see backend/subtitles-generation.js's own comment) — checked
+// once here so the generateSubtitles Agent tool and its REST route
+// (POST /api/jobs/:id/generate-subtitles) can never diverge. Deliberately
+// refuses rather than silently triggering voice-over generation itself:
+// that is its own real, paid, consent-gated action (see
+// findVoiceoverBlocker/generateVoiceover) that only happens when the user
+// explicitly asks for it, never as a side effect of asking for subtitles.
+function findSubtitlesBlocker(job) {
+  if (job.voiceStyle === 'none') {
+    return 'this job is set to no voice-over (text only) — there is no narration audio to caption';
+  }
+
+  if (!job.voiceover || job.voiceover.status !== 'completed' || !job.voiceover.url) {
+    return (
+      'there is no completed voice-over yet to transcribe. Subtitles are generated from the real, ' +
+      'already-generated narration audio, never guessed from the script — call generateVoiceover first.'
+    );
+  }
+
+  return null;
+}
+
+// Runs the real transcription call and persists the result. Shared by the
+// generateSubtitles Agent tool and its REST route so the two never drift
+// (mirrors runGenerateYoutubePackage's role for its own pipeline).
+//
+// Skip-guard note: this compares against the EXACT voiceover.url the
+// subtitles were last transcribed from, not just "a voice-over exists" —
+// the same real audio bytes always transcribe to the same correct
+// captions, so skipping a re-transcription of byte-identical audio never
+// trades away accuracy. Any actual change to the voice-over (a new
+// generateVoiceover call always produces a new url — see its own
+// finalVideo-reset comment) is a different, real url, so it always
+// forces a fresh, real transcription rather than reusing stale captions.
+// A failed transcription is never cached (generatedFromVoiceoverUrl is
+// left null on failure), so it always retries.
+async function runGenerateSubtitles(job, jobId, { forceRegenerate } = {}) {
+  const currentVoiceoverUrl = job.voiceover.url;
+  const existingSubtitles = job.subtitles;
+
+  if (
+    !forceRegenerate &&
+    existingSubtitles &&
+    existingSubtitles.status === 'completed' &&
+    existingSubtitles.generatedFromVoiceoverUrl === currentVoiceoverUrl
+  ) {
+    return job;
+  }
+
+  const result = await subtitlesGeneration.generateSubtitles({ voiceoverUrl: currentVoiceoverUrl });
+
+  const subtitlesField =
+    result.status === 'completed'
+      ? {
+          status: 'completed',
+          format: result.format,
+          content: result.content,
+          error: null,
+          generatedFromVoiceoverUrl: currentVoiceoverUrl,
+        }
+      : {
+          status: 'failed',
+          format: 'srt',
+          content: null,
+          error: result.error || 'Subtitle generation failed.',
+          generatedFromVoiceoverUrl: null,
+        };
+
+  return jobStore.updateJob(jobId, { subtitles: subtitlesField });
+}
+
 const client = new Anthropic();
 
 const VIDEO_OPTIONS = fs.readFileSync(
@@ -375,11 +491,11 @@ const UPDATABLE_JOB_FIELDS = [
   'voiceStyle',
   'referenceVideoUrl',
   'referenceVideoNotes',
-  'subtitles',
   'music',
   'thumbnail',
   'description',
   'generateYoutubePackage',
+  'burnInSubtitles',
 ];
 
 // job.images[].url and job.voiceover.url each hold a full base64-encoded
@@ -431,8 +547,12 @@ function summarizeJobForAgent(job) {
   }
 
   if (job.finalVideo && typeof job.finalVideo === 'object') {
-    const { status, error } = job.finalVideo;
-    summarized.finalVideo = { status, ...(error ? { error } : {}) };
+    const { status, error, subtitlesUsed } = job.finalVideo;
+    summarized.finalVideo = {
+      status,
+      ...(error ? { error } : {}),
+      hasBurnedInSubtitles: Boolean(subtitlesUsed),
+    };
   }
 
   if (job.referenceVideoAnalysis && typeof job.referenceVideoAnalysis === 'object') {
@@ -466,6 +586,22 @@ function summarizeJobForAgent(job) {
       ...(thumbnailText ? { thumbnailText } : {}),
       ...(error ? { error } : {}),
       hasThumbnailImage: Boolean(thumbnailUrl),
+    };
+  }
+
+  if (job.subtitles && typeof job.subtitles === 'object') {
+    // content is the full .srt file text — could be a few KB for a longer
+    // video, same "the agent needs pass/fail state, not the raw bytes"
+    // reasoning as every other generated-media field above.
+    // generatedFromVoiceoverUrl is internal bookkeeping (mirrors
+    // youtubePackage's generatedFromScript) used only to decide whether a
+    // fresh transcription is needed.
+    const { status, format, content, error } = job.subtitles;
+    summarized.subtitles = {
+      status,
+      ...(format ? { format } : {}),
+      ...(error ? { error } : {}),
+      hasSubtitles: Boolean(content),
     };
   }
 
@@ -519,7 +655,6 @@ const TOOLS = [
         // both are set the way the user wants.
         referenceVideoUrl: { type: 'string' },
         referenceVideoNotes: { type: 'string' },
-        subtitles: { type: 'string' },
         music: { type: 'string' },
         thumbnail: { type: 'string' },
         description: { type: 'string' },
@@ -529,6 +664,12 @@ const TOOLS = [
         // before calling generateYoutubePackage in response to a direct
         // chat request, so the choice is recorded on the job.
         generateYoutubePackage: { type: 'boolean' },
+        // Optional "burn captions into the final MP4" toggle — see
+        // generateSubtitles/assembleFinalVideo below. Default false; the
+        // real .srt subtitles file is still generated and available either
+        // way. Set this true when the user asks for burned-in/hardcoded
+        // captions rather than a separate downloadable caption file.
+        burnInSubtitles: { type: 'boolean' },
       },
       additionalProperties: false,
     },
@@ -693,12 +834,17 @@ const TOOLS = [
       'be completed; if any scene is missing or not yet completed, this refuses with a clear reason — ' +
       'generate the missing scene(s) with generateSceneVideo and try again, never ask the user to fix ' +
       'it manually. If there is no voice-over yet, the final video is produced silently (video only), ' +
-      'which is expected, not a failure. Calling this again after it already succeeded is a safe no-op ' +
-      'that returns the existing final video unchanged. Only tell the user the final video is ready if ' +
-      'this reports it as completed — subtitles and background music are still not implemented (never ' +
-      'claim either happened). A title/description/tags/thumbnail package can be generated separately ' +
-      '(see generateYoutubePackage below), but actually publishing/uploading the video to YouTube ' +
-      'itself is still not implemented — never claim a video was published or uploaded.',
+      'which is expected, not a failure. If burnInSubtitles is on, this ALSO requires real subtitles to ' +
+      'already exist (call generateSubtitles first) and burns them into the video — it refuses rather ' +
+      'than producing a caption-less video that silently doesn\'t match that setting. Calling this again ' +
+      'is a safe no-op that returns the existing final video unchanged ONLY while it still matches the ' +
+      'current burnInSubtitles/subtitles state — turning burnInSubtitles on/off, or regenerating ' +
+      'subtitles, after a final video already exists makes the next call here re-assemble for real (still ' +
+      'no paid API call) to keep it in sync. Only tell the user the final video is ready if this reports ' +
+      'it as completed — background music is still not implemented (never claim it happened). A ' +
+      'title/description/tags/thumbnail package can be generated separately (see generateYoutubePackage ' +
+      'below), but actually publishing/uploading the video to YouTube itself is still not implemented — ' +
+      'never claim a video was published or uploaded.',
     input_schema: {
       type: 'object',
       properties: {},
@@ -729,6 +875,34 @@ const TOOLS = [
       'artwork, or composition. Only tell the user the package was generated if this reports it as ' +
       'completed — report a failure honestly instead of assuming success, and note if only the ' +
       'thumbnail image failed while the rest succeeded.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        forceRegenerate: { type: 'boolean' },
+      },
+      additionalProperties: false,
+    },
+  },
+  {
+    name: 'generateSubtitles',
+    description:
+      'Generate a real, accurate .srt subtitle file for the current job by transcribing its ALREADY-' +
+      'GENERATED voice-over audio — never guessed or estimated from the script\'s text or length. ' +
+      'Requires a real, completed voice-over to already exist; refuses with a clear reason if there is ' +
+      'none yet (call generateVoiceover first — never call generateVoiceover yourself just to satisfy ' +
+      'this, only when the user has actually asked for a voice-over) or if the job is set to no voice-' +
+      'over at all. This costs a real OpenAI transcription call — it reuses the exact same OPENAI_API_KEY ' +
+      'already used for the voice-over/images, not a new paid service, but it is billed separately from ' +
+      'those. Calling this again with the exact same, unchanged voice-over audio is a free no-op that ' +
+      'returns the existing subtitles unchanged (the same audio always transcribes the same way, so this ' +
+      'never loses accuracy) — a real, fresh voice-over (a different url) always triggers a real, fresh ' +
+      'transcription automatically, and generateVoiceover succeeding also resets any existing subtitles ' +
+      'so stale captions from the previous narration are never kept around. Pass forceRegenerate: true ' +
+      'only if the user explicitly wants a transcription redone despite nothing having changed. The .srt ' +
+      'file itself is always the deliverable; separately, updateVideoJob\'s burnInSubtitles setting ' +
+      'controls whether assembleFinalVideo also hardcodes these exact captions into the final MP4\'s own ' +
+      'video — the .srt stays the single source of truth either way. Only tell the user subtitles were ' +
+      'generated if this reports it as completed — report a failure honestly instead of assuming success.',
     input_schema: {
       type: 'object',
       properties: {
@@ -1054,7 +1228,12 @@ async function executeTool(name, jobId, input) {
         // before, and no longer reflects this new one. Resetting finalVideo
         // here means assembleFinalVideo's own "already completed, skip"
         // check never keeps serving a stale, out-of-sync video afterward.
-        updates.finalVideo = { url: null, status: 'pending' };
+        updates.finalVideo = { url: null, status: 'pending', subtitlesUsed: null };
+        // Existing subtitles were transcribed from the PREVIOUS narration
+        // audio and no longer match this new one — resetting them here
+        // means generateSubtitles never serves stale captions, and
+        // findSubtitlesBlocker correctly requires a fresh transcription.
+        updates.subtitles = { status: 'pending', format: 'srt', content: null, error: null, generatedFromVoiceoverUrl: null };
       }
 
       const updatedJob = await jobStore.updateJob(jobId, updates);
@@ -1077,12 +1256,15 @@ async function executeTool(name, jobId, input) {
       return JSON.stringify({ error: 'job not found' });
     }
 
-    // Already assembled — return the existing result unchanged rather than
-    // re-running ffmpeg on every call. Not a paid-cost concern like the
-    // image/video providers, but still real, non-trivial local compute, and
-    // re-assembling would otherwise silently replace a job's real final
-    // video with a fresh one whenever the Agent is asked about it again.
-    if (job.finalVideo && job.finalVideo.status === 'completed' && job.finalVideo.url) {
+    // Already assembled AND still accurate (reflects the job's current
+    // burnInSubtitles/subtitles state) — return the existing result
+    // unchanged rather than re-running ffmpeg. Not a paid-cost concern like
+    // the image/video providers, but still real, non-trivial local compute,
+    // and re-assembling would otherwise silently replace a job's real final
+    // video with a fresh one whenever the Agent is asked about it again. A
+    // STALE result (subtitles turned on/off or regenerated since) is never
+    // served — see isFinalVideoStillAccurate.
+    if (isFinalVideoStillAccurate(job)) {
       return JSON.stringify(summarizeJobForAgent(job));
     }
 
@@ -1097,7 +1279,9 @@ async function executeTool(name, jobId, input) {
       // video-storage.js) — no second assembly system. Calls no paid API:
       // every clip and the voice-over were already generated (and, for the
       // clips, already paid for) earlier.
-      const finalVideo = await assembleAndStoreFinalVideo(job, jobId);
+      const desiredSubtitlesContent =
+        job.burnInSubtitles && job.subtitles && job.subtitles.status === 'completed' ? job.subtitles.content : null;
+      const finalVideo = await assembleAndStoreFinalVideo(job, jobId, desiredSubtitlesContent);
       const updatedJob = await jobStore.updateJob(jobId, { finalVideo });
       return JSON.stringify(updatedJob ? summarizeJobForAgent(updatedJob) : { error: 'job not found' });
     } catch (error) {
@@ -1142,6 +1326,41 @@ async function executeTool(name, jobId, input) {
       );
       return JSON.stringify({
         error: 'YouTube package generation failed unexpectedly. Tell the user to try again in a moment.',
+      });
+    }
+  }
+
+  if (name === 'generateSubtitles') {
+    const job = await jobStore.getJob(jobId);
+
+    if (!job) {
+      return JSON.stringify({ error: 'job not found' });
+    }
+
+    const blocker = findSubtitlesBlocker(job);
+    if (blocker) {
+      return JSON.stringify({ error: blocker });
+    }
+
+    if (!process.env.OPENAI_API_KEY) {
+      return JSON.stringify({
+        error:
+          'Subtitle generation is not configured on the server right now. Tell the user this is ' +
+          'temporarily unavailable — do not say subtitles were generated.',
+      });
+    }
+
+    try {
+      const forceRegenerate = Boolean(input && input.forceRegenerate);
+      const updatedJob = await runGenerateSubtitles(job, jobId, { forceRegenerate });
+      return JSON.stringify(updatedJob ? summarizeJobForAgent(updatedJob) : { error: 'job not found' });
+    } catch (error) {
+      console.error(
+        'Unexpected error generating subtitles (agent tool):',
+        JSON.stringify({ name: error?.name, message: error?.message }, null, 2)
+      );
+      return JSON.stringify({
+        error: 'Subtitle generation failed unexpectedly. Tell the user to try again in a moment.',
       });
     }
   }
@@ -1376,8 +1595,10 @@ app.post('/api/jobs/:id/generate-voiceover', async (req, res) => {
     const updates = { voiceover };
     if (voiceover.status === 'completed') {
       // See the generateVoiceover Agent tool's identical comment: a fresh
-      // voice-over invalidates any already-assembled final video.
-      updates.finalVideo = { url: null, status: 'pending' };
+      // voice-over invalidates any already-assembled final video and any
+      // existing subtitles (transcribed from the previous narration audio).
+      updates.finalVideo = { url: null, status: 'pending', subtitlesUsed: null };
+      updates.subtitles = { status: 'pending', format: 'srt', content: null, error: null, generatedFromVoiceoverUrl: null };
     }
 
     const updatedJob = await jobStore.updateJob(job.id, updates);
@@ -1417,6 +1638,35 @@ app.post('/api/jobs/:id/generate-youtube-package', async (req, res) => {
       JSON.stringify({ name: error?.name, message: error?.message }, null, 2)
     );
     res.status(502).json({ error: 'YouTube package generation failed unexpectedly.' });
+  }
+});
+
+app.post('/api/jobs/:id/generate-subtitles', async (req, res) => {
+  const job = await jobStore.getJob(req.params.id);
+
+  if (!job) {
+    return res.status(404).json({ error: 'job not found' });
+  }
+
+  const blocker = findSubtitlesBlocker(job);
+  if (blocker) {
+    return res.status(400).json({ error: blocker });
+  }
+
+  if (!process.env.OPENAI_API_KEY) {
+    return res.status(500).json({ error: 'OPENAI_API_KEY is not configured' });
+  }
+
+  try {
+    const forceRegenerate = Boolean(req.body && req.body.forceRegenerate);
+    const updatedJob = await runGenerateSubtitles(job, job.id, { forceRegenerate });
+    res.json(updatedJob);
+  } catch (error) {
+    console.error(
+      'Unexpected error generating subtitles:',
+      JSON.stringify({ name: error?.name, message: error?.message }, null, 2)
+    );
+    res.status(502).json({ error: 'Subtitle generation failed unexpectedly.' });
   }
 });
 
@@ -1527,10 +1777,11 @@ app.post('/api/jobs/:id/assemble-video', async (req, res) => {
     return res.status(404).json({ error: 'job not found' });
   }
 
-  // Already assembled — return the existing result unchanged rather than
-  // re-running ffmpeg on every call (mirrors the assembleFinalVideo Agent
-  // tool's own idempotency check; see its comment there).
-  if (job.finalVideo && job.finalVideo.status === 'completed' && job.finalVideo.url) {
+  // Already assembled AND still accurate — return the existing result
+  // unchanged rather than re-running ffmpeg on every call (mirrors the
+  // assembleFinalVideo Agent tool's own idempotency check; see its comment
+  // there and isFinalVideoStillAccurate's own comment).
+  if (isFinalVideoStillAccurate(job)) {
     return res.json(job);
   }
 
@@ -1540,7 +1791,9 @@ app.post('/api/jobs/:id/assemble-video', async (req, res) => {
   }
 
   try {
-    const finalVideo = await assembleAndStoreFinalVideo(job, job.id);
+    const desiredSubtitlesContent =
+      job.burnInSubtitles && job.subtitles && job.subtitles.status === 'completed' ? job.subtitles.content : null;
+    const finalVideo = await assembleAndStoreFinalVideo(job, job.id, desiredSubtitlesContent);
     const updatedJob = await jobStore.updateJob(job.id, { finalVideo });
     res.json(updatedJob);
   } catch (error) {

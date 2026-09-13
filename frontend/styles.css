@@ -269,6 +269,12 @@ a {
   width: auto;
 }
 
+.checkbox-field-small {
+  font-weight: 400;
+  font-size: 0.9rem;
+  margin: 12px 0 4px;
+}
+
 .form-field-action {
   align-items: flex-start;
 }
@@ -482,6 +488,19 @@ a {
   margin: 0 0 8px;
 }
 
+.subtitles-textarea {
+  width: 100%;
+  font-family: inherit;
+  font-size: 0.85rem;
+  padding: 10px 12px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius);
+  background: var(--color-surface);
+  color: var(--color-text);
+  resize: vertical;
+  margin-bottom: 12px;
+}
+
 /* .review-placeholder sets its own `display`, which otherwise overrides the
    native [hidden] behavior — without this, toggling .hidden in JS wouldn't
    actually hide this specific placeholder once it has that class. */
@@ -489,7 +508,8 @@ a {
 #final-video-placeholder[hidden],
 #youtube-thumbnail-placeholder[hidden],
 #youtube-titles-placeholder[hidden],
-#youtube-description-placeholder[hidden] {
+#youtube-description-placeholder[hidden],
+#subtitles-placeholder[hidden] {
   display: none;
 }
 

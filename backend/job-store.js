@@ -101,6 +101,7 @@ const JOB_FIELDS = [
   'confirmed',
   'generateYoutubePackage',
   'youtubePackage',
+  'burnInSubtitles',
 ];
 
 // Local (no-Redis) fallback only, from here down to saveJobs — the whole
@@ -268,7 +269,14 @@ function createDefaultJob(id) {
     // job record small regardless of video size (see video-storage.js's own
     // comment). Not writable by the conversational agent, same as
     // images/voiceover — nothing may ever fabricate a value here.
-    finalVideo: { url: null, status: 'pending' },
+    // subtitlesUsed records the exact subtitles.content string (or null)
+    // that was actually burned into THIS assembled video, so
+    // assembleAndStoreFinalVideo (server.js) can tell whether an existing
+    // finalVideo is still accurate — e.g. still reflects the job's current
+    // burnInSubtitles setting and current subtitles content — or is stale
+    // and must be reassembled. Reassembly itself calls no paid API, so
+    // there is no cost reason to ever serve a stale result here.
+    finalVideo: { url: null, status: 'pending', subtitlesUsed: null },
     // Optional "Reference Video / Inspiration Mode" input: a YouTube URL the
     // user wants used only as high-level storytelling inspiration (pacing,
     // tone, structure — never its transcript, dialogue, character names, or
@@ -296,7 +304,35 @@ function createDefaultJob(id) {
     // conversational agent — only the real analysis call populates this,
     // same as images/voiceover.
     referenceVideoAnalysis: { status: 'pending', summary: null, error: null, analyzedUrl: null, analyzedNotes: null },
-    subtitles: '',
+    // Optional, real subtitles generated from the job's OWN, already-
+    // generated voice-over audio (see backend/subtitles-generation.js) —
+    // NEVER guessed/estimated from the script's text. { status, format,
+    // content, error, generatedFromVoiceoverUrl }, where status is
+    // 'pending' | 'completed' | 'failed' and format is always 'srt' for
+    // now. content is the real .srt file text, only ever set once OpenAI's
+    // transcription of the real audio actually succeeded.
+    // generatedFromVoiceoverUrl records exactly which job.voiceover.url
+    // this was transcribed from, so server.js's generateSubtitles handler
+    // can skip a redundant real transcription call when asked again for
+    // the exact same, unchanged audio (the same audio always transcribes
+    // to the same correct captions, so this never trades away accuracy —
+    // see runGenerateSubtitles's comment in server.js). Not writable by the
+    // conversational agent — only the real transcription call populates
+    // this, same as voiceover/youtubePackage.
+    subtitles: { status: 'pending', format: 'srt', content: null, error: null, generatedFromVoiceoverUrl: null },
+    // Optional "burn captions into the final MP4" setting — default OFF.
+    // With this false, generateSubtitles/the .srt file still work exactly
+    // the same (a real, downloadable/copyable caption file the user can
+    // upload to YouTube alongside the video), but assembleFinalVideo never
+    // re-encodes captions into the video's own pixels. When true,
+    // assembleFinalVideo requires a real, completed subtitles.content to
+    // exist first (never invents captions to satisfy this) and burns that
+    // exact .srt content into the assembled video via ffmpeg — the .srt
+    // file itself stays the single source of truth, so the downloadable
+    // file and the burned-in captions can never drift out of sync with
+    // each other. Writable by the conversational agent like
+    // generateYoutubePackage — it's a preference, not a generation result.
+    burnInSubtitles: false,
     music: '',
     thumbnail: '',
     description: '',

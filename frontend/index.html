@@ -242,6 +242,27 @@
           </article>
 
           <article class="review-card">
+            <h3>Subtitles</h3>
+            <div id="subtitles-placeholder" class="review-placeholder text-placeholder">
+              <p>Real subtitles, generated from your voice-over audio, will appear here once the voice-over is ready.</p>
+            </div>
+            <div id="subtitles-panel" hidden>
+              <textarea id="subtitles-textarea" class="subtitles-textarea" rows="6" readonly></textarea>
+              <a id="subtitles-download" class="btn btn-primary" download="subtitles.srt" hidden>Download .srt</a>
+              <button type="button" id="generate-subtitles-btn" class="btn btn-primary btn-generate">Generate Subtitles</button>
+              <label class="checkbox-field checkbox-field-small">
+                <input type="checkbox" id="burn-in-subtitles-toggle">
+                Burn subtitles into the final video (optional)
+              </label>
+              <p class="field-hint">
+                The .srt file above is the source of truth either way. If you enable this after a final video already
+                exists, ask the agent to assemble the final video again to bake the captions in.
+              </p>
+              <p id="subtitles-status" class="generate-status" hidden aria-live="polite"></p>
+            </div>
+          </article>
+
+          <article class="review-card">
             <h3>YouTube Title</h3>
             <div id="youtube-titles-placeholder" class="review-placeholder text-placeholder">
               <p>Your generated video title will appear here.</p>

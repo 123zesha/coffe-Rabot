@@ -38,6 +38,14 @@
   const generateVoiceoverBtn = document.getElementById('generate-voiceover-btn');
   const voiceoverStatus = document.getElementById('voiceover-status');
 
+  const subtitlesPlaceholder = document.getElementById('subtitles-placeholder');
+  const subtitlesPanel = document.getElementById('subtitles-panel');
+  const subtitlesTextarea = document.getElementById('subtitles-textarea');
+  const subtitlesDownload = document.getElementById('subtitles-download');
+  const generateSubtitlesBtn = document.getElementById('generate-subtitles-btn');
+  const burnInSubtitlesToggle = document.getElementById('burn-in-subtitles-toggle');
+  const subtitlesStatus = document.getElementById('subtitles-status');
+
   const sceneClipsEmpty = document.getElementById('scene-clips-empty');
   const sceneClipsList = document.getElementById('scene-clips-list');
 
@@ -162,6 +170,7 @@
       refreshSceneClipsCard();
       refreshFinalVideoCard();
       refreshYoutubePackageCard();
+      refreshSubtitlesCard();
     }
   });
 
@@ -229,6 +238,7 @@
       refreshSceneClipsCard();
       refreshFinalVideoCard();
       refreshYoutubePackageCard();
+      refreshSubtitlesCard();
     }
   });
 
@@ -603,6 +613,130 @@
     }
   });
 
+  // --- Subtitles (Final Review) ---
+  // Real subtitles transcribed from the job's own voice-over audio (never
+  // guessed from the script) — see backend/subtitles-generation.js. Mirrors
+  // the voice-over/YouTube-package cards' generate/status pattern. The
+  // burn-in checkbox is a direct PATCH of the job's burnInSubtitles field
+  // (the existing generic PATCH /api/jobs/:id route already accepts it —
+  // job-store.js's JOB_FIELDS whitelist), not a chat message: it's a plain
+  // preference toggle with no generation attached, so there's no need to
+  // route it through the Agent the way the Create Video form's checkboxes
+  // (read only at video-creation time) do.
+  let subtitlesGenerating = false;
+
+  function setSubtitlesStatus(text, type) {
+    subtitlesStatus.textContent = text;
+    subtitlesStatus.className = 'generate-status' + (type ? ' ' + type : '');
+    subtitlesStatus.hidden = false;
+  }
+
+  function clearSubtitlesStatus() {
+    subtitlesStatus.hidden = true;
+    subtitlesStatus.textContent = '';
+  }
+
+  function renderSubtitlesCard(job) {
+    const hasCompletedVoiceover = Boolean(job && job.voiceover && job.voiceover.status === 'completed' && job.voiceover.url);
+    const subtitles = job && job.subtitles && typeof job.subtitles === 'object' ? job.subtitles : null;
+
+    if (!hasCompletedVoiceover) {
+      subtitlesPlaceholder.hidden = false;
+      subtitlesPanel.hidden = true;
+      return;
+    }
+
+    subtitlesPlaceholder.hidden = true;
+    subtitlesPanel.hidden = false;
+
+    generateSubtitlesBtn.disabled = subtitlesGenerating;
+    generateSubtitlesBtn.textContent = subtitlesGenerating
+      ? 'Generating…'
+      : subtitles && subtitles.status === 'completed'
+      ? 'Regenerate Subtitles'
+      : 'Generate Subtitles';
+
+    burnInSubtitlesToggle.checked = Boolean(job.burnInSubtitles);
+
+    if (subtitles && subtitles.status === 'completed' && subtitles.content) {
+      subtitlesTextarea.value = subtitles.content;
+      subtitlesTextarea.hidden = false;
+      subtitlesDownload.href = 'data:text/plain;charset=utf-8,' + encodeURIComponent(subtitles.content);
+      subtitlesDownload.hidden = false;
+    } else {
+      subtitlesTextarea.value = '';
+      subtitlesTextarea.hidden = true;
+      subtitlesDownload.hidden = true;
+      subtitlesDownload.removeAttribute('href');
+    }
+
+    if (subtitles && subtitles.status === 'failed' && subtitles.error) {
+      setSubtitlesStatus(subtitles.error, 'error');
+    }
+  }
+
+  async function refreshSubtitlesCard() {
+    renderSubtitlesCard(await fetchCurrentJob());
+  }
+
+  generateSubtitlesBtn.addEventListener('click', async () => {
+    if (subtitlesGenerating || !jobId) {
+      return;
+    }
+
+    const currentJob = await fetchCurrentJob();
+    // Clicking again once subtitles already exist is an explicit request to
+    // redo them — force past the skip-if-unchanged guard, same reasoning as
+    // the YouTube package button.
+    const alreadyCompleted = Boolean(
+      currentJob && currentJob.subtitles && currentJob.subtitles.status === 'completed'
+    );
+
+    subtitlesGenerating = true;
+    clearSubtitlesStatus();
+    renderSubtitlesCard(currentJob);
+
+    try {
+      const res = await fetch(`/api/jobs/${jobId}/generate-subtitles`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ forceRegenerate: alreadyCompleted }),
+      });
+      const data = await res.json();
+
+      if (!res.ok) {
+        setSubtitlesStatus(data.error || 'Could not generate subtitles.', 'error');
+      } else if (data.subtitles && data.subtitles.status === 'completed') {
+        setSubtitlesStatus('Subtitles generated successfully.', 'success');
+      } else {
+        setSubtitlesStatus((data.subtitles && data.subtitles.error) || 'Could not generate subtitles.', 'error');
+      }
+    } catch (error) {
+      setSubtitlesStatus('Could not generate subtitles. Please try again.', 'error');
+    } finally {
+      subtitlesGenerating = false;
+      await refreshSubtitlesCard();
+    }
+  });
+
+  burnInSubtitlesToggle.addEventListener('change', async () => {
+    if (!jobId) {
+      return;
+    }
+    try {
+      await fetch(`/api/jobs/${jobId}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ burnInSubtitles: burnInSubtitlesToggle.checked }),
+      });
+    } catch (error) {
+      // Best-effort — if this fails the checkbox simply reverts on the next
+      // refresh, since it always renders from the real job state.
+    } finally {
+      await refreshSubtitlesCard();
+    }
+  });
+
   generateVoiceoverBtn.addEventListener('click', async () => {
     if (voiceoverGenerating || !jobId) {
       return;
@@ -628,6 +762,11 @@
     } finally {
       voiceoverGenerating = false;
       await refreshVoiceoverCard();
+      // A successful/failed voice-over regeneration can change whether
+      // subtitles can be generated at all, and any successful regeneration
+      // resets existing subtitles server-side — refresh this card too so
+      // that's reflected immediately.
+      await refreshSubtitlesCard();
     }
   });
 
@@ -636,4 +775,5 @@
   refreshSceneClipsCard();
   refreshFinalVideoCard();
   refreshYoutubePackageCard();
+  refreshSubtitlesCard();
 })();
