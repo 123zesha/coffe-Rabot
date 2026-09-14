@@ -180,7 +180,10 @@ function findFinalVideoBlocker(job) {
 // desiredMusicUsed is the exact music snapshot (see computeDesiredMusicUsed
 // below) THIS assembly should end up reflecting — same role as
 // desiredSubtitlesContent, compared against finalVideo.musicUsed.
-async function assembleAndStoreFinalVideo(job, jobId, desiredSubtitlesContent, desiredMusicUsed) {
+// desiredResolutionUsed is job.resolutionTier itself (see
+// isFinalVideoStillAccurate) — same role again, compared against
+// finalVideo.resolutionUsed.
+async function assembleAndStoreFinalVideo(job, jobId, desiredSubtitlesContent, desiredMusicUsed, desiredResolutionUsed) {
   const originalClips = job.videoGeneration.clips;
   const healedClips = [];
   for (let i = 0; i < originalClips.length; i++) {
@@ -198,6 +201,7 @@ async function assembleAndStoreFinalVideo(job, jobId, desiredSubtitlesContent, d
       status: 'failed',
       subtitlesUsed: null,
       musicUsed: null,
+      resolutionUsed: null,
       error:
         `Scene ${brokenIndex + 1}'s video clip could not be verified or recovered before assembly ` +
         `(${healedClips[brokenIndex].error || 'unknown error'}) — regenerate it with generateSceneVideo.`,
@@ -217,6 +221,7 @@ async function assembleAndStoreFinalVideo(job, jobId, desiredSubtitlesContent, d
       status: 'failed',
       subtitlesUsed: null,
       musicUsed: null,
+      resolutionUsed: null,
       error: error.message,
     };
   }
@@ -227,6 +232,7 @@ async function assembleAndStoreFinalVideo(job, jobId, desiredSubtitlesContent, d
     burnInSubtitlesContent: desiredSubtitlesContent,
     outputFormat: job.outputFormat,
     musicUrl,
+    resolutionTier: job.resolutionTier,
   });
 
   if (assembly.status !== 'completed') {
@@ -235,13 +241,21 @@ async function assembleAndStoreFinalVideo(job, jobId, desiredSubtitlesContent, d
       status: 'failed',
       subtitlesUsed: null,
       musicUsed: null,
+      resolutionUsed: null,
       error: assembly.error || 'Final video assembly failed.',
     };
   }
 
   try {
     const url = await videoStorage.storeFinalVideo(assembly.buffer, jobId);
-    return { url, status: 'completed', subtitlesUsed: desiredSubtitlesContent, musicUsed: desiredMusicUsed, error: null };
+    return {
+      url,
+      status: 'completed',
+      subtitlesUsed: desiredSubtitlesContent,
+      musicUsed: desiredMusicUsed,
+      resolutionUsed: desiredResolutionUsed,
+      error: null,
+    };
   } catch (error) {
     console.error(
       'Final video storage error:',
@@ -252,6 +266,7 @@ async function assembleAndStoreFinalVideo(job, jobId, desiredSubtitlesContent, d
       status: 'failed',
       subtitlesUsed: null,
       musicUsed: null,
+      resolutionUsed: null,
       error: `The final video was assembled but could not be stored: ${error.message}`,
     };
   }
@@ -270,12 +285,21 @@ function computeDesiredMusicUsed(job) {
   return { enabled: true, track: job.musicTrack || null, customUrl: job.musicCustomUrl || null };
 }
 
+// The resolutionTier THIS job's settings would produce if assembled right
+// now — job.resolutionTier itself (defaults to '720p'), a plain scalar so
+// no computation is needed, but named to match computeDesiredMusicUsed's
+// role for symmetry with finalVideo.resolutionUsed.
+function computeDesiredResolutionUsed(job) {
+  return job.resolutionTier || jobStore.DEFAULT_RESOLUTION_TIER;
+}
+
 // Whether an existing job.finalVideo is still accurate and can be served
 // as-is (never re-run ffmpeg unnecessarily), vs. must be reassembled
-// because burnInSubtitles, subtitles.content, or the music settings have
-// changed since it was built — see assembleAndStoreFinalVideo's own
-// comment on subtitlesUsed/musicUsed. Shared by the assembleFinalVideo
-// Agent tool and its REST route.
+// because burnInSubtitles, subtitles.content, the music settings, or the
+// resolution tier have changed since it was built — see
+// assembleAndStoreFinalVideo's own comment on subtitlesUsed/musicUsed/
+// resolutionUsed. Shared by the assembleFinalVideo Agent tool and its REST
+// route.
 function isFinalVideoStillAccurate(job) {
   if (!job.finalVideo || job.finalVideo.status !== 'completed' || !job.finalVideo.url) {
     return false;
@@ -286,7 +310,11 @@ function isFinalVideoStillAccurate(job) {
     return false;
   }
   const desiredMusicUsed = computeDesiredMusicUsed(job);
-  return JSON.stringify(job.finalVideo.musicUsed || null) === JSON.stringify(desiredMusicUsed);
+  if (JSON.stringify(job.finalVideo.musicUsed || null) !== JSON.stringify(desiredMusicUsed)) {
+    return false;
+  }
+  const desiredResolutionUsed = computeDesiredResolutionUsed(job);
+  return (job.finalVideo.resolutionUsed || jobStore.DEFAULT_RESOLUTION_TIER) === desiredResolutionUsed;
 }
 
 // job.script must be a real, complete script and voiceStyle must not be
@@ -550,6 +578,7 @@ const UPDATABLE_JOB_FIELDS = [
   'generateYoutubePackage',
   'burnInSubtitles',
   'outputFormat',
+  'resolutionTier',
 ];
 
 // job.images[].url and job.voiceover.url each hold a full base64-encoded
@@ -601,12 +630,13 @@ function summarizeJobForAgent(job) {
   }
 
   if (job.finalVideo && typeof job.finalVideo === 'object') {
-    const { status, error, subtitlesUsed, musicUsed } = job.finalVideo;
+    const { status, error, subtitlesUsed, musicUsed, resolutionUsed } = job.finalVideo;
     summarized.finalVideo = {
       status,
       ...(error ? { error } : {}),
       hasBurnedInSubtitles: Boolean(subtitlesUsed),
       hasMusic: Boolean(musicUsed),
+      ...(resolutionUsed ? { resolutionUsed } : {}),
     };
   }
 
@@ -748,6 +778,16 @@ const TOOLS = [
         // generateSceneVideo runs (a wrong-shaped asset is never reused
         // just to save a call).
         outputFormat: { type: 'string', enum: jobStore.OUTPUT_FORMATS },
+        // Which resolution tier the FINAL assembled MP4 is exported at —
+        // independent of outputFormat (orientation). Optional — defaults to
+        // '720p' if never set. This only changes the last ffmpeg pass's
+        // output canvas; scene image/video generation is untouched (no
+        // extra paid-API cost at any tier). '1080p'/'4k' are a real,
+        // honest upscale of that same generated footage — the exported
+        // FILE genuinely has those pixel dimensions, but not genuinely
+        // higher-detail source video. Never claim sharper source footage
+        // when a higher tier is selected — see prompts/system-prompt.md.
+        resolutionTier: { type: 'string', enum: jobStore.RESOLUTION_TIERS },
       },
       additionalProperties: false,
     },
@@ -923,18 +963,26 @@ const TOOLS = [
       'already exist (call generateSubtitles first) and burns them into the video — it refuses rather ' +
       'than producing a caption-less video that silently doesn\'t match that setting. Calling this again ' +
       'is a safe no-op that returns the existing final video unchanged ONLY while it still matches the ' +
-      'current burnInSubtitles/subtitles/music state — turning burnInSubtitles on/off, regenerating ' +
-      'subtitles, or changing the music settings, after a final video already exists makes the next call ' +
-      'here re-assemble for real (still no paid API call) to keep it in sync. If musicEnabled is on (see ' +
-      'updateVideoJob), this loops/trims a local music track (musicTrack from the user-populated local ' +
-      'library, or musicCustomUrl for a one-off track) to the video\'s length, fades it in/out, and mixes ' +
-      'it in quietly ducked under the voice-over (or at a fuller standalone level with no voice-over) — ' +
-      'this is entirely optional and off by default, uses only local ffmpeg processing (no paid API, no ' +
-      'downloaded/generated music), and refuses with a clear error rather than silently skipping music if ' +
-      'the selected track is missing or unreadable. Only tell the user the final video is ready if this ' +
-      'reports it as completed. A title/description/tags/thumbnail package can be generated separately ' +
-      '(see generateYoutubePackage below), but actually publishing/uploading the video to YouTube itself ' +
-      'is still not implemented — never claim a video was published or uploaded.',
+      'current burnInSubtitles/subtitles/music/resolutionTier state — turning burnInSubtitles on/off, ' +
+      'regenerating subtitles, changing the music settings, or changing resolutionTier, after a final ' +
+      'video already exists makes the next call here re-assemble for real (still no paid API call) to ' +
+      'keep it in sync. If musicEnabled is on (see updateVideoJob), this loops/trims a local music track ' +
+      '(musicTrack from the user-populated local library, or musicCustomUrl for a one-off track) to the ' +
+      'video\'s length, fades it in/out, and mixes it in quietly ducked under the voice-over (or at a ' +
+      'fuller standalone level with no voice-over) — this is entirely optional and off by default, uses ' +
+      'only local ffmpeg processing (no paid API, no downloaded/generated music), and refuses with a ' +
+      'clear error rather than silently skipping music if the selected track is missing or unreadable. ' +
+      'resolutionTier (see updateVideoJob) controls the exported file\'s real pixel dimensions — ' +
+      '\'720p\' (default, unchanged from before this setting existed), \'1080p\', or \'4k\', at whichever ' +
+      'aspect ratio outputFormat selects. This ONLY upscales the same already-generated scene footage in ' +
+      'this local ffmpeg pass — it never requests higher-resolution images/video from any provider, so ' +
+      'there is no extra paid-API cost at any tier. Tell the user plainly that \'1080p\'/\'4k\' are a real ' +
+      'upscale of the same source footage (the file\'s dimensions genuinely match the tier), NOT sharper ' +
+      'or more detailed source video — never imply 4k means the scenes themselves were captured/generated ' +
+      'at higher detail. Only tell the user the final video is ready if this reports it as completed. A ' +
+      'title/description/tags/thumbnail package can be generated separately (see generateYoutubePackage ' +
+      'below), but actually publishing/uploading the video to YouTube itself is still not implemented — ' +
+      'never claim a video was published or uploaded.',
     input_schema: {
       type: 'object',
       properties: {},
@@ -1320,7 +1368,7 @@ async function executeTool(name, jobId, input) {
         // before, and no longer reflects this new one. Resetting finalVideo
         // here means assembleFinalVideo's own "already completed, skip"
         // check never keeps serving a stale, out-of-sync video afterward.
-        updates.finalVideo = { url: null, status: 'pending', subtitlesUsed: null, musicUsed: null };
+        updates.finalVideo = { url: null, status: 'pending', subtitlesUsed: null, musicUsed: null, resolutionUsed: null };
         // Existing subtitles were transcribed from the PREVIOUS narration
         // audio and no longer match this new one — resetting them here
         // means generateSubtitles never serves stale captions, and
@@ -1374,7 +1422,14 @@ async function executeTool(name, jobId, input) {
       const desiredSubtitlesContent =
         job.burnInSubtitles && job.subtitles && job.subtitles.status === 'completed' ? job.subtitles.content : null;
       const desiredMusicUsed = computeDesiredMusicUsed(job);
-      const finalVideo = await assembleAndStoreFinalVideo(job, jobId, desiredSubtitlesContent, desiredMusicUsed);
+      const desiredResolutionUsed = computeDesiredResolutionUsed(job);
+      const finalVideo = await assembleAndStoreFinalVideo(
+        job,
+        jobId,
+        desiredSubtitlesContent,
+        desiredMusicUsed,
+        desiredResolutionUsed
+      );
       const updatedJob = await jobStore.updateJob(jobId, { finalVideo });
       return JSON.stringify(updatedJob ? summarizeJobForAgent(updatedJob) : { error: 'job not found' });
     } catch (error) {
@@ -1700,7 +1755,7 @@ app.post('/api/jobs/:id/generate-voiceover', async (req, res) => {
       // See the generateVoiceover Agent tool's identical comment: a fresh
       // voice-over invalidates any already-assembled final video and any
       // existing subtitles (transcribed from the previous narration audio).
-      updates.finalVideo = { url: null, status: 'pending', subtitlesUsed: null, musicUsed: null };
+      updates.finalVideo = { url: null, status: 'pending', subtitlesUsed: null, musicUsed: null, resolutionUsed: null };
       updates.subtitles = { status: 'pending', format: 'srt', content: null, error: null, generatedFromVoiceoverUrl: null };
     }
 
@@ -1898,7 +1953,14 @@ app.post('/api/jobs/:id/assemble-video', async (req, res) => {
     const desiredSubtitlesContent =
       job.burnInSubtitles && job.subtitles && job.subtitles.status === 'completed' ? job.subtitles.content : null;
     const desiredMusicUsed = computeDesiredMusicUsed(job);
-    const finalVideo = await assembleAndStoreFinalVideo(job, job.id, desiredSubtitlesContent, desiredMusicUsed);
+    const desiredResolutionUsed = computeDesiredResolutionUsed(job);
+    const finalVideo = await assembleAndStoreFinalVideo(
+      job,
+      job.id,
+      desiredSubtitlesContent,
+      desiredMusicUsed,
+      desiredResolutionUsed
+    );
     const updatedJob = await jobStore.updateJob(job.id, { finalVideo });
     res.json(updatedJob);
   } catch (error) {

@@ -22,7 +22,13 @@ const http = require('http');
 const assert = require('assert');
 const { execFileSync, spawnSync } = require('child_process');
 
-const { assembleFinalVideo, getMediaDuration, ffmpegPath, OUTPUT_DIMENSIONS_BY_FORMAT } = require('./video-assembly');
+const {
+  assembleFinalVideo,
+  getMediaDuration,
+  ffmpegPath,
+  OUTPUT_DIMENSIONS_BY_FORMAT,
+  OUTPUT_DIMENSIONS_BY_FORMAT_AND_TIER,
+} = require('./video-assembly');
 
 let failures = 0;
 
@@ -404,6 +410,64 @@ async function main() {
       assert.deepStrictEqual(probeResolution(tmpOut), { width: expectedWidth, height: expectedHeight });
     });
   }
+
+  // --- Resolution tiers (job.resolutionTier: 720p/1080p/4k) ---
+  // Every OTHER test in this file omits resolutionTier entirely and still
+  // passes unchanged at exactly today's 720p dimensions (via
+  // OUTPUT_DIMENSIONS_BY_FORMAT_AND_TIER's own '720p' column matching the
+  // pre-existing OUTPUT_DIMENSIONS_BY_FORMAT values) — that IS the
+  // regression proof for the default tier. These tests cover the new
+  // 1080p/4k tiers themselves: real, decoded pixel dimensions at every
+  // supported aspect ratio, verified by ffmpeg's own decode, never merely
+  // requested.
+  for (const [outputFormat, tiers] of Object.entries(OUTPUT_DIMENSIONS_BY_FORMAT_AND_TIER)) {
+    for (const [resolutionTier, [expectedWidth, expectedHeight]] of Object.entries(tiers)) {
+      if (resolutionTier === '720p') {
+        continue; // already covered by the pre-existing per-format loop above.
+      }
+      await test(`assembleFinalVideo exports a real ${expectedWidth}x${expectedHeight} video for outputFormat '${outputFormat}' at resolutionTier '${resolutionTier}'`, async () => {
+        const result = await assembleFinalVideo({
+          clips: [
+            { status: 'completed', url: redClipPath },
+            { status: 'completed', url: blueClipPath },
+          ],
+          voiceover: null,
+          outputFormat,
+          resolutionTier,
+        });
+
+        assert.strictEqual(result.status, 'completed', JSON.stringify(result));
+        const tmpOut = path.join(fixturesDir, `check-resolution-${outputFormat}-${resolutionTier}.mp4`);
+        fs.writeFileSync(tmpOut, result.buffer);
+        assert.deepStrictEqual(probeResolution(tmpOut), { width: expectedWidth, height: expectedHeight });
+      });
+    }
+  }
+
+  await test('assembleFinalVideo combines a higher resolutionTier with voice-over, burned-in subtitles, and music all at once', async () => {
+    const voiceoverDataUri = `data:audio/mpeg;base64,${fs.readFileSync(audioPath).toString('base64')}`;
+    const musicPath = makeMusic('music-resolution-combo.mp3', 1);
+
+    const result = await assembleFinalVideo({
+      clips: [
+        { status: 'completed', url: redClipPath },
+        { status: 'completed', url: blueClipPath },
+      ],
+      voiceover: { status: 'completed', url: voiceoverDataUri },
+      burnInSubtitlesContent: SAMPLE_SRT,
+      musicUrl: musicPath,
+      outputFormat: 'vertical',
+      resolutionTier: '1080p',
+    });
+
+    assert.strictEqual(result.status, 'completed', JSON.stringify(result));
+    const tmpOut = path.join(fixturesDir, 'check-resolution-combo.mp4');
+    fs.writeFileSync(tmpOut, result.buffer);
+    assert.deepStrictEqual(probeResolution(tmpOut), { width: 1080, height: 1920 });
+    const log = probe(tmpOut);
+    assert.ok(log.includes('Video:'));
+    assert.ok(log.includes('Audio:'), 'voice-over + music must still be mixed in at a non-default resolution tier');
+  });
 
   await test('assembleFinalVideo exports the correct vertical 9:16 dimensions with a real mixed-in voice-over too', async () => {
     const voiceoverDataUri = `data:audio/mpeg;base64,${fs.readFileSync(audioPath).toString('base64')}`;

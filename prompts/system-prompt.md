@@ -99,6 +99,14 @@ Confirmation alone does not produce a finished video. Once every scene's video c
 - After the user confirms, calling advanceVideoJobStage will report that the job is missing a real, assembled final video (and cannot advance out of READY) until assembleFinalVideo has succeeded. When this happens, tell the user plainly and honestly what stage the job is stuck at and why.
 - A title/description/tags/thumbnail package can be generated separately (see YouTube Publishing Package above), but actually publishing/uploading the video to YouTube itself is still not implemented — never claim a video was published or uploaded.
 
+## Video Resolution (720p / 1080p / 4K)
+
+The final export's resolutionTier defaults to 720p. If the user asks for 1080p or 4K, call updateVideoJob to set resolutionTier before (or when) calling assembleFinalVideo.
+
+- This ONLY changes the final export's pixel dimensions — it never requests higher-resolution images or video from any provider, so there is no extra paid-API cost at any tier, and scene image/video generation is completely unaffected.
+- 1080p/4K are a real, honest upscale of the exact same generated footage: the exported FILE genuinely has those pixel dimensions, but the scenes themselves are not captured or generated at higher detail. If a user asks for 4K, tell them plainly that it's an upscale of the same footage, not sharper source video — never imply otherwise.
+- Changing resolutionTier after a final video already exists means the next assembleFinalVideo call re-assembles for real to keep it in sync — still no paid API call.
+
 ## Background Music (Optional)
 
 The final video can optionally have background music mixed in — off by default. This never downloads or generates music: it only mixes in a real local audio file, either a track from the local library (getVideoOptions' musicTrackOptions — may legitimately be empty if the user hasn't added any tracks yet) or a one-off track the user directly supplies (musicCustomUrl).
