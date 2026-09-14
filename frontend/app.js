@@ -221,12 +221,65 @@
     generateStatus.hidden = false;
   }
 
+  const DEFAULT_OUTPUT_FORMAT = 'horizontal';
+
+  // Starts a brand-new, empty job (POST /api/jobs — a local, free call; no
+  // paid API involved) and points this page at it. Without this, clicking
+  // "Generate Video" kept reusing whatever jobId was already sitting in
+  // localStorage from a previous, possibly unrelated video — so a new
+  // request could silently inherit that old job's images, voice-over,
+  // video clips, final MP4, and even its outputFormat. A fresh job has none
+  // of that (see job-store.js's createDefaultJob), so starting one here
+  // guarantees a clean slate every time this form is submitted.
+  async function startFreshJob() {
+    const res = await fetch('/api/jobs', { method: 'POST' });
+    if (!res.ok) {
+      throw new Error(`Could not create a new job (status ${res.status})`);
+    }
+    const job = await res.json();
+    jobId = job.id;
+    storeJobId(jobId);
+    conversationHistory = [];
+    return job;
+  }
+
   generateBtn.addEventListener('click', async () => {
     const topic = videoIdeaInput.value.trim();
 
     if (!topic) {
       setGenerateStatus('Please enter a video topic or story idea first.', 'error');
       videoIdeaInput.focus();
+      return;
+    }
+
+    generateBtn.disabled = true;
+    setGenerateStatus('Starting a new video job…', 'loading');
+
+    try {
+      await startFreshJob();
+    } catch (error) {
+      setGenerateStatus('Could not start a new video job. Please try again.', 'error');
+      generateBtn.disabled = false;
+      return;
+    }
+
+    // The select's empty value means "Horizontal (16:9, default)" — map it
+    // to the real outputFormat value explicitly and PATCH it onto the new
+    // job directly (the same deterministic pattern burnInSubtitlesToggle
+    // below already uses for a plain preference field), so the exact format
+    // chosen in this form is always what actually gets saved — never left
+    // to the chat message being parsed correctly, and never left ambiguous
+    // with "not specified".
+    const outputFormat = videoOutputFormatSelect.value || DEFAULT_OUTPUT_FORMAT;
+    try {
+      await fetch(`/api/jobs/${jobId}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ outputFormat }),
+      });
+    } catch (error) {
+      setGenerateStatus('Could not save the selected output format. Please try again.', 'error');
+      generateBtn.disabled = false;
       return;
     }
 
@@ -239,9 +292,9 @@
     if (videoLanguageSelect.value) details.push(`Language: ${languageOption.textContent}`);
     if (videoStyleSelect.value) details.push(`Style: ${styleOption.textContent}`);
 
-    // Omitting this (the empty "Horizontal (16:9, default)" option) leaves
-    // the job at its default outputFormat — only mentioned at all when the
-    // user actually picked Vertical or Square.
+    // outputFormat itself is already saved for real above — this is only
+    // mentioned in the message (when non-default) so the agent's own
+    // narration of the plan stays consistent with what was picked.
     if (videoOutputFormatSelect.value) {
       const outputFormatOption = videoOutputFormatSelect.selectedOptions[0];
       details.push(`Output format: ${outputFormatOption.textContent}`);
