@@ -1540,6 +1540,35 @@ app.use(express.static(path.resolve(__dirname, '..', 'frontend')));
 // route simply serves nothing.
 app.use('/generated', express.static(videoStorage.GENERATED_DIR));
 
+// Prompt caching: SYSTEM_PROMPT_BASE (this project's full instructions,
+// plus TOOLS — which the API renders immediately before `system` on every
+// request) never changes for the life of this process, so it's split into
+// its own content block with a cache_control breakpoint at the end. Per
+// Anthropic's prefix-caching rules, a breakpoint on the last block of a
+// stable prefix caches everything up to it — tools included — so no
+// separate marker is needed on TOOLS itself. The per-job summary is a
+// second, unmarked block: it changes on every single request (job status,
+// script, topic, etc.), so it must never sit inside the cached prefix. A
+// top-level function (like executeTool below) purely so this exact request
+// shape can be verified without making a live, billed Anthropic call.
+function buildCachedSystemPrompt(job) {
+  return [
+    {
+      type: 'text',
+      text: SYSTEM_PROMPT_BASE,
+      cache_control: { type: 'ephemeral' },
+    },
+    {
+      type: 'text',
+      text:
+        '\n\n## Current Video Production Job\n' +
+        'This is the current state of the video production job for this conversation. ' +
+        'Use the updateVideoJob, advanceVideoJobStage, and confirmVideoJob tools to keep it accurate.\n\n' +
+        JSON.stringify(summarizeJobForAgent(job)),
+    },
+  ];
+}
+
 app.post('/api/agent', async (req, res) => {
   const { message, conversationHistory, jobId: requestedJobId } = req.body || {};
 
@@ -1555,13 +1584,7 @@ app.post('/api/agent', async (req, res) => {
 
   async function buildSystemPrompt() {
     const currentJob = await jobStore.getJob(jobId);
-    return (
-      SYSTEM_PROMPT_BASE +
-      '\n\n## Current Video Production Job\n' +
-      'This is the current state of the video production job for this conversation. ' +
-      'Use the updateVideoJob, advanceVideoJobStage, and confirmVideoJob tools to keep it accurate.\n\n' +
-      JSON.stringify(summarizeJobForAgent(currentJob))
-    );
+    return buildCachedSystemPrompt(currentJob);
   }
 
   try {
@@ -2023,3 +2046,6 @@ if (require.main === module) {
 // expecting the listenable app).
 module.exports = app;
 module.exports.executeTool = executeTool;
+module.exports.buildCachedSystemPrompt = buildCachedSystemPrompt;
+module.exports.SYSTEM_PROMPT_BASE = SYSTEM_PROMPT_BASE;
+module.exports.TOOLS = TOOLS;
