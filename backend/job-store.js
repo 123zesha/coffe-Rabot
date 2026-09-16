@@ -106,6 +106,7 @@ const JOB_FIELDS = [
   'burnInSubtitles',
   'outputFormat',
   'resolutionTier',
+  'videoMode',
 ];
 
 // The only real, supported output-format values — 'horizontal' (16:9),
@@ -131,6 +132,23 @@ const DEFAULT_OUTPUT_FORMAT = 'horizontal';
 // (see prompts/system-prompt.md), never implied to be sharper source video.
 const RESOLUTION_TIERS = ['720p', '1080p', '4k'];
 const DEFAULT_RESOLUTION_TIER = '720p';
+
+// Which final-assembly pipeline a job uses. 'cinematic' (the default,
+// preserving every job's exact pre-existing behavior) is the Runway-clip
+// pipeline (image-generation.js + video-generation.js + video-assembly.js)
+// — real, paid Runway/OpenAI calls per scene. 'simple-story' is the local,
+// FFmpeg-only pipeline (see backend/simple-story-video.js) built for
+// English learning/listening-practice story videos: no scene images, no
+// Runway clips, no paid video-generation call of any kind — the final MP4
+// is built directly from the job's own script/voice-over/subtitles. A job
+// never mixes the two; see getMissingOutputs below for how 'simple-story'
+// skips the image/video-prompt requirement 'cinematic' still has at the
+// ASSET GENERATION stage, and server.js's executeTool for the hard guard
+// that refuses generateSceneImages/generateSceneVideo (Runway/OpenAI image
+// calls) outright on a 'simple-story' job — never just relying on prompt
+// discipline for a "no paid Runway calls in this mode" guarantee.
+const VIDEO_MODES = ['cinematic', 'simple-story'];
+const DEFAULT_VIDEO_MODE = 'cinematic';
 
 // Local (no-Redis) fallback only, from here down to saveJobs — the whole
 // job list really is just one small JSON file on disk, so there is no
@@ -273,6 +291,12 @@ function createDefaultJob(id) {
     // agent like outputFormat. Defaults to '720p', preserving the exact
     // pre-existing pixel dimensions for any job that never sets this.
     resolutionTier: DEFAULT_RESOLUTION_TIER,
+    // Which final-assembly pipeline this job uses — see VIDEO_MODES above.
+    // Defaults to 'cinematic', preserving the exact pre-existing Runway
+    // pipeline for any job that never sets this. Writable by the
+    // conversational agent like outputFormat/resolutionTier — a
+    // preference, not a generation result.
+    videoMode: DEFAULT_VIDEO_MODE,
     // Which named voice-over option (see data/video-options.json ->
     // voiceOverOptions) the user picked; writable by the agent like
     // topic/language/storyStyle, since it's just a preference, not a
@@ -337,7 +361,19 @@ function createDefaultJob(id) {
     // resolutionUsed records which RESOLUTION_TIERS value THIS assembled
     // video's real pixel dimensions actually reflect — same role again, for
     // the resolutionTier field above.
-    finalVideo: { url: null, status: 'pending', subtitlesUsed: null, musicUsed: null, resolutionUsed: null },
+    // videoModeUsed records which VIDEO_MODES value actually produced THIS
+    // assembled video — same "is the cached result still accurate" role,
+    // for the videoMode field above. A job whose videoMode is switched
+    // between 'cinematic' and 'simple-story' after a final video already
+    // exists must never keep serving the old pipeline's stale output.
+    finalVideo: {
+      url: null,
+      status: 'pending',
+      subtitlesUsed: null,
+      musicUsed: null,
+      resolutionUsed: null,
+      videoModeUsed: null,
+    },
     // Optional "Reference Video / Inspiration Mode" input: a YouTube URL the
     // user wants used only as high-level storytelling inspiration (pacing,
     // tone, structure — never its transcript, dialogue, character names, or
@@ -582,7 +618,17 @@ function hasRequiredOutput(job, field) {
 }
 
 function getMissingOutputs(job) {
-  const required = STAGE_OUTPUT_REQUIREMENTS[job.status] || [];
+  let required = STAGE_OUTPUT_REQUIREMENTS[job.status] || [];
+
+  // A 'simple-story' job never generates scene images or Runway clips (see
+  // VIDEO_MODES above) — imagePrompts/videoPrompts exist only to drive
+  // those two paid calls, so requiring them here would block a
+  // simple-story job from ever leaving ASSET GENERATION for no real
+  // reason. 'cinematic' jobs (the default) are completely unaffected.
+  if (job.status === 'ASSET GENERATION' && job.videoMode === 'simple-story') {
+    required = required.filter((field) => field !== 'imagePrompts' && field !== 'videoPrompts');
+  }
+
   return required.filter((field) => !hasRequiredOutput(job, field));
 }
 
@@ -648,6 +694,8 @@ module.exports = {
   DEFAULT_OUTPUT_FORMAT,
   RESOLUTION_TIERS,
   DEFAULT_RESOLUTION_TIER,
+  VIDEO_MODES,
+  DEFAULT_VIDEO_MODE,
   listJobs,
   createJob,
   getJob,

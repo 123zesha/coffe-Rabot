@@ -12,6 +12,7 @@
   const generateBtn = document.getElementById('generate-video-btn');
   const generateStatus = document.getElementById('generate-status');
   const videoIdeaInput = document.getElementById('video-idea');
+  const videoGenerationModeSelect = document.getElementById('video-generation-mode');
   const videoDurationSelect = document.getElementById('video-duration');
   const videoLanguageSelect = document.getElementById('video-language');
   const videoStyleSelect = document.getElementById('video-style');
@@ -269,16 +270,19 @@
     // below already uses for a plain preference field), so the exact format
     // chosen in this form is always what actually gets saved — never left
     // to the chat message being parsed correctly, and never left ambiguous
-    // with "not specified".
+    // with "not specified". videoMode is included in the same PATCH for the
+    // same reason: which pipeline (and whether Runway is ever used at all)
+    // must never depend on the chat message being parsed correctly.
     const outputFormat = videoOutputFormatSelect.value || DEFAULT_OUTPUT_FORMAT;
+    const videoMode = videoGenerationModeSelect.value;
     try {
       await fetch(`/api/jobs/${jobId}`, {
         method: 'PATCH',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ outputFormat }),
+        body: JSON.stringify({ outputFormat, videoMode }),
       });
     } catch (error) {
-      setGenerateStatus('Could not save the selected output format. Please try again.', 'error');
+      setGenerateStatus('Could not save the selected video generation mode/output format. Please try again.', 'error');
       generateBtn.disabled = false;
       return;
     }
@@ -288,6 +292,15 @@
     const styleOption = videoStyleSelect.selectedOptions[0];
 
     const details = [`Topic or story idea: ${topic}`];
+    // videoMode itself is already saved for real above — mentioned here so
+    // the agent's own narration/plan (and, for 'simple-story', its script
+    // length target and skipped asset-generation steps) matches what was
+    // actually picked, and only when non-default so the message stays
+    // unchanged for the common "AI Cinematic Video" case.
+    if (videoMode === 'simple-story') {
+      const modeOption = videoGenerationModeSelect.selectedOptions[0];
+      details.push(`Video generation mode: ${modeOption.textContent}`);
+    }
     if (videoDurationSelect.value) details.push(`Duration: ${durationOption.textContent}`);
     if (videoLanguageSelect.value) details.push(`Language: ${languageOption.textContent}`);
     if (videoStyleSelect.value) details.push(`Style: ${styleOption.textContent}`);

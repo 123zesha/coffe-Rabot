@@ -80,6 +80,20 @@
             <textarea id="video-idea" rows="4" placeholder="e.g. A beginner's guide to growing tomatoes at home"></textarea>
           </div>
 
+          <div class="form-field form-field-wide">
+            <label for="video-generation-mode">Video generation mode</label>
+            <select id="video-generation-mode">
+              <option value="cinematic">AI Cinematic Video (Runway – Paid)</option>
+              <option value="simple-story">Simple Story Video (FFmpeg – No Runway)</option>
+            </select>
+            <p class="field-hint">
+              "Simple Story Video" never uses Runway or scene images — it renders large synchronized
+              on-screen story text with simple backgrounds, built for English learning/listening-practice
+              story videos. "AI Cinematic Video" is the standard pipeline with AI-generated scene images
+              and paid Runway video clips.
+            </p>
+          </div>
+
           <div class="form-field">
             <label for="video-duration">Desired video duration</label>
             <select id="video-duration">

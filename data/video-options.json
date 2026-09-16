@@ -55,5 +55,17 @@
     { "value": "horizontal", "label": "Horizontal (16:9 Standard)" },
     { "value": "vertical", "label": "Vertical (9:16 Shorts)" },
     { "value": "square", "label": "Square (1:1 Social)" }
+  ],
+  "videoGenerationModes": [
+    {
+      "value": "simple-story",
+      "label": "Simple Story Video (FFmpeg – No Runway)",
+      "description": "Local ffmpeg only, no Runway/OpenAI image calls. Large synchronized on-screen story text, simple backgrounds with gentle Ken Burns movement, and burned-in captions — built for English learning/listening-practice story videos. Fixed 1080p horizontal (16:9)."
+    },
+    {
+      "value": "cinematic",
+      "label": "AI Cinematic Video (Runway – Paid)",
+      "description": "The existing pipeline: AI-generated scene images and Runway video clips per scene, assembled into one final video. Real, paid Runway/OpenAI image calls."
+    }
   ]
 }

@@ -14,6 +14,7 @@ const referenceVideo = require('./reference-video');
 const youtubePackage = require('./youtube-package');
 const subtitlesGeneration = require('./subtitles-generation');
 const musicLibrary = require('./music-library');
+const simpleStoryVideo = require('./simple-story-video');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -46,6 +47,26 @@ const TEMP_GENERATE_VIDEO_SCENE_CAP = 2;
 // actionable enough (which tool, which field, what shape) that the Agent
 // can call updateVideoJob and fix it itself, without asking the user to
 // manually repair job data.
+// Simple Story Video mode (job.videoMode === 'simple-story') never uses
+// Runway or OpenAI image generation — see job-store.js's VIDEO_MODES
+// comment: its final video is rendered directly from the script/voice-over/
+// subtitles via local ffmpeg only (backend/simple-story-video.js). This is
+// a hard, code-level guard shared by every entry point that could trigger
+// either paid call (the generateSceneImages/generateSceneVideo Agent tools
+// AND their equivalent REST routes) — never just prompt discipline — so a
+// 'simple-story' job can never rack up Runway/OpenAI-image spend by
+// accident.
+function findPaidVisualGenerationBlocker(job, toolLabel) {
+  if (job.videoMode === 'simple-story') {
+    return (
+      `This job is set to Simple Story Video mode, which never uses ${toolLabel} — it is assembled ` +
+      'directly from the script, voice-over, and subtitles using local ffmpeg only. Generate the ' +
+      'voice-over and subtitles instead, then call assembleFinalVideo.'
+    );
+  }
+  return null;
+}
+
 function findScenePromptMismatch(job) {
   const imageCount = Array.isArray(job.imagePrompts) ? job.imagePrompts.length : 0;
   const videoCount = Array.isArray(job.videoPrompts) ? job.videoPrompts.length : 0;
@@ -104,6 +125,29 @@ function findScenePromptMismatch(job) {
 // number, lets the error tell the Agent exactly which scene still needs
 // generateSceneVideo, the same actionable style as findScenePromptMismatch.
 function findFinalVideoBlocker(job) {
+  // Simple Story Video mode has entirely different prerequisites — no
+  // scenes/clips at all, just a real script, a completed voice-over, and
+  // real subtitles (which drive the on-screen text's timing; see
+  // backend/simple-story-video.js). Checked first so this never falls
+  // through into the Runway-clip checks below, which would report
+  // irrelevant "missing videoPrompts/clips" errors for a mode that never
+  // has any.
+  if (job.videoMode === 'simple-story') {
+    if (!job.script || !job.script.trim()) {
+      return 'There is no script yet, so there is nothing to narrate. Write the script first.';
+    }
+    if (!job.voiceover || job.voiceover.status !== 'completed' || !job.voiceover.url) {
+      return 'A completed voice-over is required for Simple Story Video mode. Use generateVoiceover first.';
+    }
+    if (!job.subtitles || job.subtitles.status !== 'completed' || !job.subtitles.content) {
+      return (
+        'Real subtitles are required for Simple Story Video mode — they drive the synchronized ' +
+        'on-screen story text, not just captions. Use generateSubtitles first.'
+      );
+    }
+    return null;
+  }
+
   const expectedCount = Array.isArray(job.videoPrompts) ? job.videoPrompts.length : 0;
   const clips = job.videoGeneration && Array.isArray(job.videoGeneration.clips) ? job.videoGeneration.clips : [];
 
@@ -183,7 +227,69 @@ function findFinalVideoBlocker(job) {
 // desiredResolutionUsed is job.resolutionTier itself (see
 // isFinalVideoStillAccurate) — same role again, compared against
 // finalVideo.resolutionUsed.
-async function assembleAndStoreFinalVideo(job, jobId, desiredSubtitlesContent, desiredMusicUsed, desiredResolutionUsed) {
+// desiredVideoModeUsed is job.videoMode itself (see computeDesiredVideoModeUsed
+// below) — which of the two pipelines below actually runs.
+async function assembleAndStoreFinalVideo(
+  job,
+  jobId,
+  desiredSubtitlesContent,
+  desiredMusicUsed,
+  desiredResolutionUsed,
+  desiredVideoModeUsed
+) {
+  // Simple Story Video mode: an entirely separate, local-ffmpeg-only
+  // pipeline (backend/simple-story-video.js) — no scene clips, no Runway
+  // healing, no music/resolution tier (that pipeline is always fixed
+  // 1080p/16:9 with no music, per its own module comment). subtitlesUsed
+  // still records the real subtitles content actually burned in — the same
+  // "was this reassembled since a real change" bookkeeping role it has for
+  // the Runway pipeline below.
+  if (desiredVideoModeUsed === 'simple-story') {
+    const assembly = await simpleStoryVideo.assembleSimpleStoryVideo({
+      voiceover: job.voiceover,
+      subtitlesContent: job.subtitles && job.subtitles.status === 'completed' ? job.subtitles.content : null,
+    });
+
+    if (assembly.status !== 'completed') {
+      return {
+        url: null,
+        status: 'failed',
+        subtitlesUsed: null,
+        musicUsed: null,
+        resolutionUsed: null,
+        videoModeUsed: null,
+        error: assembly.error || 'Simple Story Video assembly failed.',
+      };
+    }
+
+    try {
+      const url = await videoStorage.storeFinalVideo(assembly.buffer, jobId);
+      return {
+        url,
+        status: 'completed',
+        subtitlesUsed: job.subtitles.content,
+        musicUsed: null,
+        resolutionUsed: null,
+        videoModeUsed: 'simple-story',
+        error: null,
+      };
+    } catch (error) {
+      console.error(
+        'Simple Story Video storage error:',
+        JSON.stringify({ name: error?.name, message: error?.message }, null, 2)
+      );
+      return {
+        url: null,
+        status: 'failed',
+        subtitlesUsed: null,
+        musicUsed: null,
+        resolutionUsed: null,
+        videoModeUsed: null,
+        error: `The final video was assembled but could not be stored: ${error.message}`,
+      };
+    }
+  }
+
   const originalClips = job.videoGeneration.clips;
   const healedClips = [];
   for (let i = 0; i < originalClips.length; i++) {
@@ -202,6 +308,7 @@ async function assembleAndStoreFinalVideo(job, jobId, desiredSubtitlesContent, d
       subtitlesUsed: null,
       musicUsed: null,
       resolutionUsed: null,
+      videoModeUsed: null,
       error:
         `Scene ${brokenIndex + 1}'s video clip could not be verified or recovered before assembly ` +
         `(${healedClips[brokenIndex].error || 'unknown error'}) — regenerate it with generateSceneVideo.`,
@@ -222,6 +329,7 @@ async function assembleAndStoreFinalVideo(job, jobId, desiredSubtitlesContent, d
       subtitlesUsed: null,
       musicUsed: null,
       resolutionUsed: null,
+      videoModeUsed: null,
       error: error.message,
     };
   }
@@ -242,6 +350,7 @@ async function assembleAndStoreFinalVideo(job, jobId, desiredSubtitlesContent, d
       subtitlesUsed: null,
       musicUsed: null,
       resolutionUsed: null,
+      videoModeUsed: null,
       error: assembly.error || 'Final video assembly failed.',
     };
   }
@@ -254,6 +363,7 @@ async function assembleAndStoreFinalVideo(job, jobId, desiredSubtitlesContent, d
       subtitlesUsed: desiredSubtitlesContent,
       musicUsed: desiredMusicUsed,
       resolutionUsed: desiredResolutionUsed,
+      videoModeUsed: desiredVideoModeUsed,
       error: null,
     };
   } catch (error) {
@@ -267,6 +377,7 @@ async function assembleAndStoreFinalVideo(job, jobId, desiredSubtitlesContent, d
       subtitlesUsed: null,
       musicUsed: null,
       resolutionUsed: null,
+      videoModeUsed: null,
       error: `The final video was assembled but could not be stored: ${error.message}`,
     };
   }
@@ -293,6 +404,13 @@ function computeDesiredResolutionUsed(job) {
   return job.resolutionTier || jobStore.DEFAULT_RESOLUTION_TIER;
 }
 
+// The videoMode THIS job's settings would produce if assembled right now —
+// job.videoMode itself (defaults to 'cinematic'), same role as
+// computeDesiredResolutionUsed for finalVideo.videoModeUsed.
+function computeDesiredVideoModeUsed(job) {
+  return job.videoMode || jobStore.DEFAULT_VIDEO_MODE;
+}
+
 // Whether an existing job.finalVideo is still accurate and can be served
 // as-is (never re-run ffmpeg unnecessarily), vs. must be reassembled
 // because burnInSubtitles, subtitles.content, the music settings, or the
@@ -304,6 +422,24 @@ function isFinalVideoStillAccurate(job) {
   if (!job.finalVideo || job.finalVideo.status !== 'completed' || !job.finalVideo.url) {
     return false;
   }
+
+  const desiredVideoModeUsed = computeDesiredVideoModeUsed(job);
+  if ((job.finalVideo.videoModeUsed || jobStore.DEFAULT_VIDEO_MODE) !== desiredVideoModeUsed) {
+    return false;
+  }
+
+  if (desiredVideoModeUsed === 'simple-story') {
+    // Simple Story Video mode always uses subtitles as its on-screen text
+    // source (not conditional on burnInSubtitles — see findFinalVideoBlocker)
+    // and never applies music/resolutionTier (that pipeline is always fixed
+    // 1080p/16:9 with no music — see simple-story-video.js). Checking those
+    // here would force a pointless reassembly on every check, since this
+    // pipeline never sets musicUsed/resolutionUsed to anything but null.
+    const desiredSubtitlesContent =
+      job.subtitles && job.subtitles.status === 'completed' ? job.subtitles.content : null;
+    return (job.finalVideo.subtitlesUsed || null) === desiredSubtitlesContent;
+  }
+
   const desiredSubtitlesContent =
     job.burnInSubtitles && job.subtitles && job.subtitles.status === 'completed' ? job.subtitles.content : null;
   if ((job.finalVideo.subtitlesUsed || null) !== desiredSubtitlesContent) {
@@ -579,6 +715,7 @@ const UPDATABLE_JOB_FIELDS = [
   'burnInSubtitles',
   'outputFormat',
   'resolutionTier',
+  'videoMode',
 ];
 
 // job.images[].url and job.voiceover.url each hold a full base64-encoded
@@ -630,13 +767,14 @@ function summarizeJobForAgent(job) {
   }
 
   if (job.finalVideo && typeof job.finalVideo === 'object') {
-    const { status, error, subtitlesUsed, musicUsed, resolutionUsed } = job.finalVideo;
+    const { status, error, subtitlesUsed, musicUsed, resolutionUsed, videoModeUsed } = job.finalVideo;
     summarized.finalVideo = {
       status,
       ...(error ? { error } : {}),
       hasBurnedInSubtitles: Boolean(subtitlesUsed),
       hasMusic: Boolean(musicUsed),
       ...(resolutionUsed ? { resolutionUsed } : {}),
+      ...(videoModeUsed ? { videoModeUsed } : {}),
     };
   }
 
@@ -788,6 +926,19 @@ const TOOLS = [
         // higher-detail source video. Never claim sharper source footage
         // when a higher tier is selected — see prompts/system-prompt.md.
         resolutionTier: { type: 'string', enum: jobStore.RESOLUTION_TIERS },
+        // Which final-assembly pipeline this job uses. 'cinematic'
+        // (default) is the existing Runway-clip pipeline — real, paid
+        // Runway/OpenAI image calls per scene. 'simple-story' is a local,
+        // FFmpeg-only pipeline for English learning/listening-practice
+        // story videos: NO scene images, NO Runway clips, NO paid video
+        // call of any kind — large synchronized on-screen story text,
+        // Ken Burns backgrounds, and burned-in captions, rendered directly
+        // from the script/voice-over/subtitles. Set this BEFORE asset
+        // generation begins — switching it after scene images/clips
+        // already exist does not delete them, but a 'simple-story' job
+        // never uses them and a 'cinematic' job never uses this mode's
+        // rendering. See getVideoOptions' videoGenerationModes.
+        videoMode: { type: 'string', enum: jobStore.VIDEO_MODES },
       },
       additionalProperties: false,
     },
@@ -828,7 +979,10 @@ const TOOLS = [
     name: 'generateSceneImages',
     description:
       'Generate the real scene images for the current video job from its existing imagePrompts and ' +
-      'characters, using the same image-generation backend the rest of this app already uses. Before ' +
+      'characters, using the same image-generation backend the rest of this app already uses. Refuses ' +
+      'outright — no OpenAI call is made — if the job\'s videoMode is \'simple-story\' (Simple Story ' +
+      'Video mode never uses scene images; go straight to generateVoiceover/generateSubtitles/' +
+      'assembleFinalVideo instead). Before ' +
       'calling this, set BOTH imagePrompts AND videoPrompts via updateVideoJob together — one ' +
       'videoPrompt (a short motion/camera description) per imagePrompt, in the same scene order — ' +
       'even though this tool only generates images. Scene video generation later needs a matching ' +
@@ -884,7 +1038,9 @@ const TOOLS = [
     description:
       'Generate a REAL, PAID Runway video clip for exactly one scene of the current video job, ' +
       'using the same provider-independent video-generation backend the rest of this app already ' +
-      'uses. This costs real Runway credits — only call this when the user has explicitly asked, ' +
+      'uses. Refuses outright — no Runway call is made — if the job\'s videoMode is \'simple-story\' ' +
+      '(Simple Story Video mode never uses Runway; go straight to generateVoiceover/generateSubtitles/' +
+      'assembleFinalVideo instead). This costs real Runway credits — only call this when the user has explicitly asked, ' +
       'right now, to generate video for a specific scene. Never call this automatically after ' +
       'generating images, and never call it again to retry a scene that already FAILED unless the ' +
       'user explicitly asks again. IMPORTANT exception: if the scene\'s status is "processing" ' +
@@ -954,7 +1110,14 @@ const TOOLS = [
       'has been generated) into one real, playable final MP4 for the current job, using local ffmpeg ' +
       'processing only. This calls NO paid API — every clip and the voice-over were already generated ' +
       'and paid for earlier — so, unlike generateSceneVideo/generateSceneImages, you do not need to ' +
-      'ask the user for permission before calling this. Requires every scene\'s video clip to already ' +
+      'ask the user for permission before calling this. If the job\'s videoMode is \'simple-story\', ' +
+      'this instead renders that mode\'s local, FFmpeg-only pipeline (see backend/simple-story-video.js) ' +
+      'straight from the script/voice-over/subtitles — no scene clips involved at all, no Runway call ' +
+      'ever, large synchronized on-screen story text plus burned-in captions, fixed at 1080p 16:9. It ' +
+      'requires a completed voice-over AND completed subtitles (call generateVoiceover then ' +
+      'generateSubtitles first) and refuses with a clear reason if either is missing — the rest of this ' +
+      'description (scene clips, outputFormat, burnInSubtitles, music, resolutionTier) describes the ' +
+      'default \'cinematic\' Runway pipeline only. For a \'cinematic\' job: requires every scene\'s video clip to already ' +
       'be completed; if any scene is missing or not yet completed, this refuses with a clear reason — ' +
       'generate the missing scene(s) with generateSceneVideo and try again, never ask the user to fix ' +
       'it manually. If there is no voice-over yet, the final video is produced silently (video only), ' +
@@ -1135,6 +1298,11 @@ async function executeTool(name, jobId, input) {
       return JSON.stringify({ error: 'job not found' });
     }
 
+    const paidVisualBlocker = findPaidVisualGenerationBlocker(job, 'scene image generation');
+    if (paidVisualBlocker) {
+      return JSON.stringify({ error: paidVisualBlocker });
+    }
+
     const promptMismatch = findScenePromptMismatch(job);
     if (promptMismatch) {
       return JSON.stringify({ error: promptMismatch });
@@ -1220,6 +1388,11 @@ async function executeTool(name, jobId, input) {
 
     if (!job) {
       return JSON.stringify({ error: 'job not found' });
+    }
+
+    const paidVisualBlocker = findPaidVisualGenerationBlocker(job, 'Runway video generation');
+    if (paidVisualBlocker) {
+      return JSON.stringify({ error: paidVisualBlocker });
     }
 
     const promptMismatch = findScenePromptMismatch(job);
@@ -1368,7 +1541,7 @@ async function executeTool(name, jobId, input) {
         // before, and no longer reflects this new one. Resetting finalVideo
         // here means assembleFinalVideo's own "already completed, skip"
         // check never keeps serving a stale, out-of-sync video afterward.
-        updates.finalVideo = { url: null, status: 'pending', subtitlesUsed: null, musicUsed: null, resolutionUsed: null };
+        updates.finalVideo = { url: null, status: 'pending', subtitlesUsed: null, musicUsed: null, resolutionUsed: null, videoModeUsed: null };
         // Existing subtitles were transcribed from the PREVIOUS narration
         // audio and no longer match this new one — resetting them here
         // means generateSubtitles never serves stale captions, and
@@ -1423,12 +1596,14 @@ async function executeTool(name, jobId, input) {
         job.burnInSubtitles && job.subtitles && job.subtitles.status === 'completed' ? job.subtitles.content : null;
       const desiredMusicUsed = computeDesiredMusicUsed(job);
       const desiredResolutionUsed = computeDesiredResolutionUsed(job);
+      const desiredVideoModeUsed = computeDesiredVideoModeUsed(job);
       const finalVideo = await assembleAndStoreFinalVideo(
         job,
         jobId,
         desiredSubtitlesContent,
         desiredMusicUsed,
-        desiredResolutionUsed
+        desiredResolutionUsed,
+        desiredVideoModeUsed
       );
       const updatedJob = await jobStore.updateJob(jobId, { finalVideo });
       return JSON.stringify(updatedJob ? summarizeJobForAgent(updatedJob) : { error: 'job not found' });
@@ -1723,6 +1898,11 @@ app.post('/api/jobs/:id/generate-images', async (req, res) => {
     return res.status(404).json({ error: 'job not found' });
   }
 
+  const paidVisualBlocker = findPaidVisualGenerationBlocker(job, 'scene image generation');
+  if (paidVisualBlocker) {
+    return res.status(400).json({ error: paidVisualBlocker });
+  }
+
   const promptMismatch = findScenePromptMismatch(job);
   if (promptMismatch) {
     return res.status(400).json({ error: promptMismatch });
@@ -1778,7 +1958,7 @@ app.post('/api/jobs/:id/generate-voiceover', async (req, res) => {
       // See the generateVoiceover Agent tool's identical comment: a fresh
       // voice-over invalidates any already-assembled final video and any
       // existing subtitles (transcribed from the previous narration audio).
-      updates.finalVideo = { url: null, status: 'pending', subtitlesUsed: null, musicUsed: null, resolutionUsed: null };
+      updates.finalVideo = { url: null, status: 'pending', subtitlesUsed: null, musicUsed: null, resolutionUsed: null, videoModeUsed: null };
       updates.subtitles = { status: 'pending', format: 'srt', content: null, error: null, generatedFromVoiceoverUrl: null };
     }
 
@@ -1856,6 +2036,11 @@ app.post('/api/jobs/:id/generate-video', async (req, res) => {
 
   if (!job) {
     return res.status(404).json({ error: 'job not found' });
+  }
+
+  const paidVisualBlocker = findPaidVisualGenerationBlocker(job, 'Runway video generation');
+  if (paidVisualBlocker) {
+    return res.status(400).json({ error: paidVisualBlocker });
   }
 
   const promptMismatch = findScenePromptMismatch(job);
@@ -1977,12 +2162,14 @@ app.post('/api/jobs/:id/assemble-video', async (req, res) => {
       job.burnInSubtitles && job.subtitles && job.subtitles.status === 'completed' ? job.subtitles.content : null;
     const desiredMusicUsed = computeDesiredMusicUsed(job);
     const desiredResolutionUsed = computeDesiredResolutionUsed(job);
+    const desiredVideoModeUsed = computeDesiredVideoModeUsed(job);
     const finalVideo = await assembleAndStoreFinalVideo(
       job,
       job.id,
       desiredSubtitlesContent,
       desiredMusicUsed,
-      desiredResolutionUsed
+      desiredResolutionUsed,
+      desiredVideoModeUsed
     );
     const updatedJob = await jobStore.updateJob(job.id, { finalVideo });
     res.json(updatedJob);
