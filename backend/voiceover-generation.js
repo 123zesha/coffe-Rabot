@@ -93,17 +93,22 @@ async function generateVoiceover({ script, voiceStyle }) {
   const chunks = chunkScript(script, MAX_TTS_INPUT_LENGTH);
 
   try {
-    const buffers = [];
-
-    for (const chunk of chunks) {
-      const response = await client.audio.speech.create({
-        model: TTS_MODEL,
-        voice,
-        input: chunk,
-        response_format: 'mp3',
-      });
-      buffers.push(Buffer.from(await response.arrayBuffer()));
-    }
+    // Chunks are synthesized concurrently, not sequentially — a long script
+    // (e.g. a 15-20 minute story) can produce several chunks, and awaiting
+    // them one at a time risks exceeding the hosting platform's request
+    // timeout. Promise.all preserves chunks' input order in its results
+    // regardless of completion order, so concatenation below stays correct.
+    const buffers = await Promise.all(
+      chunks.map(async (chunk) => {
+        const response = await client.audio.speech.create({
+          model: TTS_MODEL,
+          voice,
+          input: chunk,
+          response_format: 'mp3',
+        });
+        return Buffer.from(await response.arrayBuffer());
+      })
+    );
 
     const audioBuffer = Buffer.concat(buffers);
     if (audioBuffer.length === 0) {
