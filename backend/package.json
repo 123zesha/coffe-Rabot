@@ -32,7 +32,8 @@
     "test:music-library": "node test-music-library.js",
     "test:prompt-caching": "node test-prompt-caching.js",
     "test:simple-story-video": "node test-simple-story-video.js",
-    "test:simple-story-video-mode": "node test-simple-story-video-mode.js"
+    "test:simple-story-video-mode": "node test-simple-story-video-mode.js",
+    "test:agent-multi-step-flow": "node test-agent-multi-step-flow.js"
   },
   "keywords": [],
   "author": "",

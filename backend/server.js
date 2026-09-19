@@ -1744,10 +1744,22 @@ function buildCachedSystemPrompt(job) {
   ];
 }
 
-app.post('/api/agent', async (req, res) => {
-  const { message, conversationHistory, jobId: requestedJobId } = req.body || {};
+// Each of these takes long enough (real OpenAI TTS/Whisper calls, or a
+// real multi-minute ffmpeg encode for a 15-20 minute Simple Story Video)
+// that running more than one inside a single /api/agent request risks the
+// serverless function's own time limit — measured directly: a real
+// 18-minute voice-over -> subtitles -> final-video chain, all in one
+// request, took ~296-300s against a 300s limit, i.e. no safe margin at
+// all. The loop below allows at most one of these per request and reports
+// autoContinue: true when another is still pending, so the frontend can
+// resume the SAME conversation as a fresh, separate request — safely
+// inside the time limit — without the user having to type anything.
+const HEAVY_TOOLS = new Set(['generateVoiceover', 'generateSubtitles', 'assembleFinalVideo']);
 
-  if (!message) {
+app.post('/api/agent', async (req, res) => {
+  const { message, conversationHistory, jobId: requestedJobId, continueAutomatically } = req.body || {};
+
+  if (!continueAutomatically && !message) {
     return res.status(400).json({ error: 'message is required' });
   }
 
@@ -1755,7 +1767,13 @@ app.post('/api/agent', async (req, res) => {
   const jobId = existingJob ? existingJob.id : (await jobStore.createJob()).id;
 
   const history = Array.isArray(conversationHistory) ? conversationHistory : [];
-  const messages = [...history, { role: 'user', content: message }];
+  // A continuation request resumes an already-started turn (its history
+  // already ends with the pending tool_use/tool_result exchange) rather
+  // than starting a new one, so it must NOT append another user message —
+  // Claude's API requires strict user/assistant alternation, and the
+  // pending tool_use must be resolved by a tool_result, never followed by
+  // a second plain user message.
+  const messages = continueAutomatically ? [...history] : [...history, { role: 'user', content: message }];
 
   async function buildSystemPrompt() {
     const currentJob = await jobStore.getJob(jobId);
@@ -1778,6 +1796,8 @@ app.post('/api/agent', async (req, res) => {
     });
 
     let toolUseBlocks = response.content.filter((block) => block.type === 'tool_use');
+    let heavyToolExecuted = false;
+    let deferredHeavyTool = null;
 
     // Drive this off the actual presence of tool_use blocks, not stop_reason.
     // If a response hits max_tokens (Opus 5 runs adaptive thinking by
@@ -1791,13 +1811,45 @@ app.post('/api/agent', async (req, res) => {
     while (toolUseBlocks.length > 0) {
       messages.push({ role: 'assistant', content: response.content });
       const toolResults = await Promise.all(
-        toolUseBlocks.map(async (tool) => ({
-          type: 'tool_result',
-          tool_use_id: tool.id,
-          content: await executeTool(tool.name, jobId, tool.input),
-        }))
+        toolUseBlocks.map(async (tool) => {
+          // A second heavy tool call in the same request is deferred, never
+          // executed — its own tool_result says so, so Claude's next reply
+          // (still generated below) can tell the user what happens next
+          // instead of silently going quiet on this tool call.
+          if (HEAVY_TOOLS.has(tool.name) && heavyToolExecuted) {
+            deferredHeavyTool = tool.name;
+            return {
+              type: 'tool_result',
+              tool_use_id: tool.id,
+              content: JSON.stringify({
+                deferred: true,
+                note:
+                  `${tool.name} will run automatically in a separate follow-up request right after this ` +
+                  'one, to stay safely within the serverless function time limit. Tell the user this step ' +
+                  'is continuing automatically — do not say it failed or was skipped.',
+              }),
+            };
+          }
+          if (HEAVY_TOOLS.has(tool.name)) {
+            heavyToolExecuted = true;
+          }
+          return {
+            type: 'tool_result',
+            tool_use_id: tool.id,
+            content: await executeTool(tool.name, jobId, tool.input),
+          };
+        })
       );
       messages.push({ role: 'user', content: toolResults });
+
+      if (deferredHeavyTool) {
+        // Stop here rather than asking Claude for another reply: the next
+        // turn would just try the same deferred tool again, and the real
+        // work should not run until the follow-up request. `messages`
+        // already ends on this valid user-role tool_results turn, which is
+        // exactly where the follow-up request needs to resume.
+        break;
+      }
 
       response = await client.messages.create({
         model: 'claude-opus-5',
@@ -1812,9 +1864,10 @@ app.post('/api/agent', async (req, res) => {
     const textBlock = response.content.find((block) => block.type === 'text');
 
     res.json({
-      reply: textBlock ? textBlock.text : '',
-      conversationHistory: [...messages, { role: 'assistant', content: response.content }],
+      reply: textBlock ? textBlock.text : deferredHeavyTool ? 'Continuing automatically...' : '',
+      conversationHistory: deferredHeavyTool ? messages : [...messages, { role: 'assistant', content: response.content }],
       jobId,
+      autoContinue: Boolean(deferredHeavyTool),
     });
   } catch (error) {
     if (error instanceof Anthropic.APIError) {
