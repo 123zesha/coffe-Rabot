@@ -1532,6 +1532,7 @@ async function executeTool(name, jobId, input) {
       const voiceover = await voiceoverGeneration.generateVoiceover({
         script: job.script,
         voiceStyle: job.voiceStyle,
+        jobId: job.id,
       });
 
       const updates = { voiceover };
@@ -2004,6 +2005,7 @@ app.post('/api/jobs/:id/generate-voiceover', async (req, res) => {
     const voiceover = await voiceoverGeneration.generateVoiceover({
       script: job.script,
       voiceStyle: job.voiceStyle,
+      jobId: job.id,
     });
 
     const updates = { voiceover };
