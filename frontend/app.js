@@ -82,18 +82,21 @@
   let conversationHistory = [];
   let jobId = loadStoredJobId();
 
-  async function callAgent(message) {
+  async function postAgentRequest(payload) {
     const response = await fetch('/api/agent', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ message, conversationHistory, jobId }),
+      body: JSON.stringify(payload),
     });
 
     if (!response.ok) {
       throw new Error(`Request failed with status ${response.status}`);
     }
 
-    const data = await response.json();
+    return response.json();
+  }
+
+  function applyAgentResponse(data) {
     conversationHistory = Array.isArray(data.conversationHistory)
       ? data.conversationHistory
       : conversationHistory;
@@ -101,6 +104,29 @@
       jobId = data.jobId;
       storeJobId(jobId);
     }
+  }
+
+  // Voice-over generation, subtitle transcription, and final video assembly
+  // are each slow enough (real OpenAI calls, or several minutes of real
+  // ffmpeg encoding for a 15-20 minute video) that the backend only ever
+  // runs ONE of them per /api/agent request and reports autoContinue: true
+  // when another is still pending (see server.js's HEAVY_TOOLS guard) —
+  // otherwise a single request chaining all of them could exceed the
+  // serverless function's time limit. This resumes those follow-up steps
+  // automatically as separate requests, so from the user's side, sending
+  // one message still produces one complete video with no extra prompts.
+  // onProgress, if given, is called with each intermediate step's reply as
+  // it completes (the final reply is returned normally, not passed here).
+  async function callAgent(message, onProgress) {
+    let data = await postAgentRequest({ message, conversationHistory, jobId });
+    applyAgentResponse(data);
+
+    while (data.autoContinue) {
+      if (onProgress) onProgress(data.reply);
+      data = await postAgentRequest({ conversationHistory, jobId, continueAutomatically: true });
+      applyAgentResponse(data);
+    }
+
     return data.reply;
   }
 
@@ -158,10 +184,14 @@
     input.disabled = true;
     sendBtn.disabled = true;
 
-    const typingBubble = showTypingIndicator();
+    let typingBubble = showTypingIndicator();
 
     try {
-      const reply = await callAgent(text);
+      const reply = await callAgent(text, (progressReply) => {
+        typingBubble.remove();
+        addMessage(progressReply, 'bot');
+        typingBubble = showTypingIndicator();
+      });
       typingBubble.remove();
       addMessage(reply, 'bot');
     } catch (error) {
@@ -361,7 +391,14 @@
     setGenerateStatus('Generating your video plan…', 'loading');
 
     try {
-      const reply = await callAgent(message);
+      const reply = await callAgent(message, (progressReply) => {
+        setGenerateStatus(progressReply, 'loading');
+        refreshVoiceoverCard();
+        refreshSceneClipsCard();
+        refreshFinalVideoCard();
+        refreshYoutubePackageCard();
+        refreshSubtitlesCard();
+      });
       setGenerateStatus(reply);
     } catch (error) {
       setGenerateStatus(ERROR_REPLY, 'error');
