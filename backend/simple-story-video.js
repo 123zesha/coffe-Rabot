@@ -49,6 +49,7 @@ const path = require('path');
 const { execFile } = require('child_process');
 
 const { ffmpegPath, getMediaDuration } = require('./video-assembly');
+const videoStorage = require('./video-storage');
 
 const FONTS_DIR = path.resolve(__dirname, '..', 'assets', 'fonts');
 const FONT_BOLD_PATH = path.join(FONTS_DIR, 'DejaVuSans-Bold.ttf');
@@ -470,10 +471,15 @@ async function assembleSimpleStoryVideo({ voiceover, subtitlesContent, sectionTa
   }
 }
 
-// Mirrors video-assembly.js's fetchToFile for the one shape this module
-// actually needs (the voice-over's own url) — a base64 data: URI (the
-// normal case; voiceover.url is always embedded base64, never stored
-// externally) or, for this module's own tests, a plain local file path.
+// Mirrors video-assembly.js's fetchToFile for the voice-over's own url —
+// every shape voiceover-generation.js's storage can produce (see
+// video-storage.js): a real http(s) URL (Vercel Blob in production), a
+// /generated/... local reference (the no-Blob-token dev/test fallback,
+// resolved straight from disk via GENERATED_DIR rather than fetched over
+// HTTP, since this server has no fixed, known base URL to fetch its own
+// static route from), a base64 data: URI (kept for backward compatibility
+// with any job created before voice-over audio was moved out of the job
+// record), or a plain local file path (this module's own tests).
 async function fetchAudioToFile(url, destPath) {
   if (url.startsWith('data:')) {
     const commaIndex = url.indexOf(',');
@@ -485,6 +491,26 @@ async function fetchAudioToFile(url, destPath) {
     fs.writeFileSync(destPath, buffer);
     return;
   }
+
+  if (url.startsWith('/generated/')) {
+    const filePath = path.join(videoStorage.GENERATED_DIR, url.slice('/generated/'.length));
+    fs.copyFileSync(filePath, destPath);
+    return;
+  }
+
+  if (/^https?:\/\//i.test(url)) {
+    const response = await fetch(url);
+    if (!response.ok) {
+      throw new Error(`Failed to download voice-over audio (HTTP ${response.status}) from ${url}`);
+    }
+    const buffer = Buffer.from(await response.arrayBuffer());
+    if (buffer.length === 0) {
+      throw new Error(`Downloaded voice-over audio from ${url} was empty.`);
+    }
+    fs.writeFileSync(destPath, buffer);
+    return;
+  }
+
   fs.copyFileSync(url, destPath);
 }
 

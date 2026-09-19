@@ -1,6 +1,8 @@
 // Tests for backend/subtitles-generation.js — the optional Subtitles
-// feature's text half. Covers: decoding the voice-over's data: URI,
-// honoring OpenAI's response_format: 'srt' (verified against the installed
+// feature's text half. Covers: reading the voice-over's real audio bytes
+// (a data: URI, a /generated/ local reference, or a real http(s) URL —
+// every shape voiceover-generation.js's storage can produce), honoring
+// OpenAI's response_format: 'srt' (verified against the installed
 // `openai` SDK's own type definitions — a non-JSON content-type response is
 // returned as a plain string by the SDK's default response parser), and
 // honest failure handling for missing/invalid audio and API errors. The one
@@ -12,7 +14,10 @@
 //   npm run test:subtitles-generation
 
 const http = require('http');
+const fs = require('fs');
+const path = require('path');
 const assert = require('assert');
+const { GENERATED_DIR } = require('./video-storage');
 
 let failures = 0;
 
@@ -65,7 +70,7 @@ async function main() {
     return require('./subtitles-generation');
   }
 
-  await test('generateSubtitles refuses — before any OpenAI call — when there is no real voice-over url', async () => {
+  await test('generateSubtitles refuses — before any OpenAI call — when there is no real voice-over reference', async () => {
     let requestCount = 0;
     const server = await startMockOpenAiTranscription((body, res) => {
       requestCount++;
@@ -77,13 +82,35 @@ async function main() {
     const fresh = freshModule();
 
     try {
-      for (const voiceoverUrl of [null, undefined, '', 'not-a-data-uri', 'https://example.com/voice.mp3']) {
+      for (const voiceoverUrl of [null, undefined, '', 'not-a-real-reference', 'ftp://example.com/voice.mp3']) {
         const result = await fresh.generateSubtitles({ voiceoverUrl });
         assert.strictEqual(result.status, 'failed');
         assert.strictEqual(result.content, null);
         assert.ok(result.error, `expected an error message for voiceoverUrl=${JSON.stringify(voiceoverUrl)}`);
       }
-      assert.strictEqual(requestCount, 0, 'no OpenAI call may happen without a real voice-over data: URI');
+      assert.strictEqual(requestCount, 0, 'no OpenAI call may happen without a real, readable voice-over reference');
+    } finally {
+      server.close();
+      delete process.env.OPENAI_API_KEY;
+      delete process.env.OPENAI_BASE_URL;
+    }
+  });
+
+  await test('generateSubtitles refuses — before any OpenAI call — when a /generated/ local reference does not exist on disk', async () => {
+    let requestCount = 0;
+    const server = await startMockOpenAiTranscription((body, res) => {
+      requestCount++;
+      res.writeHead(200, { 'Content-Type': 'text/plain' });
+      res.end(SAMPLE_SRT);
+    });
+    process.env.OPENAI_API_KEY = 'test-key';
+    process.env.OPENAI_BASE_URL = `http://localhost:${server.address().port}`;
+    const fresh = freshModule();
+
+    try {
+      const result = await fresh.generateSubtitles({ voiceoverUrl: '/generated/does-not-exist.mp3' });
+      assert.strictEqual(result.status, 'failed');
+      assert.strictEqual(requestCount, 0);
     } finally {
       server.close();
       delete process.env.OPENAI_API_KEY;
@@ -143,6 +170,61 @@ async function main() {
       server.close();
       delete process.env.OPENAI_API_KEY;
       delete process.env.OPENAI_BASE_URL;
+    }
+  });
+
+  await test('generateSubtitles transcribes real audio served from a real https(-like) URL (Vercel Blob production shape)', async () => {
+    let audioRequestCount = 0;
+    const audioServer = await startMockServer((req, res) => {
+      audioRequestCount++;
+      res.writeHead(200, { 'Content-Type': 'audio/mpeg' });
+      res.end(Buffer.from('fake mp3 bytes served over http'));
+    });
+    const transcriptionServer = await startMockOpenAiTranscription((body, res) => {
+      res.writeHead(200, { 'Content-Type': 'text/plain' });
+      res.end(SAMPLE_SRT);
+    });
+    process.env.OPENAI_API_KEY = 'test-key';
+    process.env.OPENAI_BASE_URL = `http://localhost:${transcriptionServer.address().port}`;
+    const fresh = freshModule();
+
+    try {
+      const voiceoverUrl = `http://localhost:${audioServer.address().port}/voiceover.mp3`;
+      const result = await fresh.generateSubtitles({ voiceoverUrl });
+
+      assert.strictEqual(audioRequestCount, 1, 'expected exactly one download of the remote-stored voice-over audio');
+      assert.strictEqual(result.status, 'completed', JSON.stringify(result));
+      assert.strictEqual(result.content, SAMPLE_SRT.trim());
+    } finally {
+      audioServer.close();
+      transcriptionServer.close();
+      delete process.env.OPENAI_API_KEY;
+      delete process.env.OPENAI_BASE_URL;
+    }
+  });
+
+  await test('generateSubtitles transcribes real audio read from a /generated/ local reference (no-Blob-token dev/test fallback)', async () => {
+    fs.mkdirSync(GENERATED_DIR, { recursive: true });
+    const filename = `voiceover-test-${Date.now()}.mp3`;
+    fs.writeFileSync(path.join(GENERATED_DIR, filename), Buffer.from('fake mp3 bytes on local disk'));
+
+    const server = await startMockOpenAiTranscription((body, res) => {
+      res.writeHead(200, { 'Content-Type': 'text/plain' });
+      res.end(SAMPLE_SRT);
+    });
+    process.env.OPENAI_API_KEY = 'test-key';
+    process.env.OPENAI_BASE_URL = `http://localhost:${server.address().port}`;
+    const fresh = freshModule();
+
+    try {
+      const result = await fresh.generateSubtitles({ voiceoverUrl: `/generated/${filename}` });
+      assert.strictEqual(result.status, 'completed', JSON.stringify(result));
+      assert.strictEqual(result.content, SAMPLE_SRT.trim());
+    } finally {
+      server.close();
+      delete process.env.OPENAI_API_KEY;
+      delete process.env.OPENAI_BASE_URL;
+      fs.rmSync(path.join(GENERATED_DIR, filename), { force: true });
     }
   });
 

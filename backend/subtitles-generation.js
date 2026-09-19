@@ -33,8 +33,11 @@
 // per the same type definitions — they cannot return 'srt' or
 // 'verbose_json' timestamps at all.
 
+const fs = require('fs');
+const path = require('path');
 const OpenAI = require('openai');
 const { toFile } = require('openai');
+const videoStorage = require('./video-storage');
 
 const TRANSCRIPTION_MODEL = 'whisper-1';
 
@@ -57,23 +60,50 @@ function describeError(error) {
   return (error && error.message) || 'Unknown error generating subtitles.';
 }
 
-// Decodes the voice-over's own data: URI (see voiceover-generation.js —
-// always audio/mpeg) into a real uploadable file for the transcription
-// call. Returns null for anything that isn't a real base64 data URI, never
-// guesses at partial/malformed input.
-async function dataUriToAudioFile(dataUri) {
-  const match = /^data:([^;]+);base64,(.*)$/s.exec(dataUri);
-  if (!match) {
+// Reads the voice-over's real audio bytes into an uploadable file for the
+// transcription call. job.voiceover.url is one of three shapes, matching
+// every place voiceover-generation.js's storeAudioFile call can produce
+// (see video-storage.js): a real https:// URL (Vercel Blob in production),
+// a /generated/... local reference (the no-Blob-token dev/test fallback,
+// read straight from disk — this server has no fixed, known base URL to
+// fetch its own static route from), or a base64 data: URI (kept for
+// backward compatibility with any job created before voice-over audio was
+// moved out of the job record). Returns null for anything else, or for a
+// reference that decodes/downloads to zero bytes — never guesses at
+// partial/malformed input.
+async function resolveVoiceoverAudioFile(voiceoverUrl) {
+  let buffer;
+  let mimeType = 'audio/mpeg';
+
+  if (voiceoverUrl.startsWith('data:')) {
+    const match = /^data:([^;]+);base64,(.*)$/s.exec(voiceoverUrl);
+    if (!match) {
+      return null;
+    }
+    mimeType = match[1];
+    buffer = Buffer.from(match[2], 'base64');
+  } else if (voiceoverUrl.startsWith('/generated/')) {
+    const filePath = path.join(videoStorage.GENERATED_DIR, voiceoverUrl.slice('/generated/'.length));
+    if (!fs.existsSync(filePath)) {
+      return null;
+    }
+    buffer = fs.readFileSync(filePath);
+  } else if (/^https?:\/\//i.test(voiceoverUrl)) {
+    const response = await fetch(voiceoverUrl);
+    if (!response.ok) {
+      return null;
+    }
+    buffer = Buffer.from(await response.arrayBuffer());
+    mimeType = response.headers.get('content-type') || mimeType;
+  } else {
     return null;
   }
 
-  const [, mimeType, base64] = match;
-  const buffer = Buffer.from(base64, 'base64');
-  if (buffer.length === 0) {
+  if (!buffer || buffer.length === 0) {
     return null;
   }
+
   const extension = mimeType.split('/')[1] || 'mp3';
-
   return toFile(buffer, `voiceover.${extension}`, { type: mimeType });
 }
 
@@ -86,11 +116,11 @@ function failedResult(error) {
 // voice-over audio, an empty transcription, or an API failure all fail
 // honestly instead of guessing at timing or text.
 async function generateSubtitles({ voiceoverUrl }) {
-  if (typeof voiceoverUrl !== 'string' || !voiceoverUrl.startsWith('data:')) {
+  if (typeof voiceoverUrl !== 'string' || !voiceoverUrl) {
     return failedResult('No real voice-over audio is available to transcribe yet.');
   }
 
-  const audioFile = await dataUriToAudioFile(voiceoverUrl);
+  const audioFile = await resolveVoiceoverAudioFile(voiceoverUrl);
   if (!audioFile) {
     return failedResult('The voice-over audio could not be read for transcription.');
   }

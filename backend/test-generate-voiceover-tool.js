@@ -50,6 +50,7 @@ const REAL_SCRIPT =
 let mockRequestCount = 0;
 let mockShouldFail = false;
 let lastRequestBody = null;
+let mockAudioBytesPerChunk = 0;
 
 function startMockOpenAi() {
   return new Promise((resolve) => {
@@ -71,7 +72,11 @@ function startMockOpenAi() {
         }
 
         res.writeHead(200, { 'Content-Type': 'audio/mpeg' });
-        res.end(Buffer.from('fake mp3 audio bytes'));
+        res.end(
+          mockAudioBytesPerChunk > 0
+            ? Buffer.alloc(mockAudioBytesPerChunk, 1)
+            : Buffer.from('fake mp3 audio bytes')
+        );
       });
     });
     server.listen(0, () => resolve(server));
@@ -98,7 +103,60 @@ async function main() {
     assert.strictEqual(result.voiceover.url, undefined);
 
     const persisted = await jobStore.getJob(job.id);
-    assert.ok(persisted.voiceover.url && persisted.voiceover.url.startsWith('data:audio/'));
+    // The audio is stored OUTSIDE the job record (video-storage.js) — see
+    // the "stays safely under the Redis/Upstash payload limit" test below
+    // for why. No BLOB_READ_WRITE_TOKEN is set in this test process, so
+    // this exercises the local-file fallback.
+    assert.ok(persisted.voiceover.url && persisted.voiceover.url.startsWith('/generated/voiceover-'));
+    assert.ok(persisted.voiceover.url.endsWith('.mp3'));
+  });
+
+  await test('a real-length voice-over keeps the persisted job record safely under the Upstash 10 MB request limit', async () => {
+    // Reproduces the exact real production failure this fix addresses: a
+    // ~12,800-character script (this app's own real 15-20 minute target
+    // length) split into several TTS chunks (MAX_TTS_INPUT_LENGTH = 4096),
+    // each chunk here simulated as 3 MB of audio — several times larger
+    // than OpenAI's real gpt-4o-mini-tts output for a ~4000-character chunk,
+    // chosen deliberately so the combined audio (well over 10 MB) WOULD have
+    // blown the Upstash "ERR max request size exceeded (10485760 bytes)"
+    // limit had it still been embedded as a base64 data: URI in the job
+    // record — the real error seen in production logs.
+    const LONG_SCRIPT = Array(55).fill(REAL_SCRIPT).join(' '); // ~12,800 characters
+    const job = await jobStore.createJob();
+    await jobStore.updateJob(job.id, { script: LONG_SCRIPT });
+
+    mockRequestCount = 0;
+    mockAudioBytesPerChunk = 3 * 1024 * 1024;
+    const bytesPerChunkUsed = mockAudioBytesPerChunk;
+    let result;
+    try {
+      result = JSON.parse(await app.executeTool('generateVoiceover', job.id, {}));
+    } finally {
+      mockAudioBytesPerChunk = 0;
+    }
+
+    assert.ok(mockRequestCount >= 3, `expected multiple TTS chunks for a ~12,700 character script, got ${mockRequestCount}`);
+    assert.strictEqual(result.voiceover.status, 'completed', JSON.stringify(result));
+
+    const totalSynthesizedAudioBytes = mockRequestCount * bytesPerChunkUsed;
+    // Sanity-check the scenario itself is a real stress test, not a trivial one.
+    assert.ok(
+      totalSynthesizedAudioBytes > 10 * 1024 * 1024,
+      'test setup: the simulated audio must itself exceed the 10 MB Upstash limit for this to be a meaningful regression test'
+    );
+
+    const persisted = await jobStore.getJob(job.id);
+    assert.ok(persisted.voiceover.url.startsWith('/generated/voiceover-'), 'must reference stored audio, never embed it');
+
+    const persistedJobBytes = Buffer.byteLength(JSON.stringify(persisted), 'utf8');
+    const UPSTASH_MAX_REQUEST_SIZE_BYTES = 10 * 1024 * 1024;
+    assert.ok(
+      persistedJobBytes < UPSTASH_MAX_REQUEST_SIZE_BYTES,
+      `persisted job record is ${persistedJobBytes} bytes — must stay safely under Upstash's ${UPSTASH_MAX_REQUEST_SIZE_BYTES}-byte request limit`
+    );
+    // Not just "under the limit" — actually small, proving the audio really
+    // was stored outside the record rather than merely fitting by luck.
+    assert.ok(persistedJobBytes < 50 * 1024, `expected a small job record (only a reference URL), got ${persistedJobBytes} bytes`);
   });
 
   await test('generateVoiceover sets voiceStyle and uses the matching OpenAI voice in the same call', async () => {

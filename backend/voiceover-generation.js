@@ -5,6 +5,7 @@
 // stage/confirmation gates in server.js and job-store.js are untouched.
 
 const OpenAI = require('openai');
+const videoStorage = require('./video-storage');
 
 // gpt-4o-mini-tts is OpenAI's current general-purpose TTS model (verified
 // against the OpenAI API docs/SDK type definitions at integration time).
@@ -83,11 +84,17 @@ function chunkScript(script, maxLength) {
   return chunks.filter((chunk) => chunk.length > 0);
 }
 
-// Synthesizes the full script into one MP3 audio file, returning it as a
-// data URI. Only ever marks the result 'completed' when OpenAI actually
-// returned audio data for every chunk; any failure is recorded as 'failed'
-// with an error message, never a fabricated URL.
-async function generateVoiceover({ script, voiceStyle }) {
+// Synthesizes the full script into one MP3 audio file, storing it OUTSIDE
+// the job record (video-storage.js — Vercel Blob in production, a local
+// file in dev/tests) and returning only that short reference URL. A real
+// 15-20 minute narration track's audio easily runs to several MB; embedding
+// that directly as a base64 data: URI in the job record risks exceeding
+// Redis/Upstash's per-request payload limit (see job-store.js's comment),
+// silently discarding an already-generated, already-paid-for result. Only
+// ever marks the result 'completed' when OpenAI actually returned audio
+// data for every chunk and it was stored successfully; any failure is
+// recorded as 'failed' with an error message, never a fabricated URL.
+async function generateVoiceover({ script, voiceStyle, jobId }) {
   const client = getClient();
   const voice = resolveVoice(voiceStyle);
   const chunks = chunkScript(script, MAX_TTS_INPUT_LENGTH);
@@ -115,8 +122,10 @@ async function generateVoiceover({ script, voiceStyle }) {
       throw new Error('OpenAI did not return audio data.');
     }
 
+    const url = await videoStorage.storeAudioFile(audioBuffer, jobId);
+
     return {
-      url: `data:audio/mpeg;base64,${audioBuffer.toString('base64')}`,
+      url,
       status: 'completed',
       voice,
       voiceStyle: voiceStyle || '',

@@ -1,20 +1,24 @@
-// Stores a real video file's bytes OUTSIDE the job record itself, returning
-// only a lightweight reference — a real URL. Used for two kinds of video:
-// the assembled final MP4 (produced by backend/video-assembly.js, for
-// job.finalVideo.url) and, since Runway's own download links expire (see
-// storeSceneClip below), each scene's individual clip too
-// (job.videoGeneration.clips[i].url).
+// Stores a real media file's bytes OUTSIDE the job record itself, returning
+// only a lightweight reference — a real URL. Used for the assembled final
+// MP4 (produced by backend/video-assembly.js, for job.finalVideo.url),
+// since Runway's own download links expire (see storeSceneClip below), each
+// scene's individual clip too (job.videoGeneration.clips[i].url), and the
+// generated voice-over audio (job.voiceover.url, produced by
+// backend/voiceover-generation.js).
 //
-// job.images[].url and job.voiceover.url already embed their real media
-// directly as base64 data: URIs, which works because a single generated
-// image or voice-over track is realistically hundreds of KB. A video clip,
-// and especially an assembled multi-scene final video, is a different order
-// of magnitude — and Redis/Upstash's REST API enforces a maximum payload
-// size per request (see job-store.js's per-job-key comment for the exact
-// failure mode this caused before: an oversized write throws and silently
-// discards an already-completed, already-paid-for result). Storing video
-// outside the job record entirely, and only its URL inside, keeps every job
-// read/write small and bounded regardless of how large the video is.
+// job.images[].url still embeds its real media directly as a base64 data:
+// URI, which works because a single generated image is realistically
+// hundreds of KB. Voice-over audio and video are a different order of
+// magnitude — a real 15-20 minute narration track's base64 encoding alone
+// can run to several MB, and Redis/Upstash's REST API enforces a maximum
+// payload size per request (see job-store.js's per-job-key comment for the
+// exact failure mode this caused before: an oversized write throws and
+// silently discards an already-completed, already-paid-for result — this is
+// exactly what happened to a real voice-over generation before this file's
+// storage was routed through here instead of an inline data: URI). Storing
+// this media outside the job record entirely, and only its URL inside,
+// keeps every job read/write small and bounded regardless of how large the
+// underlying file is.
 //
 // - Production (or any environment with BLOB_READ_WRITE_TOKEN set — Vercel
 //   provisions this automatically once a Blob store is connected to the
@@ -48,22 +52,22 @@ function hasBlobToken() {
 // (Vercel Blob vs. local-file fallback) without making a real network call
 // to Vercel Blob. Production code never passes it; the real `put` is always
 // used whenever BLOB_READ_WRITE_TOKEN is actually configured.
-async function storeMediaFile(buffer, filenamePrefix, { putBlob } = {}) {
+async function storeMediaFile(buffer, filenamePrefix, { putBlob, extension = 'mp4', contentType = 'video/mp4' } = {}) {
   if (!Buffer.isBuffer(buffer) || buffer.length === 0) {
-    throw new Error('storeMediaFile requires a non-empty video buffer.');
+    throw new Error('storeMediaFile requires a non-empty media buffer.');
   }
 
   // Random, not sequential/content-derived: two stores for the same
   // job/scene (e.g. a retry after a failed one, or recovering an expired
   // Runway link) must never collide on the same filename while an older
   // upload might still be referenced elsewhere.
-  const filename = `${filenamePrefix}-${crypto.randomBytes(8).toString('hex')}.mp4`;
+  const filename = `${filenamePrefix}-${crypto.randomBytes(8).toString('hex')}.${extension}`;
 
   if (hasBlobToken()) {
     const put = putBlob || require('@vercel/blob').put;
     const blob = await put(filename, buffer, {
       access: 'public',
-      contentType: 'video/mp4',
+      contentType,
       addRandomSuffix: false,
       multipart: true,
     });
@@ -90,4 +94,13 @@ async function storeSceneClip(buffer, jobId, sceneIndex, options) {
   return storeMediaFile(buffer, `scene-clip-${jobId}-${sceneIndex}`, options);
 }
 
-module.exports = { storeFinalVideo, storeSceneClip, hasBlobToken, GENERATED_DIR };
+// Stores the generated voice-over's real MP3 bytes for one job. See this
+// module's own top comment for why job.voiceover.url can no longer safely
+// embed the audio directly as a data: URI once the script is long enough
+// (this app targets 15-20 minute videos) to push the base64-encoded track
+// past Redis/Upstash's per-request payload limit.
+async function storeAudioFile(buffer, jobId, options) {
+  return storeMediaFile(buffer, `voiceover-${jobId}`, { ...options, extension: 'mp3', contentType: 'audio/mpeg' });
+}
+
+module.exports = { storeFinalVideo, storeSceneClip, storeAudioFile, hasBlobToken, GENERATED_DIR };
