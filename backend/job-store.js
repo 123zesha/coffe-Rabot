@@ -91,6 +91,7 @@ const JOB_FIELDS = [
   'videoGeneration',
   'finalVideo',
   'simpleStoryRender',
+  'videoEditSettings',
   'referenceVideoUrl',
   'referenceVideoNotes',
   'referenceVideoAnalysis',
@@ -380,6 +381,12 @@ function createDefaultJob(id) {
       musicUsed: null,
       resolutionUsed: null,
       videoModeUsed: null,
+      // Records the exact (normalized) videoEditSettings that produced THIS
+      // assembled video — same "is the cached result still accurate" role
+      // as subtitlesUsed/musicUsed/resolutionUsed/videoModeUsed above, for
+      // the videoEditSettings field below. Simple Story Video mode only;
+      // the cinematic pipeline never sets this to anything but null.
+      editSettingsUsed: null,
     },
     // Durable, resumable progress for Simple Story Video mode's section-by-
     // section rendering (see backend/simple-story-video.js's
@@ -412,7 +419,71 @@ function createDefaultJob(id) {
       sections: [],
       audioUrlSnapshot: null,
       subtitlesContentSnapshot: null,
+      // Records the exact (normalized, JSON-serialized) videoEditSettings
+      // this progress was rendered with — same staleness role as
+      // audioUrlSnapshot/subtitlesContentSnapshot: a real edit (background
+      // color, subtitle appearance, voice speed/volume, etc. — see
+      // videoEditSettings below) changes every section's own rendered
+      // pixels/audio, so it must invalidate previously-rendered sections
+      // exactly like a fresh voice-over or changed subtitles does. Not
+      // writable by the conversational agent — only
+      // continueSimpleStoryVideoAssembly itself populates this.
+      editSettingsSnapshot: null,
       error: null,
+    },
+    // Optional, purely LOCAL-ffmpeg presentation/audio-processing overrides
+    // for Simple Story Video mode's own rendering (see
+    // backend/simple-story-video.js's continueSimpleStoryVideoAssembly and
+    // normalizeVideoEditSettings). Lets the user request ONE targeted
+    // visual/audio change through chat after a video already exists — e.g.
+    // "make the background one solid navy color" or "slow the voice-over
+    // down 10%" — without regenerating the script, voice-over, subtitles,
+    // images, or thumbnail, and without any paid API call: background/text/
+    // subtitle-appearance edits only change how the existing narration/
+    // captions are burned into the video, and voice speed/volume are
+    // applied to the ALREADY-generated voice-over audio via local ffmpeg
+    // filters, never a new text-to-speech call.
+    // - backgroundColor: hex 'RRGGBB' (no '#'), or null (default) to keep
+    //   the existing rotating per-section color palette.
+    // - storyPosition: 'top' | 'center' (default) | 'bottom' — the large
+    //   on-screen story text only; the small caption line always stays at
+    //   the bottom, standard subtitle placement.
+    // - fontWeight: 'bold' | 'regular', or null (default) to keep the
+    //   existing look (story text bold, caption text regular) — the only
+    //   two weights this app's bundled font actually ships (see
+    //   simple-story-video.js's FONT_FAMILY comment); a different font
+    //   FAMILY would require bundling a new font file, which isn't
+    //   supported here.
+    // - subtitleFontScale: a multiplier (default 1) applied to BOTH the
+    //   story and caption text's built-in font sizes.
+    // - subtitleColor: hex 'RRGGBB' for both the story and caption text, or
+    //   null (default) for white.
+    // - subtitleTimingOffsetMs: a fixed millisecond shift (default 0)
+    //   applied to every subtitle cue's timing, for a pure resync without
+    //   touching the audio at all.
+    // - voiceSpeed: a playback-speed multiplier (default 1, clamped to
+    //   ffmpeg's own atempo range [0.5, 2.0]) applied to the existing
+    //   voice-over audio locally; subtitle cue timestamps are rescaled by
+    //   the same factor so on-screen text stays in sync.
+    // - voiceVolumeDb: a decibel gain/cut (default 0) applied to the
+    //   existing voice-over audio locally.
+    // Every field defaults to "use the existing built-in behavior" so any
+    // job that never touches this renders exactly as before this feature
+    // existed. Writable by the conversational agent via the dedicated
+    // updateVideoEditSettings tool (server.js) — NOT the generic
+    // updateVideoJob field-setter — since these values are validated and
+    // clamped to safe ranges there rather than accepted as arbitrary input.
+    // A general capability of Simple Story Video mode, not tied to any one
+    // job: every job gets this same field with these same defaults.
+    videoEditSettings: {
+      backgroundColor: null,
+      storyPosition: null,
+      fontWeight: null,
+      subtitleFontScale: 1,
+      subtitleColor: null,
+      subtitleTimingOffsetMs: 0,
+      voiceSpeed: 1,
+      voiceVolumeDb: 0,
     },
     // Optional "Reference Video / Inspiration Mode" input: a YouTube URL the
     // user wants used only as high-level storytelling inspiration (pacing,

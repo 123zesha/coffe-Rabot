@@ -181,6 +181,19 @@ async function main() {
   const baseUrl = `http://localhost:${server.address().port}`;
   const workDir = fs.mkdtempSync(path.join(os.tmpdir(), 'test-simple-story-mode-'));
 
+  // voiceover-generation.js caches its OpenAI client at module load (see
+  // its own getClient()), binding it to whatever OPENAI_BASE_URL was set
+  // the FIRST time any test actually calls generateVoiceover — a second,
+  // later mock server on a different port would be silently ignored (the
+  // cached client keeps talking to the first one). So every test in this
+  // file that needs a real (mocked, zero-cost) generateVoiceover success
+  // shares this ONE mock server/env-var setup for the file's whole
+  // lifetime, mirroring test-generate-voiceover-tool.js's own top-level
+  // mock server.
+  const mockOpenAiServer = await startMockOpenAiTts();
+  process.env.OPENAI_API_KEY = 'test-key';
+  process.env.OPENAI_BASE_URL = `http://localhost:${mockOpenAiServer.address().port}/v1`;
+
   await test('a new job defaults to videoMode "cinematic" (existing behavior fully preserved)', async () => {
     const job = await jobStore.createJob();
     assert.strictEqual(job.videoMode, 'cinematic');
@@ -498,32 +511,13 @@ async function main() {
     // generateVoiceover only resets simpleStoryRender once the voice-over
     // actually completes, so this needs a real (mocked, zero-cost) success
     // — not just a call that immediately refuses for lack of an API key.
-    const mockOpenAiServer = await startMockOpenAiTts();
-    const originalOpenAiKey = process.env.OPENAI_API_KEY;
-    const originalOpenAiBaseUrl = process.env.OPENAI_BASE_URL;
-    process.env.OPENAI_API_KEY = 'test-key';
-    process.env.OPENAI_BASE_URL = `http://localhost:${mockOpenAiServer.address().port}/v1`;
+    // Uses the shared mock OpenAI server set up at the top of main().
+    const result = JSON.parse(await app.executeTool('generateVoiceover', job.id, {}));
+    assert.strictEqual(result.error, undefined, `expected generateVoiceover to succeed, got: ${JSON.stringify(result)}`);
 
-    try {
-      const result = JSON.parse(await app.executeTool('generateVoiceover', job.id, {}));
-      assert.strictEqual(result.error, undefined, `expected generateVoiceover to succeed, got: ${JSON.stringify(result)}`);
-
-      const persisted = await jobStore.getJob(job.id);
-      assert.strictEqual(persisted.simpleStoryRender.status, 'not_started', 'stale in-progress render state must be reset by a fresh voice-over');
-      assert.strictEqual(persisted.simpleStoryRender.sections.length, 0);
-    } finally {
-      if (originalOpenAiKey === undefined) {
-        delete process.env.OPENAI_API_KEY;
-      } else {
-        process.env.OPENAI_API_KEY = originalOpenAiKey;
-      }
-      if (originalOpenAiBaseUrl === undefined) {
-        delete process.env.OPENAI_BASE_URL;
-      } else {
-        process.env.OPENAI_BASE_URL = originalOpenAiBaseUrl;
-      }
-      await new Promise((resolve) => mockOpenAiServer.close(resolve));
-    }
+    const persisted = await jobStore.getJob(job.id);
+    assert.strictEqual(persisted.simpleStoryRender.status, 'not_started', 'stale in-progress render state must be reset by a fresh voice-over');
+    assert.strictEqual(persisted.simpleStoryRender.sections.length, 0);
   });
 
   await test('switching videoMode away from "simple-story" after a final video exists correctly invalidates it', async () => {
@@ -558,7 +552,139 @@ async function main() {
     fs.rmSync(realPath, { force: true });
   });
 
+  // --- Selective video editing (updateVideoEditSettings) ---
+
+  await test('updateVideoEditSettings refuses for a "cinematic" job', async () => {
+    const job = await jobStore.createJob();
+    await jobStore.updateJob(job.id, { videoMode: 'cinematic' });
+
+    const result = JSON.parse(await app.executeTool('updateVideoEditSettings', job.id, { backgroundColor: '112233' }));
+    assert.ok(/cinematic/i.test(result.error), `expected a clear cinematic-mode refusal, got: ${JSON.stringify(result)}`);
+
+    const persisted = await jobStore.getJob(job.id);
+    assert.strictEqual(persisted.videoEditSettings.backgroundColor, null, 'a refused call must never partially apply');
+  });
+
+  await test('updateVideoEditSettings validates, normalizes, and persists only the fields provided', async () => {
+    const job = await jobStore.createJob();
+    await jobStore.updateJob(job.id, { videoMode: 'simple-story' });
+
+    const result = JSON.parse(
+      await app.executeTool('updateVideoEditSettings', job.id, {
+        backgroundColor: '1A2B3C',
+        voiceSpeed: 1.5,
+      })
+    );
+    assert.strictEqual(result.error, undefined, JSON.stringify(result));
+    assert.strictEqual(result.videoEditSettings.backgroundColor, '1a2b3c');
+    assert.strictEqual(result.videoEditSettings.voiceSpeed, 1.5);
+    // Untouched fields keep their existing (default) values.
+    assert.strictEqual(result.videoEditSettings.subtitleFontScale, 1);
+
+    const persisted = await jobStore.getJob(job.id);
+    assert.strictEqual(persisted.videoEditSettings.backgroundColor, '1a2b3c');
+    assert.strictEqual(persisted.videoEditSettings.voiceSpeed, 1.5);
+  });
+
+  await test('updateVideoEditSettings refuses an invalid hex color with a clear, actionable error and changes nothing', async () => {
+    const job = await jobStore.createJob();
+    await jobStore.updateJob(job.id, { videoMode: 'simple-story' });
+
+    const result = JSON.parse(await app.executeTool('updateVideoEditSettings', job.id, { backgroundColor: 'sky blue' }));
+    assert.ok(/hex/i.test(result.error), `expected a hex-format error, got: ${JSON.stringify(result)}`);
+
+    const persisted = await jobStore.getJob(job.id);
+    assert.strictEqual(persisted.videoEditSettings.backgroundColor, null);
+  });
+
+  await test('updateVideoEditSettings resets a field back to its default via the "default" sentinel', async () => {
+    const job = await jobStore.createJob();
+    await jobStore.updateJob(job.id, { videoMode: 'simple-story', videoEditSettings: { ...(await jobStore.getJob(job.id)).videoEditSettings, backgroundColor: 'abcdef' } });
+
+    const result = JSON.parse(await app.executeTool('updateVideoEditSettings', job.id, { backgroundColor: 'default' }));
+    assert.strictEqual(result.error, undefined, JSON.stringify(result));
+    assert.strictEqual(result.videoEditSettings.backgroundColor, null);
+  });
+
+  await test('an edit setting change forces a real reassembly; an unchanged one stays a safe no-op', async () => {
+    const job = await jobStore.createJob();
+    const voiceoverUrl = await makeFixtureVoiceoverDataUri(workDir);
+
+    await jobStore.updateJob(job.id, {
+      videoMode: 'simple-story',
+      script: LONG_ENOUGH_SCRIPT + ' '.repeat(200),
+      voiceover: { url: voiceoverUrl, status: 'completed', voice: 'alloy', voiceStyle: 'neutral-narrator' },
+      subtitles: {
+        status: 'completed',
+        format: 'srt',
+        content: FIXTURE_SRT,
+        error: null,
+        generatedFromVoiceoverUrl: voiceoverUrl,
+      },
+    });
+
+    const first = JSON.parse(await app.executeTool('assembleFinalVideo', job.id, {}));
+    assert.strictEqual(first.finalVideo.status, 'completed', JSON.stringify(first));
+    // job-store.js's no-Redis fallback returns the SAME shared, mutable job
+    // object from every getJob call and mutates it in place on update — so
+    // a value that must survive a LATER mutation (to compare against) has
+    // to be captured as its own primitive right away, not read later off a
+    // held object reference (which would silently reflect the later state).
+    const firstUrl = (await jobStore.getJob(job.id)).finalVideo.url;
+    const firstPath = path.join(require('./video-storage').GENERATED_DIR, firstUrl.slice('/generated/'.length));
+
+    // Unchanged: calling assembleFinalVideo again must be a safe no-op
+    // (isFinalVideoStillAccurate returns true), same url.
+    const again = JSON.parse(await app.executeTool('assembleFinalVideo', job.id, {}));
+    const againUrl = (await jobStore.getJob(job.id)).finalVideo.url;
+    assert.strictEqual(again.finalVideo.status, 'completed');
+    assert.strictEqual(againUrl, firstUrl, 'no edit settings changed — must not reassemble');
+
+    // Now change one edit setting — the next assembleFinalVideo call must
+    // for real reassemble (a genuinely different url), never keep serving
+    // the video built before the edit.
+    const editResult = JSON.parse(await app.executeTool('updateVideoEditSettings', job.id, { backgroundColor: '336699' }));
+    assert.strictEqual(editResult.error, undefined, JSON.stringify(editResult));
+
+    const second = JSON.parse(await app.executeTool('assembleFinalVideo', job.id, {}));
+    assert.strictEqual(second.finalVideo.status, 'completed', JSON.stringify(second));
+    const afterSecond = await jobStore.getJob(job.id);
+    const secondUrl = afterSecond.finalVideo.url;
+    assert.notStrictEqual(secondUrl, firstUrl, 'an edit settings change must force a real reassembly');
+    assert.deepStrictEqual(
+      afterSecond.finalVideo.editSettingsUsed,
+      require('./simple-story-video').normalizeVideoEditSettings({ backgroundColor: '336699' })
+    );
+
+    const secondPath = path.join(require('./video-storage').GENERATED_DIR, secondUrl.slice('/generated/'.length));
+    fs.rmSync(firstPath, { force: true });
+    fs.rmSync(secondPath, { force: true });
+  });
+
+  await test('a fresh voice-over preserves videoEditSettings (unlike simpleStoryRender/finalVideo, which reset)', async () => {
+    const job = await jobStore.createJob();
+    await jobStore.updateJob(job.id, {
+      videoMode: 'simple-story',
+      script: LONG_ENOUGH_SCRIPT + ' She always came home before sunset to tell her family everything she had seen.',
+      voiceStyle: 'neutral-narrator',
+      videoEditSettings: { ...(await jobStore.getJob(job.id)).videoEditSettings, backgroundColor: 'aabbcc', voiceSpeed: 1.2 },
+    });
+
+    // Uses the shared mock OpenAI server set up at the top of main().
+    const result = JSON.parse(await app.executeTool('generateVoiceover', job.id, {}));
+    assert.strictEqual(result.error, undefined, JSON.stringify(result));
+
+    const persisted = await jobStore.getJob(job.id);
+    assert.strictEqual(persisted.videoEditSettings.backgroundColor, 'aabbcc');
+    assert.strictEqual(persisted.videoEditSettings.voiceSpeed, 1.2);
+    // simpleStoryRender still resets, as proven by the earlier test —
+    // this only proves videoEditSettings (a standing style/audio
+    // preference, not narration-timing-dependent cache) is untouched.
+    assert.strictEqual(persisted.simpleStoryRender.status, 'not_started');
+  });
+
   server.close();
+  await new Promise((resolve) => mockOpenAiServer.close(resolve));
   fs.rmSync(workDir, { recursive: true, force: true });
 
   if (originalJobsFile !== null) {

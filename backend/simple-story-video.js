@@ -107,6 +107,135 @@ function backgroundColorForSection(sectionIndex) {
   return SECTION_BACKGROUND_COLORS[sectionIndex % SECTION_BACKGROUND_COLORS.length];
 }
 
+// --- Selective, local-only video editing (videoEditSettings) ---
+//
+// Lets a user request ONE targeted visual/audio change after a video
+// already exists — "make the background navy", "slow the voice-over down",
+// "shift the captions earlier" — without regenerating the script, voice-
+// over, subtitles, images, or thumbnail, and without any paid API call.
+// See job-store.js's videoEditSettings field comment for the full field
+// list and defaults; everything below only ever reads the NORMALIZED shape
+// normalizeVideoEditSettings produces, never raw/unvalidated agent input.
+const HEX_COLOR_RE = /^[0-9a-fA-F]{6}$/;
+const VALID_STORY_POSITIONS = ['top', 'center', 'bottom'];
+const VALID_FONT_WEIGHTS = ['regular', 'bold'];
+// ffmpeg's atempo filter only accepts a single-instance range of
+// [0.5, 2.0] — outside that it must be chained across multiple atempo
+// calls, which this app deliberately never needs by clamping here instead.
+const VOICE_SPEED_MIN = 0.5;
+const VOICE_SPEED_MAX = 2.0;
+const VOICE_VOLUME_DB_MIN = -30;
+const VOICE_VOLUME_DB_MAX = 30;
+const SUBTITLE_FONT_SCALE_MIN = 0.5;
+const SUBTITLE_FONT_SCALE_MAX = 2.0;
+const SUBTITLE_TIMING_OFFSET_MS_MIN = -10000;
+const SUBTITLE_TIMING_OFFSET_MS_MAX = 10000;
+
+function clampNumber(value, min, max, fallback, isInteger) {
+  const num = Number(value);
+  if (!Number.isFinite(num)) {
+    return fallback;
+  }
+  const clamped = Math.min(max, Math.max(min, num));
+  return isInteger ? Math.round(clamped) : clamped;
+}
+
+// Turns arbitrary (possibly missing/invalid) edit-setting input into a
+// canonical, safe-to-use shape — every field either a validated value or
+// this feature's own "use the existing built-in default" value (never
+// null for the numeric fields, so callers can use them directly in ffmpeg
+// filter strings/ASS style rows with no further checking). Called on every
+// continueSimpleStoryVideoAssembly invocation, and the result is what gets
+// JSON-serialized into the render progress ledger's editSettingsSnapshot —
+// so this must be a pure function of its input (same input, same output)
+// for that staleness check to mean anything.
+function normalizeVideoEditSettings(raw) {
+  const input = raw && typeof raw === 'object' ? raw : {};
+  return {
+    backgroundColor: HEX_COLOR_RE.test(input.backgroundColor || '') ? input.backgroundColor.toLowerCase() : null,
+    storyPosition: VALID_STORY_POSITIONS.includes(input.storyPosition) ? input.storyPosition : null,
+    fontWeight: VALID_FONT_WEIGHTS.includes(input.fontWeight) ? input.fontWeight : null,
+    subtitleFontScale: clampNumber(input.subtitleFontScale, SUBTITLE_FONT_SCALE_MIN, SUBTITLE_FONT_SCALE_MAX, 1),
+    subtitleColor: HEX_COLOR_RE.test(input.subtitleColor || '') ? input.subtitleColor.toLowerCase() : null,
+    subtitleTimingOffsetMs: clampNumber(
+      input.subtitleTimingOffsetMs,
+      SUBTITLE_TIMING_OFFSET_MS_MIN,
+      SUBTITLE_TIMING_OFFSET_MS_MAX,
+      0,
+      true
+    ),
+    voiceSpeed: clampNumber(input.voiceSpeed, VOICE_SPEED_MIN, VOICE_SPEED_MAX, 1),
+    voiceVolumeDb: clampNumber(input.voiceVolumeDb, VOICE_VOLUME_DB_MIN, VOICE_VOLUME_DB_MAX, 0),
+  };
+}
+
+// Converts a plain 'RRGGBB' hex string into ASS's own `&HAABBGGRR` color
+// format (alpha 00 = fully opaque here, matching every hardcoded color
+// buildAssScript already used before this feature existed). Falls back to
+// opaque white for anything that isn't a real 6-digit hex string, so a bad
+// value here can never break the ffmpeg ass= filter.
+function assColorFromHex(hex) {
+  const clean = HEX_COLOR_RE.test(hex || '') ? hex : 'ffffff';
+  const rr = clean.slice(0, 2);
+  const gg = clean.slice(2, 4);
+  const bb = clean.slice(4, 6);
+  return `&H00${bb}${gg}${rr}`.toUpperCase();
+}
+
+// Rescales/shifts real transcribed cue timestamps to match a LOCALLY sped-
+// up/slowed-down copy of the voice-over audio (see prepareEffectiveAudio) —
+// never the audio's own real content, which is never re-transcribed just
+// for a speed change. voiceSpeed > 1 plays the audio faster (shorter
+// duration), so every cue's timestamp is divided by the same factor to
+// land at the same relative moment in the new, shorter timeline;
+// subtitleTimingOffsetMs then applies a further fixed shift for a pure
+// resync, independent of any speed change. Returns the SAME array
+// reference when neither setting differs from its default, so a job with
+// no voice/timing edits pays zero extra allocation. Never returns cues with
+// end <= start (a large enough negative offset could otherwise push a cue
+// entirely before zero) — those are dropped rather than shown backwards.
+function applyCueTimingAdjustments(cues, editSettings) {
+  const speed = editSettings && editSettings.voiceSpeed > 0 ? editSettings.voiceSpeed : 1;
+  const offsetSeconds = editSettings && Number.isFinite(editSettings.subtitleTimingOffsetMs) ? editSettings.subtitleTimingOffsetMs / 1000 : 0;
+  if (speed === 1 && offsetSeconds === 0) {
+    return cues;
+  }
+
+  return cues
+    .map((cue) => ({
+      start: Math.max(0, cue.start / speed + offsetSeconds),
+      end: Math.max(0, cue.end / speed + offsetSeconds),
+      text: cue.text,
+    }))
+    .filter((cue) => cue.end > cue.start);
+}
+
+// Applies voiceSpeed/voiceVolumeDb to the job's ALREADY-generated voice-
+// over audio, entirely locally via ffmpeg's atempo/volume filters — never a
+// new text-to-speech call, per this feature's own "never regenerate a
+// paid-for asset just to make one targeted edit" rule. Returns sourcePath
+// UNCHANGED (no ffmpeg call at all) when both settings are at their
+// defaults, so a job with no voice edits never pays this extra cost.
+async function prepareEffectiveAudio(sourcePath, editSettings, workDir) {
+  const speed = editSettings.voiceSpeed;
+  const volumeDb = editSettings.voiceVolumeDb;
+  if (speed === 1 && volumeDb === 0) {
+    return sourcePath;
+  }
+
+  const filters = [];
+  if (speed !== 1) {
+    filters.push(`atempo=${speed}`);
+  }
+  if (volumeDb !== 0) {
+    filters.push(`volume=${volumeDb}dB`);
+  }
+
+  const outPath = path.join(workDir, 'voiceover-audio-edited.m4a');
+  await runFfmpeg(['-y', '-i', sourcePath, '-filter:a', filters.join(','), '-c:a', 'aac', outPath]);
+  return outPath;
+}
+
 // How many section renders (see renderSection below) run at once. Each one
 // spawns its own independent ffmpeg process on its own output file — there
 // is no shared state between them — so they were previously run ONE AT A
@@ -349,7 +478,26 @@ function escapeAssText(text) {
 // (standard caption behavior). Both draw from the exact same real,
 // transcribed cues — never two different sources of truth for the same
 // narration.
-function buildAssScript(cues, audioDuration) {
+// editSettings: an ALREADY-NORMALIZED videoEditSettings shape (see
+// normalizeVideoEditSettings) — omitted/defaulted fields reproduce the
+// exact original hardcoded look byte-for-byte (large bold white centered
+// story text, small regular white bottom caption text), so a job that
+// never touches this feature renders exactly as before it existed. Only
+// storyPosition moves the on-screen story text (top/center/bottom); the
+// caption line always stays at the bottom, standard subtitle placement.
+function buildAssScript(cues, audioDuration, editSettings = {}) {
+  const storyPosition = VALID_STORY_POSITIONS.includes(editSettings.storyPosition) ? editSettings.storyPosition : 'center';
+  const fontWeight = VALID_FONT_WEIGHTS.includes(editSettings.fontWeight) ? editSettings.fontWeight : null;
+  const subtitleFontScale = editSettings.subtitleFontScale > 0 ? editSettings.subtitleFontScale : 1;
+  const textColorAss = assColorFromHex(editSettings.subtitleColor);
+
+  const storyBold = fontWeight === 'regular' ? 0 : 1;
+  const captionBold = fontWeight === 'bold' ? 1 : 0;
+  const storyAlignment = storyPosition === 'top' ? 8 : storyPosition === 'bottom' ? 2 : 5;
+  const storyMarginV = storyPosition === 'center' ? 0 : 60;
+  const storyFontSize = Math.round(64 * subtitleFontScale);
+  const captionFontSize = Math.round(30 * subtitleFontScale);
+
   const header =
     '[Script Info]\n' +
     'ScriptType: v4.00+\n' +
@@ -361,13 +509,14 @@ function buildAssScript(cues, audioDuration) {
     'Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, ' +
     'Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, ' +
     'Alignment, MarginL, MarginR, MarginV, Encoding\n' +
-    // Story: large, centered (Alignment 5 = middle-center), an opaque box
-    // background (BorderStyle 3) for readability over any background color.
-    `Style: Story,${FONT_FAMILY},64,&H00FFFFFF,&H00FFFFFF,&H00000000,&H99000000,1,0,0,0,100,100,0,0,3,0,4,5,120,120,0,1\n` +
-    // Caption: small, bottom-center (Alignment 2), plain outline (no box)
-    // — the familiar closed-caption look, mirroring what burnInSubtitles
-    // already produces elsewhere in this app.
-    `Style: Caption,${FONT_FAMILY},30,&H00FFFFFF,&H00FFFFFF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,2,0,2,40,40,48,1\n\n` +
+    // Story: large, centered by default (Alignment 5 = middle-center; see
+    // storyPosition above), an opaque box background (BorderStyle 3) for
+    // readability over any background color.
+    `Style: Story,${FONT_FAMILY},${storyFontSize},${textColorAss},${textColorAss},&H00000000,&H99000000,${storyBold},0,0,0,100,100,0,0,3,0,4,${storyAlignment},120,120,${storyMarginV},1\n` +
+    // Caption: small, always bottom-center (Alignment 2), plain outline (no
+    // box) — the familiar closed-caption look, mirroring what
+    // burnInSubtitles already produces elsewhere in this app.
+    `Style: Caption,${FONT_FAMILY},${captionFontSize},${textColorAss},${textColorAss},&H00000000,&H00000000,${captionBold},0,0,0,100,100,0,0,1,2,0,2,40,40,48,1\n\n` +
     '[Events]\n' +
     'Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n';
 
@@ -425,16 +574,20 @@ function cuesForSection(cues, section) {
 // the caller extends to cover any real audio duration remaining after the
 // last cue (see assembleSimpleStoryVideo for why this replaces a separate
 // global padding pass).
-async function renderSection(section, sectionIndex, workDir, sectionCues, effectiveDuration) {
+// editSettings: an ALREADY-NORMALIZED videoEditSettings shape (see
+// normalizeVideoEditSettings) — backgroundColor overrides the default
+// rotating per-section palette with ONE fixed color for every section when
+// set; everything else is passed straight through to buildAssScript.
+async function renderSection(section, sectionIndex, workDir, sectionCues, effectiveDuration, editSettings = {}) {
   const duration = Math.max(0.5, effectiveDuration);
   const outPath = path.join(workDir, `section-${sectionIndex}.mp4`);
-  const color = backgroundColorForSection(sectionIndex);
+  const color = editSettings.backgroundColor || backgroundColorForSection(sectionIndex);
   const zoomingIn = sectionIndex % 2 === 0;
   const zoomExpr = zoomingIn ? 'min(zoom+0.0006,1.15)' : 'if(eq(on,0),1.15,max(zoom-0.0006,1.0))';
 
   const fadeDuration = Math.min(SECTION_FADE_SECONDS, duration / 2);
   const assPath = path.join(workDir, `section-${sectionIndex}.ass`);
-  fs.writeFileSync(assPath, buildAssScript(sectionCues, duration), 'utf8');
+  fs.writeFileSync(assPath, buildAssScript(sectionCues, duration, editSettings), 'utf8');
 
   const vf =
     `zoompan=z='${zoomExpr}':d=1:s=${SIMPLE_STORY_WIDTH}x${SIMPLE_STORY_HEIGHT}:fps=${SIMPLE_STORY_FPS},` +
@@ -470,13 +623,14 @@ async function renderSection(section, sectionIndex, workDir, sectionCues, effect
 // whose previous progress was just discarded as stale — see
 // continueSimpleStoryVideoAssembly). Matches job-store.js's own
 // simpleStoryRender default exactly.
-function freshRenderProgress(voiceoverUrl, subtitlesContent) {
+function freshRenderProgress(voiceoverUrl, subtitlesContent, editSettingsSnapshot) {
   return {
     status: 'in_progress',
     totalSections: null,
     sections: [],
     audioUrlSnapshot: voiceoverUrl,
     subtitlesContentSnapshot: subtitlesContent,
+    editSettingsSnapshot: editSettingsSnapshot || null,
     error: null,
   };
 }
@@ -532,6 +686,7 @@ async function continueSimpleStoryVideoAssembly({
   jobId,
   sectionTargetSeconds,
   timeBudgetMs,
+  editSettings: rawEditSettings,
 }) {
   if (!voiceover || voiceover.status !== 'completed' || !voiceover.url) {
     return { status: 'failed', error: 'A completed voice-over is required for Simple Story Video mode.', render: existingRender || null };
@@ -549,19 +704,25 @@ async function continueSimpleStoryVideoAssembly({
     return { status: 'failed', error: 'Subtitles contained no usable cues to build the video from.', render: existingRender || null };
   }
 
-  // A fresh voice-over or a real subtitles change invalidates every
-  // previously-rendered section — their real narration timing no longer
-  // matches. Starting over here (rather than trying to patch/diff the old
-  // progress) is simple and safe: sections are cheap to re-render (a few
-  // seconds each with the ultrafast preset), so there is no real cost to
-  // discarding stale progress outright.
+  const editSettings = normalizeVideoEditSettings(rawEditSettings);
+  const editSettingsSnapshot = JSON.stringify(editSettings);
+
+  // A fresh voice-over, a real subtitles change, OR a changed
+  // videoEditSettings invalidates every previously-rendered section — a
+  // different background color, text style, or voice speed/volume changes
+  // every section's own rendered pixels/audio just as much as a real
+  // narration change does. Starting over here (rather than trying to
+  // patch/diff the old progress) is simple and safe: sections are cheap to
+  // re-render (a few seconds each with the ultrafast preset), so there is
+  // no real cost to discarding stale progress outright.
   const isStale =
     !existingRender ||
     existingRender.audioUrlSnapshot !== voiceover.url ||
-    existingRender.subtitlesContentSnapshot !== subtitlesContent;
+    existingRender.subtitlesContentSnapshot !== subtitlesContent ||
+    (existingRender.editSettingsSnapshot || null) !== editSettingsSnapshot;
 
   const render = isStale
-    ? freshRenderProgress(voiceover.url, subtitlesContent)
+    ? freshRenderProgress(voiceover.url, subtitlesContent, editSettingsSnapshot)
     : { ...existingRender, sections: existingRender.sections.map((section) => ({ ...section })), status: 'in_progress', error: null };
 
   const workDir = fs.mkdtempSync(path.join(os.tmpdir(), 'simple-story-video-'));
@@ -583,11 +744,26 @@ async function continueSimpleStoryVideoAssembly({
 
     const audioPath = path.join(workDir, 'voiceover-audio');
     await fetchAudioToFile(voiceover.url, audioPath);
-    const audioDuration = await getMediaDuration(audioPath);
+    // Applies voiceSpeed/voiceVolumeDb (if set) via local ffmpeg filters —
+    // never a new text-to-speech call. Returns audioPath unchanged when
+    // both are at their defaults, so a job with no voice edits pays no
+    // extra ffmpeg cost here.
+    const effectiveAudioPath = await prepareEffectiveAudio(audioPath, editSettings, workDir);
+    const audioDuration = await getMediaDuration(effectiveAudioPath);
     log(`voice-over audio ready, real duration ${audioDuration.toFixed(1)}s`);
 
+    // Rescales/shifts cue timestamps to match the EFFECTIVE (possibly sped-
+    // up/slowed) audio timeline above — see applyCueTimingAdjustments — so
+    // every downstream computation (section boundaries, per-section text
+    // burn-in) already reflects any voice-speed/timing-offset edit, not
+    // just the final mux.
+    const adjustedCues = applyCueTimingAdjustments(cues, editSettings);
+    if (adjustedCues.length === 0) {
+      throw new Error('Subtitle timing adjustments left no usable cues — check subtitleTimingOffsetMs.');
+    }
+
     const targetSectionSeconds = sectionTargetSeconds > 0 ? sectionTargetSeconds : DEFAULT_SECTION_TARGET_SECONDS;
-    const sections = groupCuesIntoSections(cues, targetSectionSeconds, audioDuration);
+    const sections = groupCuesIntoSections(adjustedCues, targetSectionSeconds, audioDuration);
     render.totalSections = sections.length;
     // Reconciles the persisted per-section progress array to this exact
     // section count/order — a no-op except on the very first call for this
@@ -623,7 +799,14 @@ async function continueSimpleStoryVideoAssembly({
         const effectiveDuration = isLastSection
           ? Math.max(section.end, audioDuration) - section.start
           : section.end - section.start;
-        const outPath = await renderSection(section, sectionIndex, workDir, cuesForSection(cues, section), effectiveDuration);
+        const outPath = await renderSection(
+          section,
+          sectionIndex,
+          workDir,
+          cuesForSection(adjustedCues, section),
+          effectiveDuration,
+          editSettings
+        );
         const buffer = fs.readFileSync(outPath);
         const url = await videoStorage.storeSimpleStorySectionClip(buffer, jobId, sectionIndex);
         render.sections[sectionIndex] = { status: 'completed', url };
@@ -669,7 +852,7 @@ async function continueSimpleStoryVideoAssembly({
       '-i',
       concatenatedPath,
       '-i',
-      audioPath,
+      effectiveAudioPath,
       '-map',
       '0:v',
       '-map',
@@ -770,4 +953,22 @@ module.exports = {
   FONT_REGULAR_PATH,
   FONTS_DIR,
   ffmpegPath,
+  // Selective video editing (videoEditSettings) — exported for server.js's
+  // updateVideoEditSettings tool (validation/normalization) and this
+  // module's own tests.
+  normalizeVideoEditSettings,
+  applyCueTimingAdjustments,
+  prepareEffectiveAudio,
+  assColorFromHex,
+  VOICE_SPEED_MIN,
+  VOICE_SPEED_MAX,
+  VOICE_VOLUME_DB_MIN,
+  VOICE_VOLUME_DB_MAX,
+  SUBTITLE_FONT_SCALE_MIN,
+  SUBTITLE_FONT_SCALE_MAX,
+  SUBTITLE_TIMING_OFFSET_MS_MIN,
+  SUBTITLE_TIMING_OFFSET_MS_MAX,
+  VALID_STORY_POSITIONS,
+  VALID_FONT_WEIGHTS,
+  HEX_COLOR_RE,
 };
