@@ -2,23 +2,24 @@
 // only a lightweight reference — a real URL. Used for the assembled final
 // MP4 (produced by backend/video-assembly.js, for job.finalVideo.url),
 // since Runway's own download links expire (see storeSceneClip below), each
-// scene's individual clip too (job.videoGeneration.clips[i].url), and the
+// scene's individual clip too (job.videoGeneration.clips[i].url), the
 // generated voice-over audio (job.voiceover.url, produced by
-// backend/voiceover-generation.js).
+// backend/voiceover-generation.js), and every generated scene/thumbnail
+// image (job.images[].url, job.youtubePackage.thumbnailUrl, produced by
+// backend/image-generation.js).
 //
-// job.images[].url still embeds its real media directly as a base64 data:
-// URI, which works because a single generated image is realistically
-// hundreds of KB. Voice-over audio and video are a different order of
-// magnitude — a real 15-20 minute narration track's base64 encoding alone
-// can run to several MB, and Redis/Upstash's REST API enforces a maximum
-// payload size per request (see job-store.js's per-job-key comment for the
-// exact failure mode this caused before: an oversized write throws and
-// silently discards an already-completed, already-paid-for result — this is
-// exactly what happened to a real voice-over generation before this file's
-// storage was routed through here instead of an inline data: URI). Storing
+// Embedding any of this media directly as a base64 data: URI in the job
+// record risks Redis/Upstash's REST API maximum payload size per request
+// (see job-store.js's per-job-key comment for the exact failure mode this
+// caused before: an oversized write throws and silently discards an
+// already-completed, already-paid-for result). A single image or a real
+// 15-20 minute voice-over track can individually run to multiple MB, and
+// several scene images in one job add up fast — this is exactly what
+// happened to real voice-over and multi-scene image generations before
+// each was routed through here instead of an inline data: URI. Storing
 // this media outside the job record entirely, and only its URL inside,
-// keeps every job read/write small and bounded regardless of how large the
-// underlying file is.
+// keeps every job read/write small and bounded regardless of how large or
+// how numerous the underlying files are.
 //
 // - Production (or any environment with BLOB_READ_WRITE_TOKEN set — Vercel
 //   provisions this automatically once a Blob store is connected to the
@@ -103,4 +104,14 @@ async function storeAudioFile(buffer, jobId, options) {
   return storeMediaFile(buffer, `voiceover-${jobId}`, { ...options, extension: 'mp3', contentType: 'audio/mpeg' });
 }
 
-module.exports = { storeFinalVideo, storeSceneClip, storeAudioFile, hasBlobToken, GENERATED_DIR };
+// Stores one generated scene/thumbnail image's real PNG bytes for one job.
+// See this module's own top comment for why job.images[].url can no longer
+// safely embed images directly as data: URIs once enough scenes (or one
+// large enough image) push the combined base64 past Redis/Upstash's
+// per-request payload limit — the exact failure a real production job hit
+// generating 8 scene images.
+async function storeImageFile(buffer, jobId, options) {
+  return storeMediaFile(buffer, `image-${jobId}`, { ...options, extension: 'png', contentType: 'image/png' });
+}
+
+module.exports = { storeFinalVideo, storeSceneClip, storeAudioFile, storeImageFile, hasBlobToken, GENERATED_DIR };

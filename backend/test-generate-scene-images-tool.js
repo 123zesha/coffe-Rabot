@@ -34,6 +34,7 @@ const jobStore = require('./job-store');
 let failures = 0;
 let mockOpenAiServer;
 let mockOpenAiRequestCount = 0;
+let mockImageBytesPerCall = 0;
 
 async function test(name, fn) {
   try {
@@ -56,8 +57,12 @@ function startMockOpenAi() {
       mockOpenAiRequestCount++;
       req.on('data', () => {});
       req.on('end', () => {
+        const b64Json =
+          mockImageBytesPerCall > 0
+            ? Buffer.alloc(mockImageBytesPerCall, 1).toString('base64')
+            : 'ZmFrZWltYWdlZGF0YQ==';
         res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ data: [{ b64_json: 'ZmFrZWltYWdlZGF0YQ==' }] }));
+        res.end(JSON.stringify({ data: [{ b64_json: b64Json }] }));
       });
     });
     server.listen(0, () => resolve(server));
@@ -87,7 +92,63 @@ async function main() {
 
     const persisted = await jobStore.getJob(job.id);
     assert.strictEqual(persisted.images.length, 2);
-    assert.ok(persisted.images.every((image) => image.url && image.url.startsWith('data:image/')));
+    // Images are stored OUTSIDE the job record (video-storage.js), same as
+    // voice-over audio — see test-video-storage.js for the payload-size
+    // regression test. No BLOB_READ_WRITE_TOKEN is set here, so this
+    // exercises the local-file fallback.
+    assert.ok(persisted.images.every((image) => image.url && image.url.startsWith('/generated/image-')));
+  });
+
+  await test('8 real-size scene images keep the persisted job record safely under the Upstash 10 MB request limit', async () => {
+    // Reproduces the exact real production failure this fix addresses: a
+    // job generating 8 scene images (this app's own real scene count) each
+    // simulated at 1.5 MB — comparable to a real gpt-image-2 1536x1024
+    // medium-quality PNG — so the combined images (well over 10 MB) WOULD
+    // have blown the Upstash "ERR max request size exceeded (10485760
+    // bytes)" limit had they still been embedded as base64 data: URIs in
+    // the job record — the real error seen in production logs.
+    const job = await jobStore.createJob();
+    const imagePrompts = Array.from({ length: 8 }, (_, i) => `Scene ${i + 1}: a lighthouse at dusk`);
+    await jobStore.updateJob(job.id, {
+      imagePrompts,
+      videoPrompts: imagePrompts.map((_, i) => `Pan across scene ${i + 1}`),
+      characters: ['Mira'],
+    });
+
+    mockOpenAiRequestCount = 0;
+    mockImageBytesPerCall = 1.5 * 1024 * 1024;
+    const bytesPerCallUsed = mockImageBytesPerCall;
+    let result;
+    try {
+      result = JSON.parse(await app.executeTool('generateSceneImages', job.id, {}));
+    } finally {
+      mockImageBytesPerCall = 0;
+    }
+
+    assert.strictEqual(mockOpenAiRequestCount, 8);
+    assert.strictEqual(result.images.length, 8);
+    assert.ok(result.images.every((image) => image.status === 'completed'), JSON.stringify(result));
+
+    const totalSynthesizedImageBytes = mockOpenAiRequestCount * bytesPerCallUsed;
+    // Sanity-check the scenario itself is a real stress test, not a trivial one.
+    assert.ok(
+      totalSynthesizedImageBytes > 10 * 1024 * 1024,
+      'test setup: the simulated images must themselves exceed the 10 MB Upstash limit for this to be a meaningful regression test'
+    );
+
+    const persisted = await jobStore.getJob(job.id);
+    assert.ok(
+      persisted.images.every((image) => image.url.startsWith('/generated/image-')),
+      'must reference stored images, never embed them'
+    );
+
+    const persistedJobBytes = Buffer.byteLength(JSON.stringify(persisted), 'utf8');
+    const UPSTASH_MAX_REQUEST_SIZE_BYTES = 10 * 1024 * 1024;
+    assert.ok(
+      persistedJobBytes < UPSTASH_MAX_REQUEST_SIZE_BYTES,
+      `persisted job record is ${persistedJobBytes} bytes — must stay safely under Upstash's ${UPSTASH_MAX_REQUEST_SIZE_BYTES}-byte request limit`
+    );
+    assert.ok(persistedJobBytes < 50 * 1024, `expected a small job record (only reference URLs), got ${persistedJobBytes} bytes`);
   });
 
   await test('generateSceneImages skips a scene whose image is already completed, never re-charging it', async () => {

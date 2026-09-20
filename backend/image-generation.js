@@ -4,9 +4,12 @@
 // its own REST route, so the conversational agent, its tools, and the
 // stage/confirmation gates in server.js and job-store.js are untouched.
 
+const fs = require('fs');
+const path = require('path');
 const OpenAI = require('openai');
 const { toFile } = require('openai');
 const { OUTPUT_FORMATS, DEFAULT_OUTPUT_FORMAT } = require('./job-store');
+const videoStorage = require('./video-storage');
 
 // gpt-image-2 is OpenAI's current general-purpose image model (verified
 // against the OpenAI API docs/SDK type definitions at integration time).
@@ -96,32 +99,55 @@ function buildPrompt(scenePrompt, characterContext, outputFormat) {
     .join('\n');
 }
 
+// Reads a generated image's real bytes back from its stored url — every
+// shape video-storage.js's storeImageFile can produce: a real https:// URL
+// (Vercel Blob in production), a /generated/... local reference (the
+// no-Blob-token dev/test fallback, read straight from disk), or a legacy
+// base64 data: URI (kept for backward compatibility with images generated
+// before storage moved out of the job record). Returns null for anything
+// else, or for a reference that decodes/downloads to zero bytes.
+async function resolveImageBuffer(url) {
+  if (typeof url !== 'string' || !url) {
+    return null;
+  }
+
+  let buffer;
+  if (url.startsWith('data:')) {
+    const match = /^data:([^;]+);base64,(.*)$/s.exec(url);
+    if (!match) {
+      return null;
+    }
+    buffer = Buffer.from(match[2], 'base64');
+  } else if (url.startsWith('/generated/')) {
+    const filePath = path.join(videoStorage.GENERATED_DIR, url.slice('/generated/'.length));
+    if (!fs.existsSync(filePath)) {
+      return null;
+    }
+    buffer = fs.readFileSync(filePath);
+  } else if (/^https?:\/\//i.test(url)) {
+    const response = await fetch(url);
+    if (!response.ok) {
+      return null;
+    }
+    buffer = Buffer.from(await response.arrayBuffer());
+  } else {
+    return null;
+  }
+
+  return buffer.length > 0 ? buffer : null;
+}
+
 // Finds the most recent successfully generated image in the job so it can
 // be passed back into the API as a reference for the next scene, biasing
 // the model toward keeping the same character appearance across scenes.
-function findReferenceDataUri(existingImages) {
+async function findReferenceImageBuffer(existingImages) {
   if (!Array.isArray(existingImages)) {
     return null;
   }
 
-  const reference = [...existingImages]
-    .reverse()
-    .find((image) => image && image.status === 'completed' && typeof image.url === 'string' && image.url.startsWith('data:'));
+  const reference = [...existingImages].reverse().find((image) => image && image.status === 'completed' && image.url);
 
-  return reference ? reference.url : null;
-}
-
-async function dataUriToFile(dataUri) {
-  const match = /^data:([^;]+);base64,(.*)$/s.exec(dataUri);
-  if (!match) {
-    return null;
-  }
-
-  const [, mimeType, base64] = match;
-  const buffer = Buffer.from(base64, 'base64');
-  const extension = mimeType.split('/')[1] || 'png';
-
-  return toFile(buffer, `reference.${extension}`, { type: mimeType });
+  return reference ? resolveImageBuffer(reference.url) : null;
 }
 
 function describeError(error) {
@@ -131,14 +157,14 @@ function describeError(error) {
   return (error && error.message) || 'Unknown error generating image.';
 }
 
-async function generateSceneImage({ prompt, characterContext, referenceDataUri, outputFormat }) {
+async function generateSceneImage({ prompt, characterContext, referenceImageBuffer, outputFormat, jobId }) {
   const client = getClient();
   const fullPrompt = buildPrompt(prompt, characterContext, outputFormat);
   const size = resolveImageSize(outputFormat);
 
   let response;
-  if (referenceDataUri) {
-    const referenceFile = await dataUriToFile(referenceDataUri);
+  if (referenceImageBuffer) {
+    const referenceFile = await toFile(referenceImageBuffer, 'reference.png', { type: 'image/png' });
     // A single reference image must be passed as-is, not wrapped in an
     // array. The SDK's TypeScript types accept image: Uploadable[], but the
     // real OpenAI API rejects an array with "400 Invalid type for 'image':
@@ -171,7 +197,10 @@ async function generateSceneImage({ prompt, characterContext, referenceDataUri, 
     throw new Error('OpenAI did not return image data.');
   }
 
-  return `data:image/png;base64,${base64}`;
+  const buffer = Buffer.from(base64, 'base64');
+  const url = await videoStorage.storeImageFile(buffer, jobId);
+
+  return { url, buffer };
 }
 
 // Generates one image per entry in `imagePrompts`, reusing any already-
@@ -179,7 +208,7 @@ async function generateSceneImage({ prompt, characterContext, referenceDataUri, 
 // A prompt is only ever marked 'completed' when the API actually returned
 // image data; any failure is recorded as 'failed' with an error message,
 // never a fabricated URL.
-async function generateImagesForPrompts({ imagePrompts, characters, existingImages, outputFormat }) {
+async function generateImagesForPrompts({ imagePrompts, characters, existingImages, outputFormat, jobId }) {
   const resolvedFormat = OUTPUT_FORMATS.includes(outputFormat) ? outputFormat : DEFAULT_OUTPUT_FORMAT;
   const size = resolveImageSize(resolvedFormat);
 
@@ -196,7 +225,7 @@ async function generateImagesForPrompts({ imagePrompts, characters, existingImag
 
   const characterContext = buildCharacterContext(characters);
   const images = [];
-  let referenceDataUri = findReferenceDataUri(existingImages);
+  let referenceImageBuffer = await findReferenceImageBuffer(existingImages);
 
   for (const prompt of imagePrompts) {
     // Only reuse an already-completed image for this exact prompt if it was
@@ -221,9 +250,9 @@ async function generateImagesForPrompts({ imagePrompts, characters, existingImag
     }
 
     try {
-      const url = await generateSceneImage({ prompt, characterContext, referenceDataUri, outputFormat: resolvedFormat });
-      images.push({ prompt, url, status: 'completed', outputFormat: resolvedFormat });
-      referenceDataUri = url;
+      const result = await generateSceneImage({ prompt, characterContext, referenceImageBuffer, outputFormat: resolvedFormat, jobId });
+      images.push({ prompt, url: result.url, status: 'completed', outputFormat: resolvedFormat });
+      referenceImageBuffer = result.buffer;
     } catch (error) {
       console.error(
         'OpenAI image generation error:',
@@ -252,7 +281,7 @@ async function generateImagesForPrompts({ imagePrompts, characters, existingImag
 // any reference-video content — see youtube-package.js's own comment for
 // why. Returns { url, status, error? }, the same shape as one entry of
 // generateImagesForPrompts, and never fabricates a url on failure.
-async function generateThumbnailImage({ thumbnailConcept, thumbnailText }) {
+async function generateThumbnailImage({ thumbnailConcept, thumbnailText, jobId }) {
   const promptParts = [
     'Cinematic, eye-catching YouTube thumbnail image, bold composition, widescreen (16:9) framing, ' +
       'high contrast, vibrant colors.',
@@ -266,8 +295,8 @@ async function generateThumbnailImage({ thumbnailConcept, thumbnailText }) {
   const prompt = promptParts.join('\n');
 
   try {
-    const url = await generateSceneImage({ prompt, characterContext: '', referenceDataUri: null });
-    return { url, status: 'completed', error: null };
+    const result = await generateSceneImage({ prompt, characterContext: '', referenceImageBuffer: null, jobId });
+    return { url: result.url, status: 'completed', error: null };
   } catch (error) {
     console.error(
       'OpenAI thumbnail image generation error:',

@@ -560,6 +560,7 @@ async function runGenerateYoutubePackage(job, jobId, { forceRegenerate } = {}) {
     const thumbnailResult = await imageGeneration.generateThumbnailImage({
       thumbnailConcept: textResult.thumbnailConcept,
       thumbnailText: textResult.thumbnailText,
+      jobId,
     });
     thumbnailUrl = thumbnailResult.status === 'completed' ? thumbnailResult.url : null;
     thumbnailError = thumbnailResult.status === 'failed' ? thumbnailResult.error : null;
@@ -1327,6 +1328,7 @@ async function executeTool(name, jobId, input) {
         characters: job.characters,
         existingImages: job.images,
         outputFormat: job.outputFormat,
+        jobId: job.id,
       });
       const updatedJob = await jobStore.updateJob(jobId, { images });
       return JSON.stringify(updatedJob ? summarizeJobForAgent(updatedJob) : { error: 'job not found' });
@@ -1972,6 +1974,7 @@ app.post('/api/jobs/:id/generate-images', async (req, res) => {
       characters: job.characters,
       existingImages: job.images,
       outputFormat: job.outputFormat,
+      jobId: job.id,
     });
 
     const updatedJob = await jobStore.updateJob(job.id, { images });
