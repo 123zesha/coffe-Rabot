@@ -621,6 +621,14 @@
   // gap the Progress tab's scene-clip viewer had before it was built. Only
   // ever shows a player/download link when finalVideo.status is genuinely
   // 'completed' with a real url — never for 'pending' or 'failed'.
+  //
+  // 'processing' (Simple Story Video mode only — see
+  // continueSimpleStoryVideoAssembly in backend/simple-story-video.js) means
+  // a real render is under way but a long story can need more than one
+  // assembleFinalVideo call to finish; job.simpleStoryRender carries the
+  // real completed/total section counts. This never holds one HTTP request
+  // open waiting for the whole thing — pollSimpleStoryRenderProgress below
+  // drives it forward with its own separate, short POSTs instead.
   function renderFinalVideoCard(job) {
     const finalVideo = job && job.finalVideo && typeof job.finalVideo === 'object' ? job.finalVideo : null;
 
@@ -639,6 +647,18 @@
       finalVideoDownload.href = finalVideo.url;
       finalVideoDownload.hidden = false;
       finalVideoStatus.hidden = true;
+    } else if (finalVideo.status === 'processing') {
+      finalVideoPlayer.hidden = true;
+      finalVideoPlayer.removeAttribute('src');
+      finalVideoDownload.hidden = true;
+      const render = job.simpleStoryRender;
+      const completed = render && Array.isArray(render.sections) ? render.sections.filter((s) => s && s.status === 'completed').length : 0;
+      const total = render && typeof render.totalSections === 'number' ? render.totalSections : null;
+      finalVideoStatus.textContent = total
+        ? `Rendering final video… ${completed}/${total} section(s) done so far. This can take a few minutes for a long story.`
+        : 'Rendering final video…';
+      finalVideoStatus.className = 'generate-status loading';
+      finalVideoStatus.hidden = false;
     } else {
       finalVideoPlayer.hidden = true;
       finalVideoPlayer.removeAttribute('src');
@@ -649,8 +669,41 @@
     }
   }
 
+  // Drives Simple Story Video's resumable render to completion with plain,
+  // separate HTTP calls on a timer — never by looping the conversational
+  // agent purely to advance a mechanical render with nothing left to
+  // reason about (that would cost a real Claude call per step for no
+  // reason). Guarded by simpleStoryPollTimer so a chat-triggered render and
+  // a page reload can never start two overlapping polling loops for the
+  // same job. Stops itself the moment the job's own state is no longer
+  // 'processing' — a network hiccup on one poll is not fatal, the next
+  // scheduled poll (or a manual page refresh) just tries again.
+  let simpleStoryPollTimer = null;
+  const SIMPLE_STORY_POLL_INTERVAL_MS = 4000;
+
+  function pollSimpleStoryRenderProgress(job) {
+    const finalVideo = job && job.finalVideo;
+    if (!jobId || !finalVideo || finalVideo.status !== 'processing' || simpleStoryPollTimer) {
+      return;
+    }
+
+    simpleStoryPollTimer = setTimeout(async () => {
+      simpleStoryPollTimer = null;
+      try {
+        await fetch(`/api/jobs/${jobId}/assemble-video`, { method: 'POST' });
+      } catch (error) {
+        // Ignored — the job's own real, persisted state (checked on the
+        // next poll or the next page load) is the source of truth, not
+        // this fire-and-forget continuation call.
+      }
+      await refreshFinalVideoCard();
+    }, SIMPLE_STORY_POLL_INTERVAL_MS);
+  }
+
   async function refreshFinalVideoCard() {
-    renderFinalVideoCard(await fetchCurrentJob());
+    const job = await fetchCurrentJob();
+    renderFinalVideoCard(job);
+    pollSimpleStoryRenderProgress(job);
   }
 
   // --- YouTube Publishing Package (Final Review) ---

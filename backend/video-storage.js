@@ -95,6 +95,18 @@ async function storeSceneClip(buffer, jobId, sceneIndex, options) {
   return storeMediaFile(buffer, `scene-clip-${jobId}-${sceneIndex}`, options);
 }
 
+// Stores one Simple Story Video section's real rendered clip bytes
+// (background + Ken Burns zoom + its own burned-in text — see
+// backend/simple-story-video.js's renderSection) durably, OUTSIDE both the
+// job record and this function's own serverless invocation's /tmp
+// (which does not persist between invocations). This is what makes
+// section rendering resumable across SEPARATE assembleFinalVideo calls: a
+// section already rendered and stored here is never re-rendered just
+// because the job's overall video needed more than one call to finish.
+async function storeSimpleStorySectionClip(buffer, jobId, sectionIndex, options) {
+  return storeMediaFile(buffer, `simple-story-section-${jobId}-${sectionIndex}`, options);
+}
+
 // Stores the generated voice-over's real MP3 bytes for one job. See this
 // module's own top comment for why job.voiceover.url can no longer safely
 // embed the audio directly as a data: URI once the script is long enough
@@ -114,4 +126,12 @@ async function storeImageFile(buffer, jobId, options) {
   return storeMediaFile(buffer, `image-${jobId}`, { ...options, extension: 'png', contentType: 'image/png' });
 }
 
-module.exports = { storeFinalVideo, storeSceneClip, storeAudioFile, storeImageFile, hasBlobToken, GENERATED_DIR };
+module.exports = {
+  storeFinalVideo,
+  storeSceneClip,
+  storeSimpleStorySectionClip,
+  storeAudioFile,
+  storeImageFile,
+  hasBlobToken,
+  GENERATED_DIR,
+};

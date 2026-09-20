@@ -126,18 +126,45 @@ function backgroundColorForSection(sectionIndex) {
 // output bytes are unaffected — same sections, same settings, same order.
 const SECTION_RENDER_CONCURRENCY = 4;
 
+// How long, at most, continueSimpleStoryVideoAssembly spends STARTING new
+// section renders in one call before returning progress-so-far instead of
+// continuing to completion — real production evidence (Vercel's own "Task
+// timed out after 300 seconds" logs, cross-referenced against this
+// module's own phase-timing log lines) showed section rendering alone can
+// still be in progress well past 300s for a long story. This leaves a real
+// margin below that platform limit for the audio download, whatever
+// sections are already in flight to finish, their storage uploads, and the
+// HTTP response itself. Already-started sections always finish (never
+// aborted mid-encode) — this only stops STARTING new ones once the budget
+// is spent, which is what makes each invocation's own wall-clock time
+// predictable regardless of how many sections remain.
+const RENDER_TIME_BUDGET_MS = 200000;
+
 // Runs `mapper` over `items` with at most `limit` calls in flight at once,
 // resolving to results in the SAME ORDER as `items` regardless of which
 // call finishes first — required here because sectionPaths must stay in
 // story order for the concat step below. A rejection from any call rejects
 // the whole call, same as Promise.all.
-async function mapWithConcurrency(items, limit, mapper) {
+//
+// `deadlineAt` (a Date.now()-comparable timestamp, or null/undefined for no
+// deadline) stops STARTING new work once passed, letting anything already
+// in flight finish — always starts at least one item per worker slot
+// first, so a deadline that has already passed on entry still makes real
+// forward progress instead of doing nothing. `results[i]` stays undefined
+// for any item never started; the caller tells those apart from real
+// results by index, the same way it knows items[i] was never processed.
+async function mapWithConcurrencyUntilDeadline(items, limit, deadlineAt, mapper) {
   const results = new Array(items.length);
   let nextIndex = 0;
+  let startedCount = 0;
 
   async function worker() {
     while (nextIndex < items.length) {
+      if (startedCount > 0 && deadlineAt && Date.now() >= deadlineAt) {
+        return;
+      }
       const currentIndex = nextIndex++;
+      startedCount++;
       results[currentIndex] = await mapper(items[currentIndex], currentIndex);
     }
   }
@@ -439,6 +466,21 @@ async function renderSection(section, sectionIndex, workDir, sectionCues, effect
   return outPath;
 }
 
+// The default, empty progress record for a job that has never started (or
+// whose previous progress was just discarded as stale — see
+// continueSimpleStoryVideoAssembly). Matches job-store.js's own
+// simpleStoryRender default exactly.
+function freshRenderProgress(voiceoverUrl, subtitlesContent) {
+  return {
+    status: 'in_progress',
+    totalSections: null,
+    sections: [],
+    audioUrlSnapshot: voiceoverUrl,
+    subtitlesContentSnapshot: subtitlesContent,
+    error: null,
+  };
+}
+
 // voiceover: job.voiceover — REQUIRED here (unlike video-assembly.js's
 // Runway pipeline, where narration is optional). Without real, timed
 // narration there is nothing for the on-screen text to synchronize
@@ -448,32 +490,79 @@ async function renderSection(section, sectionIndex, workDir, sectionCues, effect
 // this is real, transcribed-from-this-audio text, never guessed from the
 // script. The caller must only call this once subtitles.status ===
 // 'completed'.
+// existingRender: job.simpleStoryRender — this job's own persisted
+// progress from any PREVIOUS call (or job-store.js's default
+// { status: 'not_started', sections: [], ... } shape for a job that has
+// never rendered before). Reused across separate invocations so an
+// already-completed section is never re-rendered — see this module's own
+// top comment and job-store.js's simpleStoryRender field comment for why:
+// real production evidence showed a long story's full render (16+ real
+// sections, each a real local ffmpeg encode) can take longer than a single
+// serverless function invocation safely allows.
+// jobId: needed to durably store each section's own rendered clip (see
+// video-storage.js's storeSimpleStorySectionClip) as it completes, so that
+// work survives between invocations even though each invocation's own
+// /tmp does not.
 // sectionTargetSeconds: optional override of DEFAULT_SECTION_TARGET_SECONDS
 // — exposed so this module's own tests can force multiple short sections
 // out of a short fixture, exercising the real section/transition logic
 // without needing a multi-minute test fixture.
+// timeBudgetMs: optional override of RENDER_TIME_BUDGET_MS — exposed so
+// this module's own tests can force an early "still in progress" return
+// without needing a slow, multi-minute fixture.
 //
-// Returns { buffer, status: 'completed', error: null } on success (the raw
-// assembled MP4 bytes — see video-assembly.js's own comment for why this
-// deliberately returns a buffer, not a stored url) or
-// { buffer: null, status: 'failed', error } on any real failure. Never
-// fabricates a buffer.
-async function assembleSimpleStoryVideo({ voiceover, subtitlesContent, sectionTargetSeconds }) {
+// Returns one of:
+//   { status: 'completed', buffer, render } — the whole video is done.
+//     buffer is the raw assembled MP4 bytes (see video-assembly.js's own
+//     comment for why this deliberately returns a buffer, not a stored
+//     url); render is the final, completed progress record to persist.
+//   { status: 'in_progress', render } — real progress may have been made,
+//     but sections remain; the caller persists `render` onto
+//     job.simpleStoryRender and must call this again later (see
+//     server.js's assembleAndStoreFinalVideo) to continue. Never blocks
+//     past timeBudgetMs trying to finish everything in one call.
+//   { status: 'failed', error, render } — a real failure. render still
+//     reflects whatever sections completed before the failure, so a retry
+//     never re-renders them.
+// Never fabricates a buffer or a completed section.
+async function continueSimpleStoryVideoAssembly({
+  voiceover,
+  subtitlesContent,
+  existingRender,
+  jobId,
+  sectionTargetSeconds,
+  timeBudgetMs,
+}) {
   if (!voiceover || voiceover.status !== 'completed' || !voiceover.url) {
-    return { buffer: null, status: 'failed', error: 'A completed voice-over is required for Simple Story Video mode.' };
+    return { status: 'failed', error: 'A completed voice-over is required for Simple Story Video mode.', render: existingRender || null };
   }
   if (!subtitlesContent || !subtitlesContent.trim()) {
     return {
-      buffer: null,
       status: 'failed',
       error: 'Real subtitles (generated from the voice-over) are required for Simple Story Video mode.',
+      render: existingRender || null,
     };
   }
 
   const cues = parseSrt(subtitlesContent);
   if (cues.length === 0) {
-    return { buffer: null, status: 'failed', error: 'Subtitles contained no usable cues to build the video from.' };
+    return { status: 'failed', error: 'Subtitles contained no usable cues to build the video from.', render: existingRender || null };
   }
+
+  // A fresh voice-over or a real subtitles change invalidates every
+  // previously-rendered section — their real narration timing no longer
+  // matches. Starting over here (rather than trying to patch/diff the old
+  // progress) is simple and safe: sections are cheap to re-render (a few
+  // seconds each with the ultrafast preset), so there is no real cost to
+  // discarding stale progress outright.
+  const isStale =
+    !existingRender ||
+    existingRender.audioUrlSnapshot !== voiceover.url ||
+    existingRender.subtitlesContentSnapshot !== subtitlesContent;
+
+  const render = isStale
+    ? freshRenderProgress(voiceover.url, subtitlesContent)
+    : { ...existingRender, sections: existingRender.sections.map((section) => ({ ...section })), status: 'in_progress', error: null };
 
   const workDir = fs.mkdtempSync(path.join(os.tmpdir(), 'simple-story-video-'));
 
@@ -490,7 +579,7 @@ async function assembleSimpleStoryVideo({ voiceover, subtitlesContent, sectionTa
   const log = (message) => console.log(`Simple Story Video assembly: ${message} (${elapsedSeconds()}s elapsed)`);
 
   try {
-    log(`starting, ${cues.length} subtitle cue(s)`);
+    log(`starting, ${cues.length} subtitle cue(s), resuming existing progress: ${!isStale}`);
 
     const audioPath = path.join(workDir, 'voiceover-audio');
     await fetchAudioToFile(voiceover.url, audioPath);
@@ -499,33 +588,68 @@ async function assembleSimpleStoryVideo({ voiceover, subtitlesContent, sectionTa
 
     const targetSectionSeconds = sectionTargetSeconds > 0 ? sectionTargetSeconds : DEFAULT_SECTION_TARGET_SECONDS;
     const sections = groupCuesIntoSections(cues, targetSectionSeconds, audioDuration);
-    log(`grouped into ${sections.length} section(s), rendering up to ${SECTION_RENDER_CONCURRENCY} at once`);
+    render.totalSections = sections.length;
+    // Reconciles the persisted per-section progress array to this exact
+    // section count/order — a no-op except on the very first call for this
+    // job (or right after the staleness reset above), since the inputs
+    // that determine section count/boundaries are the same voiceover/
+    // subtitles just validated above and never change mid-stream.
+    render.sections = sections.map((_, i) =>
+      render.sections[i] && render.sections[i].status === 'completed' ? render.sections[i] : { status: 'pending', url: null }
+    );
 
-    let sectionsRendered = 0;
-    const sectionPaths = await mapWithConcurrency(sections, SECTION_RENDER_CONCURRENCY, (section, i) => {
-      // The visual timeline is built entirely from real section boundaries
-      // (themselves derived from real cue timestamps), which can end
-      // slightly before the real, measured audio duration (e.g. a trailing
-      // pause after the last line) — never truncate real narration.
-      // Extending the LAST section's own rendered duration to cover the
-      // real audio duration (instead of a separate padding pass over the
-      // whole video afterward, as this module used to do) means every
-      // section already has real text burned in and the concatenation step
-      // below never needs to re-encode anything, regardless of the video's
-      // total length.
-      const isLastSection = i === sections.length - 1;
-      const effectiveDuration = isLastSection
-        ? Math.max(section.end, audioDuration) - section.start
-        : section.end - section.start;
-      return renderSection(section, i, workDir, cuesForSection(cues, section), effectiveDuration).then((result) => {
-        sectionsRendered++;
-        if (sectionsRendered === sections.length || sectionsRendered % 5 === 0) {
-          log(`rendered ${sectionsRendered}/${sections.length} section(s)`);
-        }
-        return result;
+    const alreadyDoneCount = render.sections.filter((section) => section.status === 'completed').length;
+    log(`grouped into ${sections.length} section(s), ${alreadyDoneCount} already completed from a previous call`);
+
+    const pendingIndexes = sections.map((_, i) => i).filter((i) => render.sections[i].status !== 'completed');
+
+    if (pendingIndexes.length > 0) {
+      const deadlineAt = Date.now() + (timeBudgetMs > 0 ? timeBudgetMs : RENDER_TIME_BUDGET_MS);
+      let renderedThisCall = 0;
+
+      await mapWithConcurrencyUntilDeadline(pendingIndexes, SECTION_RENDER_CONCURRENCY, deadlineAt, async (sectionIndex) => {
+        const section = sections[sectionIndex];
+        // The visual timeline is built entirely from real section
+        // boundaries (themselves derived from real cue timestamps), which
+        // can end slightly before the real, measured audio duration (e.g.
+        // a trailing pause after the last line) — never truncate real
+        // narration. Extending the LAST section's own rendered duration to
+        // cover the real audio duration (instead of a separate padding
+        // pass over the whole video afterward, as this module used to do)
+        // means every section already has real text burned in and the
+        // concatenation step below never needs to re-encode anything,
+        // regardless of the video's total length.
+        const isLastSection = sectionIndex === sections.length - 1;
+        const effectiveDuration = isLastSection
+          ? Math.max(section.end, audioDuration) - section.start
+          : section.end - section.start;
+        const outPath = await renderSection(section, sectionIndex, workDir, cuesForSection(cues, section), effectiveDuration);
+        const buffer = fs.readFileSync(outPath);
+        const url = await videoStorage.storeSimpleStorySectionClip(buffer, jobId, sectionIndex);
+        render.sections[sectionIndex] = { status: 'completed', url };
+        renderedThisCall++;
+        log(`rendered section ${sectionIndex + 1}/${sections.length} (${renderedThisCall} section(s) this call)`);
       });
-    });
-    log(`all ${sections.length} section(s) rendered`);
+    }
+
+    const stillPending = render.sections.some((section) => section.status !== 'completed');
+    if (stillPending) {
+      log('time budget reached with sections still pending — stopping for this call, will resume on the next one');
+      return { status: 'in_progress', render };
+    }
+    log(`all ${sections.length} section(s) completed`);
+
+    // Every section is done and durably stored — download each one's real
+    // bytes back (some may have been rendered in an EARLIER call, whose own
+    // /tmp is long gone by now) into this call's own workDir, then
+    // concatenate exactly as before.
+    const sectionPaths = [];
+    for (let i = 0; i < render.sections.length; i++) {
+      const sectionPath = path.join(workDir, `section-${i}.mp4`);
+      await fetchAudioToFile(render.sections[i].url, sectionPath);
+      sectionPaths.push(sectionPath);
+    }
+    log('all section clips fetched for concatenation');
 
     const listPath = path.join(workDir, 'sections.txt');
     fs.writeFileSync(listPath, sectionPaths.map((p) => `file '${p.replace(/'/g, "'\\''")}'`).join('\n'), 'utf8');
@@ -537,14 +661,7 @@ async function assembleSimpleStoryVideo({ voiceover, subtitlesContent, sectionTa
     // Every section already has its own text burned in and already covers
     // the real audio duration (see above), so all that's left is muxing in
     // the real narration audio — a plain stream copy of the already-final
-    // video (-c:v copy), never a re-encode. Previously this step also
-    // burned in subtitles and padded for trailing silence in one combined
-    // full-length re-encode pass; measured on a real 18-minute fixture that
-    // pass alone took ~123s, and a real production job's total render still
-    // exceeded Vercel's 300s function timeout even after parallelizing
-    // section rendering — moving both burn-in and padding into the
-    // per-section step above removes this remaining full-length re-encode
-    // entirely, regardless of video length.
+    // video (-c:v copy), never a re-encode.
     const finalPath = path.join(workDir, 'final.mp4');
 
     await runFfmpeg([
@@ -572,25 +689,32 @@ async function assembleSimpleStoryVideo({ voiceover, subtitlesContent, sectionTa
       throw new Error('ffmpeg produced an empty output file.');
     }
 
-    return { buffer, status: 'completed', error: null };
+    render.status = 'completed';
+    return { status: 'completed', buffer, render };
   } catch (error) {
     const message = (error && error.message) || 'Unknown error assembling the Simple Story Video.';
     console.error('Simple Story Video assembly error:', JSON.stringify({ message }, null, 2));
-    return { buffer: null, status: 'failed', error: message };
+    render.status = 'failed';
+    render.error = message;
+    return { status: 'failed', error: message, render };
   } finally {
     fs.rmSync(workDir, { recursive: true, force: true });
   }
 }
 
-// Mirrors video-assembly.js's fetchToFile for the voice-over's own url —
-// every shape voiceover-generation.js's storage can produce (see
-// video-storage.js): a real http(s) URL (Vercel Blob in production), a
-// /generated/... local reference (the no-Blob-token dev/test fallback,
-// resolved straight from disk via GENERATED_DIR rather than fetched over
-// HTTP, since this server has no fixed, known base URL to fetch its own
-// static route from), a base64 data: URI (kept for backward compatibility
-// with any job created before voice-over audio was moved out of the job
-// record), or a plain local file path (this module's own tests).
+// Mirrors video-assembly.js's fetchToFile — used both for downloading the
+// job's own voice-over audio and for re-fetching an already-rendered
+// section's stored clip bytes back for concatenation (see
+// continueSimpleStoryVideoAssembly), since both are just "real media bytes
+// referenced by one of the shapes video-storage.js can produce." Every
+// shape voiceover-generation.js's/this module's own storage can produce: a
+// real http(s) URL (Vercel Blob in production), a /generated/... local
+// reference (the no-Blob-token dev/test fallback, resolved straight from
+// disk via GENERATED_DIR rather than fetched over HTTP, since this server
+// has no fixed, known base URL to fetch its own static route from), a
+// base64 data: URI (kept for backward compatibility with any job created
+// before voice-over audio was moved out of the job record), or a plain
+// local file path (this module's own tests).
 async function fetchAudioToFile(url, destPath) {
   if (url.startsWith('data:')) {
     const commaIndex = url.indexOf(',');
@@ -626,7 +750,7 @@ async function fetchAudioToFile(url, destPath) {
 }
 
 module.exports = {
-  assembleSimpleStoryVideo,
+  continueSimpleStoryVideoAssembly,
   parseSrt,
   groupCuesIntoSections,
   wrapText,
@@ -634,9 +758,10 @@ module.exports = {
   buildAssScript,
   cuesForSection,
   secondsToAssTimestamp,
-  mapWithConcurrency,
+  mapWithConcurrencyUntilDeadline,
   SECTION_RENDER_CONCURRENCY,
   SECTION_ENCODE_PRESET,
+  RENDER_TIME_BUDGET_MS,
   SIMPLE_STORY_WIDTH,
   SIMPLE_STORY_HEIGHT,
   SIMPLE_STORY_FPS,
