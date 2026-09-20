@@ -84,6 +84,19 @@ const DEFAULT_SECTION_TARGET_SECONDS = 45;
 
 const SECTION_FADE_SECONDS = 0.4;
 
+// 'ultrafast', not 'veryfast': real Vercel production logs (added via the
+// phase-timing diagnostic above) showed each section — a plain solid-color
+// background with a slow Ken Burns zoom and burned-in text — taking
+// roughly 25s to encode in production, dramatically slower than the ~2-5s
+// this same encode took locally. Measured directly against the exact
+// filter chain this module uses (zoompan+fade+ass, 1920x1080, 45s), 'ultrafast'
+// encodes in about half the time 'veryfast' does for this content. Content
+// here is simple by design (a solid color and a slow zoom, never real
+// footage), so 'ultrafast'-vs-'veryfast' compression efficiency — the
+// tradeoff that normally matters for this preset choice — is not a
+// meaningful concern; output file size stays small either way.
+const SECTION_ENCODE_PRESET = 'ultrafast';
+
 // A short rotation of plain, high-contrast-with-white-text colors — "simple
 // clean backgrounds" is implemented literally: a solid color, never a
 // generated/fetched image, so this mode never depends on any image
@@ -417,7 +430,7 @@ async function renderSection(section, sectionIndex, workDir, sectionCues, effect
     '-c:v',
     'libx264',
     '-preset',
-    'veryfast',
+    SECTION_ENCODE_PRESET,
     '-pix_fmt',
     'yuv420p',
     outPath,
@@ -623,6 +636,7 @@ module.exports = {
   secondsToAssTimestamp,
   mapWithConcurrency,
   SECTION_RENDER_CONCURRENCY,
+  SECTION_ENCODE_PRESET,
   SIMPLE_STORY_WIDTH,
   SIMPLE_STORY_HEIGHT,
   SIMPLE_STORY_FPS,
