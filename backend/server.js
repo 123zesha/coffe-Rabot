@@ -1535,6 +1535,9 @@ async function executeTool(name, jobId, input) {
         script: job.script,
         voiceStyle: job.voiceStyle,
         jobId: job.id,
+        storyStyle: job.storyStyle,
+        videoMode: job.videoMode,
+        topic: job.topic,
       });
 
       const updates = { voiceover };
@@ -2009,6 +2012,9 @@ app.post('/api/jobs/:id/generate-voiceover', async (req, res) => {
       script: job.script,
       voiceStyle: job.voiceStyle,
       jobId: job.id,
+      storyStyle: job.storyStyle,
+      videoMode: job.videoMode,
+      topic: job.topic,
     });
 
     const updates = { voiceover };
