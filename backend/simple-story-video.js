@@ -464,14 +464,31 @@ async function assembleSimpleStoryVideo({ voiceover, subtitlesContent, sectionTa
 
   const workDir = fs.mkdtempSync(path.join(os.tmpdir(), 'simple-story-video-'));
 
+  // Diagnostic timing log, one line per real phase — a hard platform
+  // timeout kills the process before the catch block below ever runs, so
+  // this module's own error handling has never been visible for a timeout,
+  // only for a real thrown error. These lines are the only way to see,
+  // after the fact in Vercel's logs, which phase was actually still
+  // running when a timeout hits, instead of guessing. Never logs anything
+  // from voiceover.url/subtitlesContent themselves (no narration text or
+  // storage URLs), only counts and elapsed seconds.
+  const assemblyStart = Date.now();
+  const elapsedSeconds = () => ((Date.now() - assemblyStart) / 1000).toFixed(1);
+  const log = (message) => console.log(`Simple Story Video assembly: ${message} (${elapsedSeconds()}s elapsed)`);
+
   try {
+    log(`starting, ${cues.length} subtitle cue(s)`);
+
     const audioPath = path.join(workDir, 'voiceover-audio');
     await fetchAudioToFile(voiceover.url, audioPath);
     const audioDuration = await getMediaDuration(audioPath);
+    log(`voice-over audio ready, real duration ${audioDuration.toFixed(1)}s`);
 
     const targetSectionSeconds = sectionTargetSeconds > 0 ? sectionTargetSeconds : DEFAULT_SECTION_TARGET_SECONDS;
     const sections = groupCuesIntoSections(cues, targetSectionSeconds, audioDuration);
+    log(`grouped into ${sections.length} section(s), rendering up to ${SECTION_RENDER_CONCURRENCY} at once`);
 
+    let sectionsRendered = 0;
     const sectionPaths = await mapWithConcurrency(sections, SECTION_RENDER_CONCURRENCY, (section, i) => {
       // The visual timeline is built entirely from real section boundaries
       // (themselves derived from real cue timestamps), which can end
@@ -487,14 +504,22 @@ async function assembleSimpleStoryVideo({ voiceover, subtitlesContent, sectionTa
       const effectiveDuration = isLastSection
         ? Math.max(section.end, audioDuration) - section.start
         : section.end - section.start;
-      return renderSection(section, i, workDir, cuesForSection(cues, section), effectiveDuration);
+      return renderSection(section, i, workDir, cuesForSection(cues, section), effectiveDuration).then((result) => {
+        sectionsRendered++;
+        if (sectionsRendered === sections.length || sectionsRendered % 5 === 0) {
+          log(`rendered ${sectionsRendered}/${sections.length} section(s)`);
+        }
+        return result;
+      });
     });
+    log(`all ${sections.length} section(s) rendered`);
 
     const listPath = path.join(workDir, 'sections.txt');
     fs.writeFileSync(listPath, sectionPaths.map((p) => `file '${p.replace(/'/g, "'\\''")}'`).join('\n'), 'utf8');
 
     const concatenatedPath = path.join(workDir, 'concatenated.mp4');
     await runFfmpeg(['-y', '-f', 'concat', '-safe', '0', '-i', listPath, '-c', 'copy', concatenatedPath]);
+    log('sections concatenated');
 
     // Every section already has its own text burned in and already covers
     // the real audio duration (see above), so all that's left is muxing in
@@ -526,8 +551,10 @@ async function assembleSimpleStoryVideo({ voiceover, subtitlesContent, sectionTa
       '-shortest',
       finalPath,
     ]);
+    log('final audio mux complete');
 
     const buffer = fs.readFileSync(finalPath);
+    log(`done, output is ${(buffer.length / (1024 * 1024)).toFixed(1)}MB`);
     if (buffer.length === 0) {
       throw new Error('ffmpeg produced an empty output file.');
     }
