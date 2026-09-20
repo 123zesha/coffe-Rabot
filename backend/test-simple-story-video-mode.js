@@ -28,6 +28,7 @@
 const path = require('path');
 const fs = require('fs');
 const os = require('os');
+const http = require('http');
 const assert = require('assert');
 const { execFile } = require('child_process');
 
@@ -117,6 +118,25 @@ function probe(filePath) {
   });
 }
 
+// A local mock OpenAI TTS server (same technique as
+// test-generate-voiceover-tool.js) — used only by the "fresh voice-over
+// resets in-progress render progress" test below, which needs the real
+// generateVoiceover tool to actually succeed (reaching its finalVideo/
+// simpleStoryRender reset logic) without ever making a real, paid OpenAI
+// call.
+function startMockOpenAiTts() {
+  return new Promise((resolve) => {
+    const server = http.createServer((req, res) => {
+      req.on('data', () => {});
+      req.on('end', () => {
+        res.writeHead(200, { 'Content-Type': 'audio/mpeg' });
+        res.end(Buffer.from('fake mp3 audio bytes'));
+      });
+    });
+    server.listen(0, () => resolve(server));
+  });
+}
+
 const FIXTURE_SRT = [
   '1',
   '00:00:00,000 --> 00:00:02,000',
@@ -128,9 +148,25 @@ const FIXTURE_SRT = [
   '',
 ].join('\n');
 
-async function makeFixtureVoiceoverDataUri(workDir) {
-  const audioPath = path.join(workDir, 'fixture-voiceover.mp3');
-  await runFfmpeg(['-y', '-f', 'lavfi', '-i', 'sine=frequency=220:duration=4', '-c:a', 'libmp3lame', audioPath]);
+// A second cue starting 46s after the first (past simple-story-video.js's
+// own 45s DEFAULT_SECTION_TARGET_SECONDS) forces groupCuesIntoSections to
+// produce exactly 2 real sections — used by the resumable-rendering
+// integration test below, which needs more than one section to prove a
+// resumed call reuses an already-completed one instead of re-rendering it.
+const TWO_SECTION_SRT = [
+  '1',
+  '00:00:00,000 --> 00:00:02,000',
+  'Once upon a time there was a curious young fox.',
+  '',
+  '2',
+  '00:00:46,000 --> 00:00:48,000',
+  'She loved exploring the forest every morning.',
+  '',
+].join('\n');
+
+async function makeFixtureVoiceoverDataUri(workDir, durationSeconds = 4) {
+  const audioPath = path.join(workDir, `fixture-voiceover-${durationSeconds}.mp3`);
+  await runFfmpeg(['-y', '-f', 'lavfi', '-i', `sine=frequency=220:duration=${durationSeconds}`, '-c:a', 'libmp3lame', audioPath]);
   const base64 = fs.readFileSync(audioPath).toString('base64');
   return `data:audio/mpeg;base64,${base64}`;
 }
@@ -285,6 +321,209 @@ async function main() {
     const secondPersisted = await jobStore.getJob(job.id);
     assert.strictEqual(secondResult.finalVideo.status, 'completed');
     assert.strictEqual(secondPersisted.finalVideo.url, persisted.finalVideo.url, 'unchanged job must not be reassembled');
+  });
+
+  // --- Resumable rendering integration: a real 16+-section story can need
+  // more than one assembleFinalVideo call to finish (see
+  // simple-story-video.js's own exhaustive tests — including a full
+  // 20-section production-shaped end-to-end run — for that underlying
+  // mechanism at real scale). This test proves server.js's own
+  // orchestration (the Agent tool) correctly surfaces and persists
+  // in-progress state and then genuinely resumes from it. It uses a real
+  // (downscaled to 2 sections, for test speed) partial render — produced by
+  // calling the ORIGINAL continueSimpleStoryVideoAssembly directly with a
+  // 1ms time budget so exactly one of its two sections finishes — rather
+  // than a fully fabricated one: a fabricated "already completed" section
+  // would point at a url with no real file behind it, which the resumed
+  // call's final concatenation step would fail to read. Standing in for
+  // "a previous call already got partway through" this way keeps the test
+  // honest while still exercising server.js's own plumbing, not
+  // continueSimpleStoryVideoAssembly's internals again.
+  await test('assembleFinalVideo tool surfaces and persists "processing" state, then resumes to completion on the next call', async () => {
+    const job = await jobStore.createJob();
+    const voiceoverUrl = await makeFixtureVoiceoverDataUri(workDir, 50);
+
+    await jobStore.updateJob(job.id, {
+      videoMode: 'simple-story',
+      script: LONG_ENOUGH_SCRIPT + ' '.repeat(200),
+      voiceover: { url: voiceoverUrl, status: 'completed', voice: 'alloy', voiceStyle: 'neutral-narrator' },
+      subtitles: {
+        status: 'completed',
+        format: 'srt',
+        content: TWO_SECTION_SRT,
+        error: null,
+        generatedFromVoiceoverUrl: voiceoverUrl,
+      },
+    });
+
+    const originalContinueAssembly = simpleStoryVideo.continueSimpleStoryVideoAssembly;
+    const realPartialResult = await originalContinueAssembly({
+      voiceover: { status: 'completed', url: voiceoverUrl },
+      subtitlesContent: TWO_SECTION_SRT,
+      existingRender: null,
+      jobId: job.id,
+      timeBudgetMs: 1,
+    });
+    assert.strictEqual(realPartialResult.status, 'in_progress', JSON.stringify(realPartialResult));
+    assert.strictEqual(realPartialResult.render.totalSections, 2);
+    assert.strictEqual(realPartialResult.render.sections.filter((s) => s.status === 'completed').length, 1);
+    const section0Url = realPartialResult.render.sections[0].url;
+    assert.ok(section0Url, 'expected a real stored url for the already-completed section');
+
+    let realAssemblyCallCount = 0;
+    simpleStoryVideo.continueSimpleStoryVideoAssembly = async (args) => {
+      realAssemblyCallCount++;
+      if (realAssemblyCallCount === 1) {
+        return { status: 'in_progress', render: realPartialResult.render };
+      }
+      // Second call: let the real implementation finish for real, proving
+      // the job's persisted state (not the scripted stub) is what actually
+      // drives the resumed call forward.
+      return originalContinueAssembly(args);
+    };
+
+    let realPath;
+    let sectionClipPath;
+    try {
+      const firstResult = JSON.parse(await app.executeTool('assembleFinalVideo', job.id, {}));
+      assert.strictEqual(firstResult.finalVideo.status, 'processing', JSON.stringify(firstResult));
+      assert.strictEqual(firstResult.simpleStoryRender.completedSections, 1);
+      assert.strictEqual(firstResult.simpleStoryRender.totalSections, 2);
+      assert.strictEqual(firstResult.finalVideo.url, undefined, 'the agent-facing summary must never carry a url while still processing');
+
+      const afterFirst = await jobStore.getJob(job.id);
+      assert.strictEqual(afterFirst.finalVideo.status, 'processing');
+      assert.strictEqual(afterFirst.simpleStoryRender.status, 'in_progress');
+      assert.strictEqual(afterFirst.simpleStoryRender.sections.filter((s) => s.status === 'completed').length, 1);
+
+      // The second call must pass the JOB'S OWN persisted progress as
+      // existingRender — proving the real resumption wiring, not just that
+      // calling twice happens to work.
+      const secondResult = JSON.parse(await app.executeTool('assembleFinalVideo', job.id, {}));
+      assert.strictEqual(secondResult.finalVideo.status, 'completed', JSON.stringify(secondResult));
+
+      const afterSecond = await jobStore.getJob(job.id);
+      assert.strictEqual(afterSecond.simpleStoryRender.status, 'completed');
+      // The already-completed section must be reused verbatim, never
+      // re-rendered — proven by its storage url staying identical.
+      assert.strictEqual(afterSecond.simpleStoryRender.sections[0].url, section0Url);
+      realPath = path.join(require('./video-storage').GENERATED_DIR, afterSecond.finalVideo.url.slice('/generated/'.length));
+      const probed = await probe(realPath);
+      assert.strictEqual(probed.width, 1920);
+      assert.strictEqual(probed.height, 1080);
+    } finally {
+      simpleStoryVideo.continueSimpleStoryVideoAssembly = originalContinueAssembly;
+      sectionClipPath = path.join(require('./video-storage').GENERATED_DIR, section0Url.slice('/generated/'.length));
+      fs.rmSync(sectionClipPath, { force: true });
+      if (realPath) {
+        fs.rmSync(realPath, { force: true });
+      }
+    }
+  });
+
+  await test('POST /assemble-video also surfaces and persists "processing" state the same way the Agent tool does', async () => {
+    const job = await jobStore.createJob();
+    const voiceoverUrl = await makeFixtureVoiceoverDataUri(workDir);
+
+    await jobStore.updateJob(job.id, {
+      videoMode: 'simple-story',
+      script: LONG_ENOUGH_SCRIPT + ' '.repeat(200),
+      voiceover: { url: voiceoverUrl, status: 'completed', voice: 'alloy', voiceStyle: 'neutral-narrator' },
+      subtitles: {
+        status: 'completed',
+        format: 'srt',
+        content: FIXTURE_SRT,
+        error: null,
+        generatedFromVoiceoverUrl: voiceoverUrl,
+      },
+    });
+
+    const scriptedInProgressRender = {
+      status: 'in_progress',
+      totalSections: 4,
+      sections: [
+        { status: 'completed', url: '/generated/fake-section-0.mp4' },
+        { status: 'pending', url: null },
+        { status: 'pending', url: null },
+        { status: 'pending', url: null },
+      ],
+      audioUrlSnapshot: voiceoverUrl,
+      subtitlesContentSnapshot: FIXTURE_SRT,
+      error: null,
+    };
+
+    const originalContinueAssembly = simpleStoryVideo.continueSimpleStoryVideoAssembly;
+    simpleStoryVideo.continueSimpleStoryVideoAssembly = async () => ({ status: 'in_progress', render: scriptedInProgressRender });
+
+    try {
+      const res = await fetch(`${baseUrl}/api/jobs/${job.id}/assemble-video`, { method: 'POST' });
+      const body = await res.json();
+
+      assert.strictEqual(res.status, 200, JSON.stringify(body));
+      assert.strictEqual(body.finalVideo.status, 'processing');
+      // The REST route returns the RAW job (like GET /api/jobs/:id) — the
+      // full simpleStoryRender record, not the agent's stripped summary.
+      assert.strictEqual(body.simpleStoryRender.status, 'in_progress');
+      assert.strictEqual(body.simpleStoryRender.sections.filter((s) => s.status === 'completed').length, 1);
+
+      const persisted = await jobStore.getJob(job.id);
+      assert.strictEqual(persisted.finalVideo.status, 'processing');
+      assert.strictEqual(persisted.simpleStoryRender.totalSections, 4);
+    } finally {
+      simpleStoryVideo.continueSimpleStoryVideoAssembly = originalContinueAssembly;
+    }
+  });
+
+  await test('a fresh voice-over resets any in-progress Simple Story Video render progress', async () => {
+    const job = await jobStore.createJob();
+
+    await jobStore.updateJob(job.id, {
+      videoMode: 'simple-story',
+      // findVoiceoverBlocker checks the script's TRIMMED length against
+      // MIN_SCRIPT_LENGTH, so trailing whitespace padding (used elsewhere in
+      // this file to pad past that minimum for checks that don't trim)
+      // does not count here — a real closing sentence is added instead.
+      script: LONG_ENOUGH_SCRIPT + ' She always came home before sunset to tell her family everything she had seen.',
+      voiceStyle: 'neutral-narrator',
+      simpleStoryRender: {
+        status: 'in_progress',
+        totalSections: 10,
+        sections: Array.from({ length: 10 }, (_, i) => (i < 5 ? { status: 'completed', url: `/generated/fake-${i}.mp4` } : { status: 'pending', url: null })),
+        audioUrlSnapshot: 'data:audio/mpeg;base64,stale',
+        subtitlesContentSnapshot: 'stale subtitles',
+        error: null,
+      },
+    });
+
+    // generateVoiceover only resets simpleStoryRender once the voice-over
+    // actually completes, so this needs a real (mocked, zero-cost) success
+    // — not just a call that immediately refuses for lack of an API key.
+    const mockOpenAiServer = await startMockOpenAiTts();
+    const originalOpenAiKey = process.env.OPENAI_API_KEY;
+    const originalOpenAiBaseUrl = process.env.OPENAI_BASE_URL;
+    process.env.OPENAI_API_KEY = 'test-key';
+    process.env.OPENAI_BASE_URL = `http://localhost:${mockOpenAiServer.address().port}/v1`;
+
+    try {
+      const result = JSON.parse(await app.executeTool('generateVoiceover', job.id, {}));
+      assert.strictEqual(result.error, undefined, `expected generateVoiceover to succeed, got: ${JSON.stringify(result)}`);
+
+      const persisted = await jobStore.getJob(job.id);
+      assert.strictEqual(persisted.simpleStoryRender.status, 'not_started', 'stale in-progress render state must be reset by a fresh voice-over');
+      assert.strictEqual(persisted.simpleStoryRender.sections.length, 0);
+    } finally {
+      if (originalOpenAiKey === undefined) {
+        delete process.env.OPENAI_API_KEY;
+      } else {
+        process.env.OPENAI_API_KEY = originalOpenAiKey;
+      }
+      if (originalOpenAiBaseUrl === undefined) {
+        delete process.env.OPENAI_BASE_URL;
+      } else {
+        process.env.OPENAI_BASE_URL = originalOpenAiBaseUrl;
+      }
+      await new Promise((resolve) => mockOpenAiServer.close(resolve));
+    }
   });
 
   await test('switching videoMode away from "simple-story" after a final video exists correctly invalidates it', async () => {

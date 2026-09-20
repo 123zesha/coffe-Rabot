@@ -229,6 +229,13 @@ function findFinalVideoBlocker(job) {
 // finalVideo.resolutionUsed.
 // desiredVideoModeUsed is job.videoMode itself (see computeDesiredVideoModeUsed
 // below) — which of the two pipelines below actually runs.
+//
+// Returns { finalVideo, simpleStoryRender } — BOTH must be persisted by the
+// caller (jobStore.updateJob(jobId, { finalVideo, simpleStoryRender })).
+// simpleStoryRender only ever actually changes for the simple-story
+// pipeline below; the cinematic pipeline passes job.simpleStoryRender
+// through unchanged (a harmless no-op write), so both callers can always
+// persist both fields the same way regardless of which pipeline ran.
 async function assembleAndStoreFinalVideo(
   job,
   jobId,
@@ -244,34 +251,70 @@ async function assembleAndStoreFinalVideo(
   // still records the real subtitles content actually burned in — the same
   // "was this reassembled since a real change" bookkeeping role it has for
   // the Runway pipeline below.
+  //
+  // A real 15-20 minute story's full render (16+ real sections) can take
+  // longer than one serverless function invocation safely allows — see
+  // continueSimpleStoryVideoAssembly's own comment. So THIS call may only
+  // make partial progress ('in_progress') rather than fully finishing;
+  // finalVideo.status reads 'processing' in that case (never 'failed' —
+  // nothing has gone wrong, more work is simply still needed), and the
+  // caller (the assembleFinalVideo Agent tool / its REST route) is
+  // expected to be called again later to continue — see the frontend's own
+  // polling loop in refreshFinalVideoCard, which drives this to completion
+  // via plain repeated HTTP calls, never by looping the conversational
+  // agent purely to advance a mechanical render with nothing left to
+  // reason about.
   if (desiredVideoModeUsed === 'simple-story') {
-    const assembly = await simpleStoryVideo.assembleSimpleStoryVideo({
+    const assembly = await simpleStoryVideo.continueSimpleStoryVideoAssembly({
       voiceover: job.voiceover,
       subtitlesContent: job.subtitles && job.subtitles.status === 'completed' ? job.subtitles.content : null,
+      existingRender: job.simpleStoryRender,
+      jobId,
     });
+
+    if (assembly.status === 'in_progress') {
+      return {
+        finalVideo: {
+          url: null,
+          status: 'processing',
+          subtitlesUsed: null,
+          musicUsed: null,
+          resolutionUsed: null,
+          videoModeUsed: null,
+          error: null,
+        },
+        simpleStoryRender: assembly.render,
+      };
+    }
 
     if (assembly.status !== 'completed') {
       return {
-        url: null,
-        status: 'failed',
-        subtitlesUsed: null,
-        musicUsed: null,
-        resolutionUsed: null,
-        videoModeUsed: null,
-        error: assembly.error || 'Simple Story Video assembly failed.',
+        finalVideo: {
+          url: null,
+          status: 'failed',
+          subtitlesUsed: null,
+          musicUsed: null,
+          resolutionUsed: null,
+          videoModeUsed: null,
+          error: assembly.error || 'Simple Story Video assembly failed.',
+        },
+        simpleStoryRender: assembly.render,
       };
     }
 
     try {
       const url = await videoStorage.storeFinalVideo(assembly.buffer, jobId);
       return {
-        url,
-        status: 'completed',
-        subtitlesUsed: job.subtitles.content,
-        musicUsed: null,
-        resolutionUsed: null,
-        videoModeUsed: 'simple-story',
-        error: null,
+        finalVideo: {
+          url,
+          status: 'completed',
+          subtitlesUsed: job.subtitles.content,
+          musicUsed: null,
+          resolutionUsed: null,
+          videoModeUsed: 'simple-story',
+          error: null,
+        },
+        simpleStoryRender: assembly.render,
       };
     } catch (error) {
       console.error(
@@ -279,13 +322,16 @@ async function assembleAndStoreFinalVideo(
         JSON.stringify({ name: error?.name, message: error?.message }, null, 2)
       );
       return {
-        url: null,
-        status: 'failed',
-        subtitlesUsed: null,
-        musicUsed: null,
-        resolutionUsed: null,
-        videoModeUsed: null,
-        error: `The final video was assembled but could not be stored: ${error.message}`,
+        finalVideo: {
+          url: null,
+          status: 'failed',
+          subtitlesUsed: null,
+          musicUsed: null,
+          resolutionUsed: null,
+          videoModeUsed: null,
+          error: `The final video was assembled but could not be stored: ${error.message}`,
+        },
+        simpleStoryRender: assembly.render,
       };
     }
   }
@@ -303,15 +349,18 @@ async function assembleAndStoreFinalVideo(
   const brokenIndex = healedClips.findIndex((clip) => clip.status !== 'completed');
   if (brokenIndex !== -1) {
     return {
-      url: null,
-      status: 'failed',
-      subtitlesUsed: null,
-      musicUsed: null,
-      resolutionUsed: null,
-      videoModeUsed: null,
-      error:
-        `Scene ${brokenIndex + 1}'s video clip could not be verified or recovered before assembly ` +
-        `(${healedClips[brokenIndex].error || 'unknown error'}) — regenerate it with generateSceneVideo.`,
+      finalVideo: {
+        url: null,
+        status: 'failed',
+        subtitlesUsed: null,
+        musicUsed: null,
+        resolutionUsed: null,
+        videoModeUsed: null,
+        error:
+          `Scene ${brokenIndex + 1}'s video clip could not be verified or recovered before assembly ` +
+          `(${healedClips[brokenIndex].error || 'unknown error'}) — regenerate it with generateSceneVideo.`,
+      },
+      simpleStoryRender: job.simpleStoryRender,
     };
   }
 
@@ -324,13 +373,16 @@ async function assembleAndStoreFinalVideo(
     musicUrl = musicLibrary.resolveJobMusicUrl(job);
   } catch (error) {
     return {
-      url: null,
-      status: 'failed',
-      subtitlesUsed: null,
-      musicUsed: null,
-      resolutionUsed: null,
-      videoModeUsed: null,
-      error: error.message,
+      finalVideo: {
+        url: null,
+        status: 'failed',
+        subtitlesUsed: null,
+        musicUsed: null,
+        resolutionUsed: null,
+        videoModeUsed: null,
+        error: error.message,
+      },
+      simpleStoryRender: job.simpleStoryRender,
     };
   }
 
@@ -345,26 +397,32 @@ async function assembleAndStoreFinalVideo(
 
   if (assembly.status !== 'completed') {
     return {
-      url: null,
-      status: 'failed',
-      subtitlesUsed: null,
-      musicUsed: null,
-      resolutionUsed: null,
-      videoModeUsed: null,
-      error: assembly.error || 'Final video assembly failed.',
+      finalVideo: {
+        url: null,
+        status: 'failed',
+        subtitlesUsed: null,
+        musicUsed: null,
+        resolutionUsed: null,
+        videoModeUsed: null,
+        error: assembly.error || 'Final video assembly failed.',
+      },
+      simpleStoryRender: job.simpleStoryRender,
     };
   }
 
   try {
     const url = await videoStorage.storeFinalVideo(assembly.buffer, jobId);
     return {
-      url,
-      status: 'completed',
-      subtitlesUsed: desiredSubtitlesContent,
-      musicUsed: desiredMusicUsed,
-      resolutionUsed: desiredResolutionUsed,
-      videoModeUsed: desiredVideoModeUsed,
-      error: null,
+      finalVideo: {
+        url,
+        status: 'completed',
+        subtitlesUsed: desiredSubtitlesContent,
+        musicUsed: desiredMusicUsed,
+        resolutionUsed: desiredResolutionUsed,
+        videoModeUsed: desiredVideoModeUsed,
+        error: null,
+      },
+      simpleStoryRender: job.simpleStoryRender,
     };
   } catch (error) {
     console.error(
@@ -372,13 +430,16 @@ async function assembleAndStoreFinalVideo(
       JSON.stringify({ name: error?.name, message: error?.message }, null, 2)
     );
     return {
-      url: null,
-      status: 'failed',
-      subtitlesUsed: null,
-      musicUsed: null,
-      resolutionUsed: null,
-      videoModeUsed: null,
-      error: `The final video was assembled but could not be stored: ${error.message}`,
+      finalVideo: {
+        url: null,
+        status: 'failed',
+        subtitlesUsed: null,
+        musicUsed: null,
+        resolutionUsed: null,
+        videoModeUsed: null,
+        error: `The final video was assembled but could not be stored: ${error.message}`,
+      },
+      simpleStoryRender: job.simpleStoryRender,
     };
   }
 }
@@ -779,6 +840,24 @@ function summarizeJobForAgent(job) {
     };
   }
 
+  if (job.simpleStoryRender && typeof job.simpleStoryRender === 'object') {
+    // sections[].url are real storage references, not narration text, but
+    // still not something the agent needs to reason about — only whether
+    // rendering is done and roughly how far along it is (same "pass/fail
+    // state, not raw data" reasoning as every other generated-media field
+    // above). audioUrlSnapshot/subtitlesContentSnapshot are internal
+    // bookkeeping (mirrors youtubePackage's generatedFromScript) used only
+    // to detect stale progress.
+    const { status, sections, totalSections, error } = job.simpleStoryRender;
+    const completedSections = Array.isArray(sections) ? sections.filter((section) => section && section.status === 'completed').length : 0;
+    summarized.simpleStoryRender = {
+      status,
+      completedSections,
+      ...(typeof totalSections === 'number' ? { totalSections } : {}),
+      ...(error ? { error } : {}),
+    };
+  }
+
   if (job.referenceVideoAnalysis && typeof job.referenceVideoAnalysis === 'object') {
     // analyzedUrl/analyzedNotes are internal bookkeeping (see
     // analyzeReferenceVideo below) used only to decide whether a fresh
@@ -1116,7 +1195,12 @@ const TOOLS = [
       'straight from the script/voice-over/subtitles — no scene clips involved at all, no Runway call ' +
       'ever, large synchronized on-screen story text plus burned-in captions, fixed at 1080p 16:9. It ' +
       'requires a completed voice-over AND completed subtitles (call generateVoiceover then ' +
-      'generateSubtitles first) and refuses with a clear reason if either is missing — the rest of this ' +
+      'generateSubtitles first) and refuses with a clear reason if either is missing. A real long story ' +
+      '(16+ sections) can take longer to fully render than one call safely allows, so this may return ' +
+      'finalVideo.status \'processing\' with a completedSections/totalSections count instead of ' +
+      '\'completed\' on this call — that is normal progress, never a failure: tell the user rendering ' +
+      'has started and is continuing in the background (the app keeps advancing it automatically), never ' +
+      'call this again yourself just to push it further along. The rest of this ' +
       'description (scene clips, outputFormat, burnInSubtitles, music, resolutionTier) describes the ' +
       'default \'cinematic\' Runway pipeline only. For a \'cinematic\' job: requires every scene\'s video clip to already ' +
       'be completed; if any scene is missing or not yet completed, this refuses with a clear reason — ' +
@@ -1548,6 +1632,22 @@ async function executeTool(name, jobId, input) {
         // here means assembleFinalVideo's own "already completed, skip"
         // check never keeps serving a stale, out-of-sync video afterward.
         updates.finalVideo = { url: null, status: 'pending', subtitlesUsed: null, musicUsed: null, resolutionUsed: null, videoModeUsed: null };
+        // Any already-rendered Simple Story Video sections were rendered
+        // from the PREVIOUS narration audio's own timing and no longer
+        // match this new one — resetting this alongside finalVideo means a
+        // fresh voice-over never resumes stale section progress (see
+        // continueSimpleStoryVideoAssembly's own staleness check, which
+        // would also catch this on its own since audioUrlSnapshot no
+        // longer matches, but resetting here keeps the job's own record
+        // honest immediately rather than only at the next assembly call).
+        updates.simpleStoryRender = {
+          status: 'not_started',
+          totalSections: null,
+          sections: [],
+          audioUrlSnapshot: null,
+          subtitlesContentSnapshot: null,
+          error: null,
+        };
         // Existing subtitles were transcribed from the PREVIOUS narration
         // audio and no longer match this new one — resetting them here
         // means generateSubtitles never serves stale captions, and
@@ -1603,7 +1703,7 @@ async function executeTool(name, jobId, input) {
       const desiredMusicUsed = computeDesiredMusicUsed(job);
       const desiredResolutionUsed = computeDesiredResolutionUsed(job);
       const desiredVideoModeUsed = computeDesiredVideoModeUsed(job);
-      const finalVideo = await assembleAndStoreFinalVideo(
+      const { finalVideo, simpleStoryRender } = await assembleAndStoreFinalVideo(
         job,
         jobId,
         desiredSubtitlesContent,
@@ -1611,7 +1711,7 @@ async function executeTool(name, jobId, input) {
         desiredResolutionUsed,
         desiredVideoModeUsed
       );
-      const updatedJob = await jobStore.updateJob(jobId, { finalVideo });
+      const updatedJob = await jobStore.updateJob(jobId, { finalVideo, simpleStoryRender });
       return JSON.stringify(updatedJob ? summarizeJobForAgent(updatedJob) : { error: 'job not found' });
     } catch (error) {
       console.error(
@@ -2020,9 +2120,18 @@ app.post('/api/jobs/:id/generate-voiceover', async (req, res) => {
     const updates = { voiceover };
     if (voiceover.status === 'completed') {
       // See the generateVoiceover Agent tool's identical comment: a fresh
-      // voice-over invalidates any already-assembled final video and any
+      // voice-over invalidates any already-assembled final video, any
+      // already-rendered Simple Story Video section progress, and any
       // existing subtitles (transcribed from the previous narration audio).
       updates.finalVideo = { url: null, status: 'pending', subtitlesUsed: null, musicUsed: null, resolutionUsed: null, videoModeUsed: null };
+      updates.simpleStoryRender = {
+        status: 'not_started',
+        totalSections: null,
+        sections: [],
+        audioUrlSnapshot: null,
+        subtitlesContentSnapshot: null,
+        error: null,
+      };
       updates.subtitles = { status: 'pending', format: 'srt', content: null, error: null, generatedFromVoiceoverUrl: null };
     }
 
@@ -2227,7 +2336,7 @@ app.post('/api/jobs/:id/assemble-video', async (req, res) => {
     const desiredMusicUsed = computeDesiredMusicUsed(job);
     const desiredResolutionUsed = computeDesiredResolutionUsed(job);
     const desiredVideoModeUsed = computeDesiredVideoModeUsed(job);
-    const finalVideo = await assembleAndStoreFinalVideo(
+    const { finalVideo, simpleStoryRender } = await assembleAndStoreFinalVideo(
       job,
       job.id,
       desiredSubtitlesContent,
@@ -2235,7 +2344,7 @@ app.post('/api/jobs/:id/assemble-video', async (req, res) => {
       desiredResolutionUsed,
       desiredVideoModeUsed
     );
-    const updatedJob = await jobStore.updateJob(job.id, { finalVideo });
+    const updatedJob = await jobStore.updateJob(job.id, { finalVideo, simpleStoryRender });
     res.json(updatedJob);
   } catch (error) {
     console.error(

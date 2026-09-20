@@ -62,11 +62,43 @@ function probe(filePath) {
   });
 }
 
-function makeToneAudio(dir, seconds) {
-  const outPath = path.join(dir, `tone-${seconds}.mp3`);
+let toneAudioCounter = 0;
+
+// `label` (defaulting to an auto-incrementing counter) guarantees a
+// distinct file path/url even for two tones of the identical duration —
+// needed so tests can produce two genuinely different "voice-over" urls to
+// exercise staleness detection, not two calls that happen to collide on
+// the same `tone-${seconds}.mp3` filename.
+function makeToneAudio(dir, seconds, label) {
+  const outPath = path.join(dir, `tone-${seconds}-${label || ++toneAudioCounter}.mp3`);
   return runFfmpeg(['-y', '-f', 'lavfi', '-i', `sine=frequency=220:duration=${seconds}`, '-c:a', 'libmp3lame', outPath]).then(
     () => outPath
   );
+}
+
+// Builds a real, longer .srt fixture (real timestamps, real sequential
+// cues) to simulate a production-length story without ever generating a
+// real production-length video — used only for the end-to-end resumability
+// simulation below, where the real POINT is exercising many separate
+// continueSimpleStoryVideoAssembly calls, not the exact narration content.
+function buildLongSrt(cueCount, cueDurationSeconds, gapSeconds) {
+  const lines = [];
+  let t = 0;
+  let n = 1;
+  const toSrtTimestamp = (seconds) => {
+    const hh = Math.floor(seconds / 3600);
+    const mm = Math.floor((seconds % 3600) / 60);
+    const ss = Math.floor(seconds % 60);
+    const ms = Math.round((seconds - Math.floor(seconds)) * 1000);
+    return `${String(hh).padStart(2, '0')}:${String(mm).padStart(2, '0')}:${String(ss).padStart(2, '0')},${String(ms).padStart(3, '0')}`;
+  };
+  for (let i = 0; i < cueCount; i++) {
+    const start = t;
+    const end = t + cueDurationSeconds;
+    lines.push(String(n++), `${toSrtTimestamp(start)} --> ${toSrtTimestamp(end)}`, 'A short line of story narration text.', '');
+    t = end + gapSeconds;
+  }
+  return { srt: lines.join('\n'), totalSeconds: t };
 }
 
 const FIXTURE_SRT = [
@@ -219,36 +251,40 @@ async function main() {
     );
   });
 
-  await test('assembleSimpleStoryVideo refuses without a completed voice-over', async () => {
-    const result = await ssv.assembleSimpleStoryVideo({
+  await test('continueSimpleStoryVideoAssembly refuses without a completed voice-over', async () => {
+    const result = await ssv.continueSimpleStoryVideoAssembly({
       voiceover: { status: 'pending', url: null },
       subtitlesContent: FIXTURE_SRT,
+      jobId: 'test-job-1',
     });
     assert.strictEqual(result.status, 'failed');
     assert.ok(/voice-over/i.test(result.error));
-    assert.strictEqual(result.buffer, null);
   });
 
-  await test('assembleSimpleStoryVideo refuses without real subtitles content', async () => {
+  await test('continueSimpleStoryVideoAssembly refuses without real subtitles content', async () => {
     const audioPath = await makeToneAudio(workDir, 9);
-    const result = await ssv.assembleSimpleStoryVideo({
+    const result = await ssv.continueSimpleStoryVideoAssembly({
       voiceover: { status: 'completed', url: audioPath },
       subtitlesContent: '',
+      jobId: 'test-job-2',
     });
     assert.strictEqual(result.status, 'failed');
     assert.ok(/subtitles/i.test(result.error));
   });
 
-  await test('assembleSimpleStoryVideo produces a real 1920x1080 MP4 with genuine audio, matching the real audio duration', async () => {
+  await test('continueSimpleStoryVideoAssembly produces a real 1920x1080 MP4 with genuine audio, matching the real audio duration', async () => {
     const audioPath = await makeToneAudio(workDir, 9);
-    const result = await ssv.assembleSimpleStoryVideo({
+    const result = await ssv.continueSimpleStoryVideoAssembly({
       voiceover: { status: 'completed', url: audioPath },
       subtitlesContent: FIXTURE_SRT,
+      jobId: 'test-job-3',
       sectionTargetSeconds: 3, // forces multiple real sections/transitions from this short fixture
     });
 
     assert.strictEqual(result.status, 'completed', result.error);
     assert.ok(result.buffer && result.buffer.length > 0);
+    assert.strictEqual(result.render.status, 'completed');
+    assert.ok(result.render.sections.every((section) => section.status === 'completed'));
 
     const outPath = path.join(workDir, 'output.mp4');
     fs.writeFileSync(outPath, result.buffer);
@@ -259,24 +295,25 @@ async function main() {
     assert.ok(Math.abs(probed.duration - 9) < 0.3, `expected ~9s duration, got ${probed.duration}`);
   });
 
-  // --- mapWithConcurrency: the scheduling fix for the real production
-  // timeout (many independent section renders previously ran one at a
-  // time in a for-loop) — tested directly with synthetic timed tasks, no
-  // ffmpeg needed, since what's new here is the scheduling algorithm
-  // itself, not renderSection's own output (already covered above).
+  // --- mapWithConcurrencyUntilDeadline: the scheduling fix for the real
+  // production timeout (many independent section renders previously ran
+  // one at a time in a for-loop) — tested directly with synthetic timed
+  // tasks, no ffmpeg needed, since what's new here is the scheduling
+  // algorithm itself, not renderSection's own output (already covered
+  // above).
 
-  await test('mapWithConcurrency preserves input order regardless of which task finishes first', async () => {
+  await test('mapWithConcurrencyUntilDeadline preserves input order regardless of which task finishes first', async () => {
     const delays = [30, 5, 20, 1, 10]; // deliberately out of order
-    const results = await ssv.mapWithConcurrency(delays, 3, (delay, i) => new Promise((resolve) => setTimeout(() => resolve(i), delay)));
+    const results = await ssv.mapWithConcurrencyUntilDeadline(delays, 3, null, (delay, i) => new Promise((resolve) => setTimeout(() => resolve(i), delay)));
     assert.deepStrictEqual(results, [0, 1, 2, 3, 4], 'results must stay in original item order, not completion order');
   });
 
-  await test('mapWithConcurrency never runs more than `limit` tasks at once', async () => {
+  await test('mapWithConcurrencyUntilDeadline never runs more than `limit` tasks at once', async () => {
     let active = 0;
     let maxActive = 0;
     const items = Array.from({ length: 10 }, (_, i) => i);
 
-    await ssv.mapWithConcurrency(items, 4, async () => {
+    await ssv.mapWithConcurrencyUntilDeadline(items, 4, null, async () => {
       active++;
       maxActive = Math.max(maxActive, active);
       await new Promise((resolve) => setTimeout(resolve, 15));
@@ -287,14 +324,14 @@ async function main() {
     assert.strictEqual(maxActive, 4, 'expected the limit to actually be reached with 10 items and a limit of 4');
   });
 
-  await test('mapWithConcurrency handles fewer items than the concurrency limit', async () => {
-    const results = await ssv.mapWithConcurrency([1, 2], 4, async (n) => n * 10);
+  await test('mapWithConcurrencyUntilDeadline handles fewer items than the concurrency limit', async () => {
+    const results = await ssv.mapWithConcurrencyUntilDeadline([1, 2], 4, null, async (n) => n * 10);
     assert.deepStrictEqual(results, [10, 20]);
   });
 
-  await test('mapWithConcurrency propagates a rejection from any task', async () => {
+  await test('mapWithConcurrencyUntilDeadline propagates a rejection from any task', async () => {
     await assert.rejects(
-      () => ssv.mapWithConcurrency([1, 2, 3], 2, async (n) => {
+      () => ssv.mapWithConcurrencyUntilDeadline([1, 2, 3], 2, null, async (n) => {
         if (n === 2) throw new Error('simulated task failure');
         return n;
       }),
@@ -302,12 +339,12 @@ async function main() {
     );
   });
 
-  await test('mapWithConcurrency runs meaningfully faster than sequential execution for independent tasks', async () => {
+  await test('mapWithConcurrencyUntilDeadline runs meaningfully faster than sequential execution for independent tasks', async () => {
     const items = Array.from({ length: 8 }, (_, i) => i);
     const taskDurationMs = 25;
 
     const start = Date.now();
-    await ssv.mapWithConcurrency(items, 4, () => new Promise((resolve) => setTimeout(resolve, taskDurationMs)));
+    await ssv.mapWithConcurrencyUntilDeadline(items, 4, null, () => new Promise((resolve) => setTimeout(resolve, taskDurationMs)));
     const elapsed = Date.now() - start;
 
     // 8 tasks at limit 4 = 2 sequential rounds ~= 50ms; 8 sequential tasks
@@ -317,16 +354,43 @@ async function main() {
     assert.ok(elapsed < taskDurationMs * 6, `expected parallel execution to be well under sequential time, took ${elapsed}ms`);
   });
 
-  await test('assembleSimpleStoryVideo renders multiple real sections in parallel — same correct output as sequential rendering', async () => {
-    // Reproduces the real production shape: several sections from one job.
-    // sectionTargetSeconds forces 6 real sections from an 18s fixture,
-    // exercising SECTION_RENDER_CONCURRENCY's bounded-parallel path (more
-    // sections than the concurrency limit) with real local ffmpeg — never a
-    // real production-length video, per this app's testing discipline.
+  await test('mapWithConcurrencyUntilDeadline stops starting new work once the deadline passes, letting in-flight work finish', async () => {
+    const items = Array.from({ length: 8 }, (_, i) => i);
+    const started = [];
+    const deadlineAt = Date.now() + 30;
+
+    const results = await ssv.mapWithConcurrencyUntilDeadline(items, 2, deadlineAt, async (n) => {
+      started.push(n);
+      await new Promise((resolve) => setTimeout(resolve, 25));
+      return n * 10;
+    });
+
+    assert.ok(started.length < items.length, `expected fewer than all ${items.length} items to start, got ${started.length}`);
+    assert.ok(started.length > 0, 'expected at least some items to start before the deadline stopped new work');
+    for (let i = 0; i < started.length; i++) {
+      assert.strictEqual(results[started[i]], started[i] * 10, 'every item that DID start must still finish and produce a real result');
+    }
+  });
+
+  await test('mapWithConcurrencyUntilDeadline always starts at least one item even if the deadline already passed', async () => {
+    const results = await ssv.mapWithConcurrencyUntilDeadline([1, 2, 3], 2, Date.now() - 1000, async (n) => n * 10);
+    assert.strictEqual(results[0], 10, 'the first item must still run — a stale/already-passed deadline must never mean zero progress');
+  });
+
+  await test('continueSimpleStoryVideoAssembly renders multiple real sections — same correct output as before parallelism/resumability existed', async () => {
+    // Reproduces the real production shape: more than one section from one
+    // job (this fixture's cue spacing plus a 3s target produces 2 real
+    // sections from an 18s audio track — the last one padded out to cover
+    // the trailing silence). SECTION_RENDER_CONCURRENCY's bounded-parallel
+    // scheduling itself (more items than the concurrency limit) is
+    // covered directly by the mapWithConcurrencyUntilDeadline unit tests
+    // above with synthetic tasks; this test is about real ffmpeg output
+    // correctness, never a real production-length video.
     const audioPath = await makeToneAudio(workDir, 18);
-    const result = await ssv.assembleSimpleStoryVideo({
+    const result = await ssv.continueSimpleStoryVideoAssembly({
       voiceover: { status: 'completed', url: audioPath },
       subtitlesContent: FIXTURE_SRT,
+      jobId: 'test-job-parallel',
       sectionTargetSeconds: 3,
     });
 
@@ -340,14 +404,16 @@ async function main() {
     assert.ok(Math.abs(probed.duration - 18) < 0.3, `expected ~18s duration, got ${probed.duration}`);
   });
 
-  await test('assembleSimpleStoryVideo pads the video to the real audio duration when cues end early', async () => {
+  await test('continueSimpleStoryVideoAssembly pads the video to the real audio duration when cues end early', async () => {
     // Audio runs 12s but the fixture's last cue ends at 8.9s — the video
-    // must never truncate real narration; it should hold the last frame
-    // for the remaining ~3.1s instead.
+    // must never truncate real narration; the last section's own render is
+    // extended to cover the remaining ~3.1s instead (see this module's own
+    // comment on why that replaced a separate global padding pass).
     const audioPath = await makeToneAudio(workDir, 12);
-    const result = await ssv.assembleSimpleStoryVideo({
+    const result = await ssv.continueSimpleStoryVideoAssembly({
       voiceover: { status: 'completed', url: audioPath },
       subtitlesContent: FIXTURE_SRT,
+      jobId: 'test-job-padded',
       sectionTargetSeconds: 3,
     });
 
@@ -356,6 +422,230 @@ async function main() {
     fs.writeFileSync(outPath, result.buffer);
     const probed = await probe(outPath);
     assert.ok(Math.abs(probed.duration - 12) < 0.3, `expected the video to be padded out to ~12s, got ${probed.duration}`);
+  });
+
+  // --- Resumability: the actual point of this task. A real production job
+  // could not finish 16 sections inside one 300s Vercel invocation.
+  // timeBudgetMs simulates that boundary with a real, short cutoff instead
+  // of needing an actual multi-minute fixture — the SAME real ffmpeg
+  // section-rendering code path runs either way.
+
+  await test('continueSimpleStoryVideoAssembly stops with status "in_progress" when the time budget runs out before every section is done', async () => {
+    const audioPath = await makeToneAudio(workDir, 18);
+    const result = await ssv.continueSimpleStoryVideoAssembly({
+      voiceover: { status: 'completed', url: audioPath },
+      subtitlesContent: FIXTURE_SRT,
+      jobId: 'test-job-resume-1',
+      sectionTargetSeconds: 3, // 2 real sections from this fixture's cue spacing
+      timeBudgetMs: 1, // expires before every section can start
+    });
+
+    assert.strictEqual(result.status, 'in_progress', JSON.stringify(result));
+    assert.strictEqual(result.render.status, 'in_progress');
+    assert.strictEqual(result.render.totalSections, 2);
+    assert.ok(result.render.sections.some((section) => section.status === 'pending'), 'at least one section must still be pending');
+    assert.strictEqual(result.buffer, undefined, 'must never return a buffer while sections remain unrendered');
+  });
+
+  await test('continueSimpleStoryVideoAssembly resumes from persisted progress instead of re-rendering already-completed sections', async () => {
+    const audioPath = await makeToneAudio(workDir, 18);
+    const jobId = 'test-job-resume-2';
+
+    // First call: a real but tiny time budget lets at least one section
+    // through (mapWithConcurrencyUntilDeadline always starts at least one
+    // item per worker) but not all 6.
+    const first = await ssv.continueSimpleStoryVideoAssembly({
+      voiceover: { status: 'completed', url: audioPath },
+      subtitlesContent: FIXTURE_SRT,
+      jobId,
+      sectionTargetSeconds: 3,
+      timeBudgetMs: 1,
+    });
+    assert.strictEqual(first.status, 'in_progress', JSON.stringify(first));
+    const completedUrlsAfterFirstCall = first.render.sections.map((s) => s.url);
+    const completedCountAfterFirstCall = first.render.sections.filter((s) => s.status === 'completed').length;
+    assert.ok(completedCountAfterFirstCall > 0, 'the first call must make some real progress');
+    assert.ok(completedCountAfterFirstCall < 6, 'test setup: the first call must NOT finish everything, or this test proves nothing');
+
+    // Second call: same voiceover/subtitles, existingRender = the first
+    // call's own progress, and a real, generous time budget to finish.
+    const second = await ssv.continueSimpleStoryVideoAssembly({
+      voiceover: { status: 'completed', url: audioPath },
+      subtitlesContent: FIXTURE_SRT,
+      jobId,
+      existingRender: first.render,
+      sectionTargetSeconds: 3,
+    });
+
+    assert.strictEqual(second.status, 'completed', second.error);
+    assert.ok(second.render.sections.every((section) => section.status === 'completed'));
+
+    // The DEFINITIVE proof of no wasted re-rendering: storeSimpleStorySectionClip
+    // gives every real render a brand-new random filename (see
+    // video-storage.js), so a section already completed by the first call
+    // must keep the EXACT SAME url in the second call's final result —
+    // a different url would mean it was thrown away and rendered again.
+    for (let i = 0; i < completedUrlsAfterFirstCall.length; i++) {
+      if (completedUrlsAfterFirstCall[i]) {
+        assert.strictEqual(
+          second.render.sections[i].url,
+          completedUrlsAfterFirstCall[i],
+          `section ${i} was already completed by the first call and must not have been re-rendered`
+        );
+      }
+    }
+
+    const outPath = path.join(workDir, 'output-resumed.mp4');
+    fs.writeFileSync(outPath, second.buffer);
+    const probed = await probe(outPath);
+    assert.strictEqual(probed.width, ssv.SIMPLE_STORY_WIDTH);
+    assert.ok(Math.abs(probed.duration - 18) < 0.3, `expected ~18s duration, got ${probed.duration}`);
+  });
+
+  await test('continueSimpleStoryVideoAssembly discards stale progress and starts over when the voice-over url changes', async () => {
+    const audioPathA = await makeToneAudio(workDir, 9);
+    const audioPathB = await makeToneAudio(workDir, 9);
+    const jobId = 'test-job-stale-voiceover';
+
+    const first = await ssv.continueSimpleStoryVideoAssembly({
+      voiceover: { status: 'completed', url: audioPathA },
+      subtitlesContent: FIXTURE_SRT,
+      jobId,
+      sectionTargetSeconds: 3,
+    });
+    assert.strictEqual(first.status, 'completed', first.error);
+
+    const second = await ssv.continueSimpleStoryVideoAssembly({
+      voiceover: { status: 'completed', url: audioPathB }, // a "fresh" voice-over
+      subtitlesContent: FIXTURE_SRT,
+      jobId,
+      existingRender: first.render,
+      sectionTargetSeconds: 3,
+    });
+
+    assert.strictEqual(second.status, 'completed', second.error);
+    assert.strictEqual(second.render.audioUrlSnapshot, audioPathB);
+    // A real rebuild, not a reuse: every section's url must be a fresh one.
+    for (let i = 0; i < first.render.sections.length; i++) {
+      assert.notStrictEqual(
+        second.render.sections[i].url,
+        first.render.sections[i].url,
+        'stale progress from the old voice-over must never be reused for a new one'
+      );
+    }
+  });
+
+  await test('continueSimpleStoryVideoAssembly discards stale progress and starts over when subtitles content changes', async () => {
+    const audioPath = await makeToneAudio(workDir, 9);
+    const jobId = 'test-job-stale-subtitles';
+    const CHANGED_SRT = FIXTURE_SRT.replace('curious young fox', 'brave little rabbit');
+
+    const first = await ssv.continueSimpleStoryVideoAssembly({
+      voiceover: { status: 'completed', url: audioPath },
+      subtitlesContent: FIXTURE_SRT,
+      jobId,
+      sectionTargetSeconds: 3,
+    });
+    assert.strictEqual(first.status, 'completed', first.error);
+
+    const second = await ssv.continueSimpleStoryVideoAssembly({
+      voiceover: { status: 'completed', url: audioPath },
+      subtitlesContent: CHANGED_SRT,
+      jobId,
+      existingRender: first.render,
+      sectionTargetSeconds: 3,
+    });
+
+    assert.strictEqual(second.status, 'completed', second.error);
+    assert.strictEqual(second.render.subtitlesContentSnapshot, CHANGED_SRT);
+    for (let i = 0; i < first.render.sections.length; i++) {
+      assert.notStrictEqual(
+        second.render.sections[i].url,
+        first.render.sections[i].url,
+        'stale progress from the old subtitles must never be reused for changed text'
+      );
+    }
+  });
+
+  await test('continueSimpleStoryVideoAssembly progress accumulates monotonically across repeated partial calls, never regressing', async () => {
+    const audioPath = await makeToneAudio(workDir, 18);
+    const jobId = 'test-job-monotonic';
+
+    const first = await ssv.continueSimpleStoryVideoAssembly({
+      voiceover: { status: 'completed', url: audioPath },
+      subtitlesContent: FIXTURE_SRT,
+      jobId,
+      sectionTargetSeconds: 3,
+      timeBudgetMs: 1,
+    });
+    assert.strictEqual(first.status, 'in_progress');
+    const completedCount = first.render.sections.filter((s) => s.status === 'completed').length;
+    assert.ok(completedCount > 0);
+
+    const second = await ssv.continueSimpleStoryVideoAssembly({
+      voiceover: { status: 'completed', url: audioPath },
+      subtitlesContent: FIXTURE_SRT,
+      jobId,
+      existingRender: first.render,
+      sectionTargetSeconds: 3,
+      timeBudgetMs: 1,
+    });
+
+    // Another tiny budget: still not necessarily finished, but must never
+    // have lost the sections the first call already completed.
+    assert.notStrictEqual(second.status, 'failed', second.error);
+    const stillCompleted = second.render.sections.filter((s) => s.status === 'completed').length;
+    assert.ok(stillCompleted >= completedCount, 'sections already completed by an earlier call must never be lost by a later one');
+  });
+
+  await test('end-to-end: a real production-shaped job (20 sections) completes across several short calls, none anywhere near a real timeout', async () => {
+    // Directly reproduces the real production failure this whole feature
+    // exists to fix: real Vercel logs showed a 16-section job stuck at
+    // "10/16 sections rendered" after 248-249 real seconds — one HTTP
+    // request could not finish it. This builds a comparable-sized job (a
+    // ~16-minute simulated story, 20 sections at the default 45s target)
+    // and drives it forward with a REALISTIC per-call time budget, exactly
+    // the way server.js's assembleAndStoreFinalVideo does in production —
+    // proving completion happens across multiple bounded calls, with no
+    // single call anywhere close to a real serverless timeout, rather than
+    // needing one long-lived request.
+    const { srt, totalSeconds } = buildLongSrt(96, 9, 1);
+    const audioPath = await makeToneAudio(workDir, totalSeconds, 'e2e');
+    const REALISTIC_PER_CALL_BUDGET_MS = 15000; // generous but far under any real platform limit
+
+    let render;
+    let result;
+    let callCount = 0;
+    do {
+      callCount++;
+      const callStart = Date.now();
+      result = await ssv.continueSimpleStoryVideoAssembly({
+        voiceover: { status: 'completed', url: audioPath },
+        subtitlesContent: srt,
+        existingRender: render,
+        jobId: 'test-job-e2e-production-shape',
+        timeBudgetMs: REALISTIC_PER_CALL_BUDGET_MS,
+      });
+      render = result.render;
+      const callElapsedMs = Date.now() - callStart;
+      assert.ok(
+        callElapsedMs < REALISTIC_PER_CALL_BUDGET_MS + 10000,
+        `call ${callCount} took ${callElapsedMs}ms — a single call must never run drastically longer than its own time budget`
+      );
+      assert.ok(callCount <= 20, 'test setup: this should resolve well within 20 calls, or something regressed badly');
+    } while (result.status === 'in_progress');
+
+    assert.strictEqual(result.status, 'completed', result.error);
+    assert.ok(callCount > 1, 'test setup: this job must genuinely need more than one call, or this test proves nothing about resumability');
+    assert.ok(render.sections.every((section) => section.status === 'completed'));
+    assert.ok(result.buffer && result.buffer.length > 0);
+
+    const outPath = path.join(workDir, 'output-e2e.mp4');
+    fs.writeFileSync(outPath, result.buffer);
+    const probed = await probe(outPath);
+    assert.strictEqual(probed.width, ssv.SIMPLE_STORY_WIDTH);
+    assert.strictEqual(probed.height, ssv.SIMPLE_STORY_HEIGHT);
+    assert.ok(Math.abs(probed.duration - totalSeconds) < 0.5, `expected ~${totalSeconds.toFixed(1)}s duration, got ${probed.duration}`);
   });
 
   fs.rmSync(workDir, { recursive: true, force: true });

@@ -90,6 +90,7 @@ const JOB_FIELDS = [
   'voiceover',
   'videoGeneration',
   'finalVideo',
+  'simpleStoryRender',
   'referenceVideoUrl',
   'referenceVideoNotes',
   'referenceVideoAnalysis',
@@ -366,6 +367,12 @@ function createDefaultJob(id) {
     // for the videoMode field above. A job whose videoMode is switched
     // between 'cinematic' and 'simple-story' after a final video already
     // exists must never keep serving the old pipeline's stale output.
+    // status is 'pending' | 'processing' | 'completed' | 'failed'.
+    // 'processing' is Simple Story Video mode only (see simpleStoryRender
+    // below) — a real render still under way across more than one
+    // assembleFinalVideo call, never a single blocking call for a long
+    // story. The cinematic (Runway) pipeline never produces 'processing':
+    // its own assembly reliably finishes within one call.
     finalVideo: {
       url: null,
       status: 'pending',
@@ -373,6 +380,39 @@ function createDefaultJob(id) {
       musicUsed: null,
       resolutionUsed: null,
       videoModeUsed: null,
+    },
+    // Durable, resumable progress for Simple Story Video mode's section-by-
+    // section rendering (see backend/simple-story-video.js's
+    // continueSimpleStoryVideoAssembly) — real production evidence showed a
+    // long story's full render (16+ real sections, each a real local ffmpeg
+    // encode) can take longer than a single serverless function invocation
+    // safely allows, so this lets that work resume across SEPARATE
+    // assembleFinalVideo calls instead of needing one request to finish
+    // everything. status: 'not_started' | 'in_progress' | 'completed' |
+    // 'failed'. sections: one entry per real section this job's current
+    // voice-over/subtitles produce — { status: 'pending' | 'completed',
+    // url }, url only ever set once that section's real clip was rendered
+    // AND durably stored (backend/video-storage.js — Vercel Blob in
+    // production, a local file in dev), so completed work already paid for
+    // in compute time is never lost between invocations, even if a later
+    // section fails or a later invocation is interrupted.
+    // audioUrlSnapshot/subtitlesContentSnapshot record exactly which
+    // voice-over/subtitles this progress was built from — a fresh
+    // voice-over or a real subtitles change invalidates every previously-
+    // rendered section (their real narration timing no longer matches), so
+    // continueSimpleStoryVideoAssembly discards stale progress and starts
+    // over the moment either no longer matches, the same "never serve a
+    // stale cached result" discipline finalVideo's own subtitlesUsed/
+    // musicUsed/resolutionUsed/videoModeUsed already apply. Not writable by
+    // the conversational agent — only the real assembly step populates
+    // this, same as images/voiceover/finalVideo.
+    simpleStoryRender: {
+      status: 'not_started',
+      totalSections: null,
+      sections: [],
+      audioUrlSnapshot: null,
+      subtitlesContentSnapshot: null,
+      error: null,
     },
     // Optional "Reference Video / Inspiration Mode" input: a YouTube URL the
     // user wants used only as high-level storytelling inspiration (pacing,
