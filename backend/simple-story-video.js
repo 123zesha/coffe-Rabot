@@ -29,12 +29,15 @@
 //
 // Cues are grouped into "sections" by real elapsed time (never a fixed cue
 // count, so pacing stays even regardless of sentence length) — each
-// section gets its own simple solid-color background and a slow Ken Burns
-// zoom, concatenated with a short fade-to-black transition at each
-// boundary. Text is burned in afterward, over the fully composed timeline
-// (same ordering principle as video-assembly.js's own burnInSubtitlesContent
-// stage), using GLOBAL cue timestamps — no per-section local-time
-// conversion needed.
+// section gets its own simple solid-color background, a slow Ken Burns
+// zoom, AND its own slice of the on-screen story/caption text burned in,
+// all in one ffmpeg pass per section (see renderSection), then concatenated
+// with a short fade-to-black transition at each boundary. Text used to be
+// burned in globally, once, over the fully concatenated timeline — moved
+// per-section (each section's cues localized to its own 0-based timeline
+// by cuesForSection) so that work runs inside the same parallel step as
+// the background rendering, and concatenation never needs to re-encode
+// anything afterward regardless of the video's total length.
 //
 // Every text-rendering filter references a font BUNDLED with this repo
 // (assets/fonts/) via an explicit fontsdir path, rather than depending on
@@ -297,13 +300,15 @@ function escapeAssText(text) {
   return String(text).replace(/\{/g, '\uFF5B').replace(/\}/g, '\uFF5D');
 }
 
-// Builds one combined ASS script covering the whole video: a large,
-// centered "Story" line per cue (held on screen until the NEXT cue begins,
-// so a natural pause never blanks the screen — extending to audioDuration
-// for the last cue) and a small, bottom "Caption" line per cue at its own
-// original transcribed timing (standard caption behavior). Both draw from
-// the exact same real, transcribed cues — never two different sources of
-// truth for the same narration.
+// Builds one ASS script covering a given span of the video (the whole
+// video, or — see renderSection — just one section's own local timeline):
+// a large, centered "Story" line per cue (held on screen until the NEXT
+// cue begins, so a natural pause never blanks the screen — extending to
+// `audioDuration`, the span's own real end, for the last cue) and a small,
+// bottom "Caption" line per cue at its own original transcribed timing
+// (standard caption behavior). Both draw from the exact same real,
+// transcribed cues — never two different sources of truth for the same
+// narration.
 function buildAssScript(cues, audioDuration) {
   const header =
     '[Script Info]\n' +
@@ -345,26 +350,57 @@ function buildAssScript(cues, audioDuration) {
   return header + lines.join('\n') + '\n';
 }
 
-// Renders one section's plain solid-color background with a slow Ken Burns
+// Returns the cues that fall in this section (matched by real, GLOBAL
+// cue.start), with start/end shifted to the section's own LOCAL timeline
+// (0 = section.start) — ready to pass straight into buildAssScript.
+// groupCuesIntoSections only ever starts a new section exactly at some
+// cue's own start time, so a cue's "hold text until the next cue begins"
+// span (see buildAssScript) can never actually need to reach past its own
+// section's end: the next cue either falls in this SAME section, or IS the
+// cue whose start defines the following section's boundary. Per-section
+// text burn-in is therefore byte-identical in timing to the original
+// single global pass, not an approximation. A cue's own real end is
+// clamped to the section's end as a defensive safety net (real transcribed
+// cues are sequential and this should not trigger in practice).
+function cuesForSection(cues, section) {
+  return cues
+    .filter((cue) => cue.start >= section.start && cue.start < section.end)
+    .map((cue) => ({
+      start: cue.start - section.start,
+      end: Math.min(cue.end, section.end) - section.start,
+      text: cue.text,
+    }));
+}
+
+// Renders one section's plain solid-color background, a slow Ken Burns
 // zoom (zoom-in on even sections / zoom-out on odd sections, for gentle
-// visual variety) and a short fade-to-black at each end, to its own
-// standalone MP4 — no text; text is burned in once, globally, after every
-// section is concatenated (see assembleSimpleStoryVideo). Every section is
-// encoded with identical codec/resolution/fps settings so they can be
-// concatenated afterward with `-c copy` (no quality loss, no re-encoding a
-// 15-20 minute video twice).
-async function renderSection(section, sectionIndex, workDir) {
-  const duration = Math.max(0.5, section.end - section.start);
+// visual variety), a short fade-to-black at each end, AND this section's
+// own slice of the on-screen story/caption text — all burned in together
+// in ONE ffmpeg pass. Every section is encoded with identical codec/
+// resolution/fps settings so they can be concatenated afterward with
+// `-c copy` (no quality loss, no further re-encoding).
+// sectionCues: this section's cues, already localized by cuesForSection.
+// effectiveDuration: this section's own rendered length — equal to
+// section.end - section.start for every section except the last, which
+// the caller extends to cover any real audio duration remaining after the
+// last cue (see assembleSimpleStoryVideo for why this replaces a separate
+// global padding pass).
+async function renderSection(section, sectionIndex, workDir, sectionCues, effectiveDuration) {
+  const duration = Math.max(0.5, effectiveDuration);
   const outPath = path.join(workDir, `section-${sectionIndex}.mp4`);
   const color = backgroundColorForSection(sectionIndex);
   const zoomingIn = sectionIndex % 2 === 0;
   const zoomExpr = zoomingIn ? 'min(zoom+0.0006,1.15)' : 'if(eq(on,0),1.15,max(zoom-0.0006,1.0))';
 
   const fadeDuration = Math.min(SECTION_FADE_SECONDS, duration / 2);
+  const assPath = path.join(workDir, `section-${sectionIndex}.ass`);
+  fs.writeFileSync(assPath, buildAssScript(sectionCues, duration), 'utf8');
+
   const vf =
     `zoompan=z='${zoomExpr}':d=1:s=${SIMPLE_STORY_WIDTH}x${SIMPLE_STORY_HEIGHT}:fps=${SIMPLE_STORY_FPS},` +
     `fade=t=in:st=0:d=${fadeDuration.toFixed(3)},` +
-    `fade=t=out:st=${Math.max(0, duration - fadeDuration).toFixed(3)}:d=${fadeDuration.toFixed(3)}`;
+    `fade=t=out:st=${Math.max(0, duration - fadeDuration).toFixed(3)}:d=${fadeDuration.toFixed(3)},` +
+    `ass='${escapeFilterValue(assPath)}':fontsdir='${escapeFilterValue(FONTS_DIR)}'`;
 
   await runFfmpeg([
     '-y',
@@ -436,9 +472,23 @@ async function assembleSimpleStoryVideo({ voiceover, subtitlesContent, sectionTa
     const targetSectionSeconds = sectionTargetSeconds > 0 ? sectionTargetSeconds : DEFAULT_SECTION_TARGET_SECONDS;
     const sections = groupCuesIntoSections(cues, targetSectionSeconds, audioDuration);
 
-    const sectionPaths = await mapWithConcurrency(sections, SECTION_RENDER_CONCURRENCY, (section, i) =>
-      renderSection(section, i, workDir)
-    );
+    const sectionPaths = await mapWithConcurrency(sections, SECTION_RENDER_CONCURRENCY, (section, i) => {
+      // The visual timeline is built entirely from real section boundaries
+      // (themselves derived from real cue timestamps), which can end
+      // slightly before the real, measured audio duration (e.g. a trailing
+      // pause after the last line) — never truncate real narration.
+      // Extending the LAST section's own rendered duration to cover the
+      // real audio duration (instead of a separate padding pass over the
+      // whole video afterward, as this module used to do) means every
+      // section already has real text burned in and the concatenation step
+      // below never needs to re-encode anything, regardless of the video's
+      // total length.
+      const isLastSection = i === sections.length - 1;
+      const effectiveDuration = isLastSection
+        ? Math.max(section.end, audioDuration) - section.start
+        : section.end - section.start;
+      return renderSection(section, i, workDir, cuesForSection(cues, section), effectiveDuration);
+    });
 
     const listPath = path.join(workDir, 'sections.txt');
     fs.writeFileSync(listPath, sectionPaths.map((p) => `file '${p.replace(/'/g, "'\\''")}'`).join('\n'), 'utf8');
@@ -446,30 +496,17 @@ async function assembleSimpleStoryVideo({ voiceover, subtitlesContent, sectionTa
     const concatenatedPath = path.join(workDir, 'concatenated.mp4');
     await runFfmpeg(['-y', '-f', 'concat', '-safe', '0', '-i', listPath, '-c', 'copy', concatenatedPath]);
 
-    // The visual timeline is built entirely from real section boundaries
-    // (themselves derived from real cue timestamps), which can end
-    // slightly before the real, measured audio duration (e.g. a trailing
-    // pause after the last line) — never truncate real narration: hold the
-    // last frame for the shortfall, the same tpad technique
-    // video-assembly.js uses for the same reason.
-    //
-    // Padding (tpad) and subtitle burn-in (ass) are applied in a SINGLE
-    // ffmpeg pass via one combined -vf filter chain, rather than two
-    // separate full-length re-encodes — measured on a real 18-minute
-    // fixture, two passes took ~240s combined vs ~123s for one combined
-    // pass, for byte-for-byte identical output duration. For a 15-20
-    // minute video this is the difference between safely fitting inside a
-    // 300s serverless function timeout and not.
-    const videoDuration = await getMediaDuration(concatenatedPath);
-    const filterParts = [];
-    if (audioDuration > videoDuration + 0.05) {
-      filterParts.push(`tpad=stop_mode=clone:stop_duration=${(audioDuration - videoDuration).toFixed(3)}`);
-    }
-
-    const assPath = path.join(workDir, 'story-text.ass');
-    fs.writeFileSync(assPath, buildAssScript(cues, audioDuration), 'utf8');
-    filterParts.push(`ass='${escapeFilterValue(assPath)}':fontsdir='${escapeFilterValue(FONTS_DIR)}'`);
-
+    // Every section already has its own text burned in and already covers
+    // the real audio duration (see above), so all that's left is muxing in
+    // the real narration audio — a plain stream copy of the already-final
+    // video (-c:v copy), never a re-encode. Previously this step also
+    // burned in subtitles and padded for trailing silence in one combined
+    // full-length re-encode pass; measured on a real 18-minute fixture that
+    // pass alone took ~123s, and a real production job's total render still
+    // exceeded Vercel's 300s function timeout even after parallelizing
+    // section rendering — moving both burn-in and padding into the
+    // per-section step above removes this remaining full-length re-encode
+    // entirely, regardless of video length.
     const finalPath = path.join(workDir, 'final.mp4');
 
     await runFfmpeg([
@@ -478,18 +515,12 @@ async function assembleSimpleStoryVideo({ voiceover, subtitlesContent, sectionTa
       concatenatedPath,
       '-i',
       audioPath,
-      '-vf',
-      filterParts.join(','),
       '-map',
       '0:v',
       '-map',
       '1:a',
       '-c:v',
-      'libx264',
-      '-preset',
-      'veryfast',
-      '-pix_fmt',
-      'yuv420p',
+      'copy',
       '-c:a',
       'aac',
       '-shortest',
@@ -561,6 +592,8 @@ module.exports = {
   wrapText,
   fitCueText,
   buildAssScript,
+  cuesForSection,
+  secondsToAssTimestamp,
   mapWithConcurrency,
   SECTION_RENDER_CONCURRENCY,
   SIMPLE_STORY_WIDTH,

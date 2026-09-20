@@ -165,6 +165,60 @@ async function main() {
     assert.ok(storyLines[1].includes('0:00:05.20'), `expected cue 2's story text to hold until 5.2s, got: ${storyLines[1]}`);
   });
 
+  // --- cuesForSection: the correctness property the per-section text
+  // burn-in refactor relies on — a cue's "hold until next cue" span (see
+  // buildAssScript) must never actually need to reach past its own
+  // section's end, since groupCuesIntoSections only ever starts a new
+  // section exactly at some cue's own start time.
+
+  await test('cuesForSection assigns each cue to exactly the section containing its real start time', () => {
+    const cues = ssv.parseSrt(FIXTURE_SRT);
+    const sections = ssv.groupCuesIntoSections(cues, 3, 9); // forces multiple sections
+    const allAssigned = sections.flatMap((section) => ssv.cuesForSection(cues, section));
+    assert.strictEqual(allAssigned.length, cues.length, 'every cue must be assigned to exactly one section, none dropped or duplicated');
+  });
+
+  await test('cuesForSection localizes cue timestamps to the section\'s own 0-based timeline', () => {
+    const cues = ssv.parseSrt(FIXTURE_SRT);
+    const sections = ssv.groupCuesIntoSections(cues, 3, 9);
+    const secondSection = sections[1];
+    const localCues = ssv.cuesForSection(cues, secondSection);
+    for (const cue of localCues) {
+      assert.ok(cue.start >= 0, 'localized start must never be negative');
+      assert.ok(cue.end <= secondSection.end - secondSection.start + 0.001, 'localized end must never exceed the section\'s own length');
+    }
+  });
+
+  await test('cuesForSection + buildAssScript reproduces the exact same story-hold timing as the original single global pass', () => {
+    // This is the core correctness claim of moving text burn-in per-section:
+    // cue 2 previously held its Story text until cue 3's global start
+    // (5.2s) via ONE global ASS script. With a 2s section target, cue 2
+    // (start 2.5s) and cue 3 (start 5.2s) land in DIFFERENT, non-zero-start
+    // sections — proving the LOCAL, per-section version still holds cue 2's
+    // text all the way to its own section's end (which equals cue 3's
+    // global start, by construction — see cuesForSection's own comment),
+    // not just in the trivial case where a section happens to start at 0.
+    const cues = ssv.parseSrt(FIXTURE_SRT);
+    const sections = ssv.groupCuesIntoSections(cues, 2, 9);
+    const cue2Section = sections.find((s) => 2.5 >= s.start && 2.5 < s.end);
+    const cue3Section = sections.find((s) => 5.2 >= s.start && 5.2 < s.end);
+    assert.notStrictEqual(cue2Section, cue3Section, 'test setup: cue 2 and cue 3 must land in different sections for this to be meaningful');
+    assert.notStrictEqual(cue2Section.start, 0, 'test setup: cue 2\'s section must not start at 0, to actually exercise localization');
+    assert.strictEqual(cue2Section.end, 5.2, 'sanity check: this section must end exactly at cue 3\'s global start time');
+
+    const localCues = ssv.cuesForSection(cues, cue2Section);
+    const sectionDuration = cue2Section.end - cue2Section.start;
+    const ass = ssv.buildAssScript(localCues, sectionDuration);
+    const storyLines = ass.split('\n').filter((line) => line.includes(',Story,'));
+    const lastStoryLine = storyLines[storyLines.length - 1];
+
+    const expectedLocalEnd = ssv.secondsToAssTimestamp(sectionDuration);
+    assert.ok(
+      lastStoryLine.includes(expectedLocalEnd),
+      `expected the section's last cue to hold until the section's own local end (${expectedLocalEnd}), got: ${lastStoryLine}`
+    );
+  });
+
   await test('assembleSimpleStoryVideo refuses without a completed voice-over', async () => {
     const result = await ssv.assembleSimpleStoryVideo({
       voiceover: { status: 'pending', url: null },
