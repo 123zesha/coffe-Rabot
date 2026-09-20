@@ -91,6 +91,47 @@ function backgroundColorForSection(sectionIndex) {
   return SECTION_BACKGROUND_COLORS[sectionIndex % SECTION_BACKGROUND_COLORS.length];
 }
 
+// How many section renders (see renderSection below) run at once. Each one
+// spawns its own independent ffmpeg process on its own output file — there
+// is no shared state between them — so they were previously run ONE AT A
+// TIME in a for-loop purely by omission, not because they depend on each
+// other. A real 15-20 minute story at the default 45s section target
+// produces 20+ sections; awaiting each one's process-spawn-plus-encode
+// sequentially was measured to be the dominant real cause of a production
+// job exceeding Vercel's 300s function timeout on POST /api/agent (a real
+// "Vercel Runtime Timeout Error: Task timed out after 300 seconds"), not
+// the single final combined encode pass (already optimized — see its own
+// comment below). Bounded, not unbounded like voiceover-generation.js's
+// chunk concurrency, because section count here can run much higher (20+
+// vs. a handful of TTS chunks) and each is a real ffmpeg child process —
+// an unbounded burst risks contending for the same limited CPU/memory a
+// serverless function has, which could make things worse instead of
+// better. This changes ONLY the scheduling of independent work; the
+// output bytes are unaffected — same sections, same settings, same order.
+const SECTION_RENDER_CONCURRENCY = 4;
+
+// Runs `mapper` over `items` with at most `limit` calls in flight at once,
+// resolving to results in the SAME ORDER as `items` regardless of which
+// call finishes first — required here because sectionPaths must stay in
+// story order for the concat step below. A rejection from any call rejects
+// the whole call, same as Promise.all.
+async function mapWithConcurrency(items, limit, mapper) {
+  const results = new Array(items.length);
+  let nextIndex = 0;
+
+  async function worker() {
+    while (nextIndex < items.length) {
+      const currentIndex = nextIndex++;
+      results[currentIndex] = await mapper(items[currentIndex], currentIndex);
+    }
+  }
+
+  const workerCount = Math.max(1, Math.min(limit, items.length));
+  await Promise.all(Array.from({ length: workerCount }, worker));
+
+  return results;
+}
+
 function runFfmpeg(args) {
   return new Promise((resolve, reject) => {
     execFile(ffmpegPath, args, { maxBuffer: 1024 * 1024 * 64 }, (error, stdout, stderr) => {
@@ -395,10 +436,9 @@ async function assembleSimpleStoryVideo({ voiceover, subtitlesContent, sectionTa
     const targetSectionSeconds = sectionTargetSeconds > 0 ? sectionTargetSeconds : DEFAULT_SECTION_TARGET_SECONDS;
     const sections = groupCuesIntoSections(cues, targetSectionSeconds, audioDuration);
 
-    const sectionPaths = [];
-    for (let i = 0; i < sections.length; i++) {
-      sectionPaths.push(await renderSection(sections[i], i, workDir));
-    }
+    const sectionPaths = await mapWithConcurrency(sections, SECTION_RENDER_CONCURRENCY, (section, i) =>
+      renderSection(section, i, workDir)
+    );
 
     const listPath = path.join(workDir, 'sections.txt');
     fs.writeFileSync(listPath, sectionPaths.map((p) => `file '${p.replace(/'/g, "'\\''")}'`).join('\n'), 'utf8');
@@ -521,6 +561,8 @@ module.exports = {
   wrapText,
   fitCueText,
   buildAssScript,
+  mapWithConcurrency,
+  SECTION_RENDER_CONCURRENCY,
   SIMPLE_STORY_WIDTH,
   SIMPLE_STORY_HEIGHT,
   SIMPLE_STORY_FPS,
