@@ -270,6 +270,7 @@ async function assembleAndStoreFinalVideo(
       subtitlesContent: job.subtitles && job.subtitles.status === 'completed' ? job.subtitles.content : null,
       existingRender: job.simpleStoryRender,
       jobId,
+      editSettings: job.videoEditSettings,
     });
 
     if (assembly.status === 'in_progress') {
@@ -281,6 +282,7 @@ async function assembleAndStoreFinalVideo(
           musicUsed: null,
           resolutionUsed: null,
           videoModeUsed: null,
+          editSettingsUsed: null,
           error: null,
         },
         simpleStoryRender: assembly.render,
@@ -296,6 +298,7 @@ async function assembleAndStoreFinalVideo(
           musicUsed: null,
           resolutionUsed: null,
           videoModeUsed: null,
+          editSettingsUsed: null,
           error: assembly.error || 'Simple Story Video assembly failed.',
         },
         simpleStoryRender: assembly.render,
@@ -312,6 +315,7 @@ async function assembleAndStoreFinalVideo(
           musicUsed: null,
           resolutionUsed: null,
           videoModeUsed: 'simple-story',
+          editSettingsUsed: simpleStoryVideo.normalizeVideoEditSettings(job.videoEditSettings),
           error: null,
         },
         simpleStoryRender: assembly.render,
@@ -329,6 +333,7 @@ async function assembleAndStoreFinalVideo(
           musicUsed: null,
           resolutionUsed: null,
           videoModeUsed: null,
+          editSettingsUsed: null,
           error: `The final video was assembled but could not be stored: ${error.message}`,
         },
         simpleStoryRender: assembly.render,
@@ -356,6 +361,7 @@ async function assembleAndStoreFinalVideo(
         musicUsed: null,
         resolutionUsed: null,
         videoModeUsed: null,
+        editSettingsUsed: null,
         error:
           `Scene ${brokenIndex + 1}'s video clip could not be verified or recovered before assembly ` +
           `(${healedClips[brokenIndex].error || 'unknown error'}) — regenerate it with generateSceneVideo.`,
@@ -380,6 +386,7 @@ async function assembleAndStoreFinalVideo(
         musicUsed: null,
         resolutionUsed: null,
         videoModeUsed: null,
+        editSettingsUsed: null,
         error: error.message,
       },
       simpleStoryRender: job.simpleStoryRender,
@@ -404,6 +411,7 @@ async function assembleAndStoreFinalVideo(
         musicUsed: null,
         resolutionUsed: null,
         videoModeUsed: null,
+        editSettingsUsed: null,
         error: assembly.error || 'Final video assembly failed.',
       },
       simpleStoryRender: job.simpleStoryRender,
@@ -420,6 +428,7 @@ async function assembleAndStoreFinalVideo(
         musicUsed: desiredMusicUsed,
         resolutionUsed: desiredResolutionUsed,
         videoModeUsed: desiredVideoModeUsed,
+        editSettingsUsed: null,
         error: null,
       },
       simpleStoryRender: job.simpleStoryRender,
@@ -437,6 +446,7 @@ async function assembleAndStoreFinalVideo(
         musicUsed: null,
         resolutionUsed: null,
         videoModeUsed: null,
+        editSettingsUsed: null,
         error: `The final video was assembled but could not be stored: ${error.message}`,
       },
       simpleStoryRender: job.simpleStoryRender,
@@ -498,7 +508,15 @@ function isFinalVideoStillAccurate(job) {
     // pipeline never sets musicUsed/resolutionUsed to anything but null.
     const desiredSubtitlesContent =
       job.subtitles && job.subtitles.status === 'completed' ? job.subtitles.content : null;
-    return (job.finalVideo.subtitlesUsed || null) === desiredSubtitlesContent;
+    if ((job.finalVideo.subtitlesUsed || null) !== desiredSubtitlesContent) {
+      return false;
+    }
+    // A real videoEditSettings change (background color, subtitle
+    // appearance/timing, voice speed/volume — see updateVideoEditSettings)
+    // must also force a real reassembly, exactly like a real subtitles
+    // change does, even though nothing else here changed.
+    const desiredEditSettings = simpleStoryVideo.normalizeVideoEditSettings(job.videoEditSettings);
+    return JSON.stringify(job.finalVideo.editSettingsUsed || null) === JSON.stringify(desiredEditSettings);
   }
 
   const desiredSubtitlesContent =
@@ -1230,10 +1248,62 @@ const TOOLS = [
       'at higher detail. Only tell the user the final video is ready if this reports it as completed. A ' +
       'title/description/tags/thumbnail package can be generated separately (see generateYoutubePackage ' +
       'below), but actually publishing/uploading the video to YouTube itself is still not implemented — ' +
-      'never claim a video was published or uploaded.',
+      'never claim a video was published or uploaded. For a \'simple-story\' job, if the user asks for ONE ' +
+      'targeted visual/audio change after a video already exists (a different background color, on-screen ' +
+      'text size/position/color, subtitle timing, or voice-over speed/volume), use updateVideoEditSettings ' +
+      'first, then call this again to apply it — never re-generate the script/voice-over/subtitles/images ' +
+      'for a change like that.',
     input_schema: {
       type: 'object',
       properties: {},
+      additionalProperties: false,
+    },
+  },
+  {
+    name: 'updateVideoEditSettings',
+    description:
+      'For a \'simple-story\' job ONLY: apply ONE targeted, purely LOCAL visual/audio edit to how the ' +
+      'final video is rendered, WITHOUT regenerating the script, voice-over, subtitles, images, or ' +
+      'thumbnail, and WITHOUT any paid API call — this only ever runs local ffmpeg processing on assets ' +
+      'already generated (and already paid for) earlier. Only include the field(s) the user actually ' +
+      'asked to change; every other field keeps its current value. After calling this, call ' +
+      'assembleFinalVideo to actually re-render the video with the new setting(s) — updating the setting ' +
+      'alone does not touch the existing final video file. Refuses with a clear reason for a \'cinematic\' ' +
+      'job (this only applies to Simple Story Video mode\'s own rendering — see assembleFinalVideo). Pass ' +
+      'the string "default" for backgroundColor/storyPosition/fontWeight/subtitleColor to reset that one ' +
+      'field back to its original built-in look; numeric fields reset the same way by passing their own ' +
+      'default value (subtitleFontScale: 1, subtitleTimingOffsetMs: 0, voiceSpeed: 1, voiceVolumeDb: 0). ' +
+      'backgroundColor: a single solid hex color (e.g. "1a2a4a" for navy — no "#") used for EVERY section, ' +
+      'replacing the default rotating color palette. storyPosition: "top"/"center"(default)/"bottom" for ' +
+      'the large on-screen story text only — the small caption line always stays at the bottom, standard ' +
+      'subtitle placement, and is unaffected. fontWeight: "bold" or "regular" for both the story and ' +
+      'caption text — the only two weights this app\'s bundled font supports (never claim a different font ' +
+      'FAMILY can be applied; that would require a new font file this app does not have). ' +
+      'subtitleFontScale: a multiplier (0.5-2.0) on BOTH text elements\' built-in sizes — e.g. 1.3 for ' +
+      '"make the text bigger". subtitleColor: a hex color (no "#") for both text elements, default white. ' +
+      'subtitleTimingOffsetMs: shifts every subtitle\'s timing by this many milliseconds (-10000 to 10000, ' +
+      'positive = later) without touching the audio at all — use this for "the captions are out of sync" ' +
+      'requests. voiceSpeed: a playback-speed multiplier (0.5-2.0, e.g. 0.9 for 10% slower) applied ' +
+      'LOCALLY to the existing voice-over audio via ffmpeg — never a new text-to-speech call; on-screen ' +
+      'text timing is automatically rescaled to stay in sync with the new speed. voiceVolumeDb: a decibel ' +
+      'gain/cut (-30 to 30, e.g. 6 for noticeably louder, -6 for quieter) applied LOCALLY the same way. ' +
+      'None of these fields ever require the user\'s confirmation before calling this — they are all free, ' +
+      'local edits — but if the user instead asks for something this cannot do locally (a different VOICE ' +
+      'or a re-written script, for example), tell them that requires generateVoiceover (a real, paid ' +
+      'OpenAI call) and get their explicit confirmation before calling that, exactly as generateVoiceover\'s ' +
+      'own description already requires — never call it just to satisfy an edit request like this one.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        backgroundColor: { type: 'string' },
+        storyPosition: { type: 'string', enum: ['top', 'center', 'bottom', 'default'] },
+        fontWeight: { type: 'string', enum: ['regular', 'bold', 'default'] },
+        subtitleFontScale: { type: 'number', minimum: 0.5, maximum: 2.0 },
+        subtitleColor: { type: 'string' },
+        subtitleTimingOffsetMs: { type: 'integer', minimum: -10000, maximum: 10000 },
+        voiceSpeed: { type: 'number', minimum: 0.5, maximum: 2.0 },
+        voiceVolumeDb: { type: 'number', minimum: -30, maximum: 30 },
+      },
       additionalProperties: false,
     },
   },
@@ -1631,7 +1701,15 @@ async function executeTool(name, jobId, input) {
         // before, and no longer reflects this new one. Resetting finalVideo
         // here means assembleFinalVideo's own "already completed, skip"
         // check never keeps serving a stale, out-of-sync video afterward.
-        updates.finalVideo = { url: null, status: 'pending', subtitlesUsed: null, musicUsed: null, resolutionUsed: null, videoModeUsed: null };
+        updates.finalVideo = {
+          url: null,
+          status: 'pending',
+          subtitlesUsed: null,
+          musicUsed: null,
+          resolutionUsed: null,
+          videoModeUsed: null,
+          editSettingsUsed: null,
+        };
         // Any already-rendered Simple Story Video sections were rendered
         // from the PREVIOUS narration audio's own timing and no longer
         // match this new one — resetting this alongside finalVideo means a
@@ -1646,6 +1724,7 @@ async function executeTool(name, jobId, input) {
           sections: [],
           audioUrlSnapshot: null,
           subtitlesContentSnapshot: null,
+          editSettingsSnapshot: null,
           error: null,
         };
         // Existing subtitles were transcribed from the PREVIOUS narration
@@ -1722,6 +1801,62 @@ async function executeTool(name, jobId, input) {
         error: 'Final video assembly failed unexpectedly. Tell the user to try again in a moment.',
       });
     }
+  }
+
+  if (name === 'updateVideoEditSettings') {
+    const job = await jobStore.getJob(jobId);
+
+    if (!job) {
+      return JSON.stringify({ error: 'job not found' });
+    }
+
+    if ((job.videoMode || jobStore.DEFAULT_VIDEO_MODE) !== 'simple-story') {
+      return JSON.stringify({
+        error:
+          "updateVideoEditSettings only applies to Simple Story Video mode's own rendering — this job's " +
+          "videoMode is 'cinematic'. There is no equivalent local-edit capability for the cinematic " +
+          'pipeline yet.',
+      });
+    }
+
+    // Only string fields need a "default" sentinel (see the tool
+    // description) — the numeric fields reset the same way by passing
+    // their own real default value, so no sentinel parsing is needed for
+    // them. Invalid hex colors are refused with a clear, actionable error
+    // rather than silently falling back to a default the user never asked
+    // for (normalizeVideoEditSettings itself is more lenient, since it also
+    // has to tolerate a legacy/never-touched job record).
+    const patch = {};
+    const stringFields = ['backgroundColor', 'storyPosition', 'fontWeight', 'subtitleColor'];
+    const hexFields = ['backgroundColor', 'subtitleColor'];
+    for (const field of stringFields) {
+      if (typeof input?.[field] !== 'string') {
+        continue;
+      }
+      if (input[field].toLowerCase() === 'default') {
+        patch[field] = null;
+        continue;
+      }
+      if (hexFields.includes(field) && !simpleStoryVideo.HEX_COLOR_RE.test(input[field])) {
+        return JSON.stringify({
+          error: `${field} must be a 6-digit hex color with no "#" (e.g. "1a2a4a"), or "default" to reset — convert the requested color to hex first.`,
+        });
+      }
+      patch[field] = input[field];
+    }
+    for (const field of ['subtitleFontScale', 'subtitleTimingOffsetMs', 'voiceSpeed', 'voiceVolumeDb']) {
+      if (typeof input?.[field] === 'number') {
+        patch[field] = input[field];
+      }
+    }
+
+    if (Object.keys(patch).length === 0) {
+      return JSON.stringify({ error: 'No valid videoEditSettings field was provided to change.' });
+    }
+
+    const normalized = simpleStoryVideo.normalizeVideoEditSettings({ ...job.videoEditSettings, ...patch });
+    const updatedJob = await jobStore.updateJob(jobId, { videoEditSettings: normalized });
+    return JSON.stringify(updatedJob ? summarizeJobForAgent(updatedJob) : { error: 'job not found' });
   }
 
   if (name === 'generateYoutubePackage') {
@@ -2123,13 +2258,22 @@ app.post('/api/jobs/:id/generate-voiceover', async (req, res) => {
       // voice-over invalidates any already-assembled final video, any
       // already-rendered Simple Story Video section progress, and any
       // existing subtitles (transcribed from the previous narration audio).
-      updates.finalVideo = { url: null, status: 'pending', subtitlesUsed: null, musicUsed: null, resolutionUsed: null, videoModeUsed: null };
+      updates.finalVideo = {
+        url: null,
+        status: 'pending',
+        subtitlesUsed: null,
+        musicUsed: null,
+        resolutionUsed: null,
+        videoModeUsed: null,
+        editSettingsUsed: null,
+      };
       updates.simpleStoryRender = {
         status: 'not_started',
         totalSections: null,
         sections: [],
         audioUrlSnapshot: null,
         subtitlesContentSnapshot: null,
+        editSettingsSnapshot: null,
         error: null,
       };
       updates.subtitles = { status: 'pending', format: 'srt', content: null, error: null, generatedFromVoiceoverUrl: null };

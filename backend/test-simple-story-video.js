@@ -62,6 +62,50 @@ function probe(filePath) {
   });
 }
 
+// Same idea as probe() above, but for an audio-only file (no video stream,
+// so probe()'s dimensionMatch requirement would never be satisfied).
+function probeAudioDuration(filePath) {
+  return new Promise((resolve, reject) => {
+    execFile(ssv.ffmpegPath, ['-i', filePath, '-f', 'null', '-'], { maxBuffer: 1024 * 1024 * 16 }, (error, stdout, stderr) => {
+      const log = (stderr || '').toString();
+      const durationMatch = log.match(/Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)/);
+      if (!durationMatch) {
+        reject(new Error(`Could not probe audio duration for ${filePath}: ${log.trim().slice(-500)}`));
+        return;
+      }
+      resolve(Number(durationMatch[1]) * 3600 + Number(durationMatch[2]) * 60 + Number(durationMatch[3]));
+    });
+  });
+}
+
+// Reads one raw RGB pixel from a real decoded video frame at `atSeconds` —
+// used to prove a requested backgroundColor edit genuinely changed the
+// rendered pixels, not just that re-rendering happened. (x, y) should land
+// on plain background, away from any burned-in text box.
+async function probePixelColor(filePath, atSeconds, x, y) {
+  const rawPath = `${filePath}.raw.rgb`;
+  await runFfmpeg([
+    '-y',
+    '-ss',
+    String(atSeconds),
+    '-i',
+    filePath,
+    '-vframes',
+    '1',
+    '-f',
+    'rawvideo',
+    '-pix_fmt',
+    'rgb24',
+    rawPath,
+  ]);
+  const buffer = fs.readFileSync(rawPath);
+  const width = ssv.SIMPLE_STORY_WIDTH;
+  const offset = (y * width + x) * 3;
+  const pixel = { r: buffer[offset], g: buffer[offset + 1], b: buffer[offset + 2] };
+  fs.rmSync(rawPath, { force: true });
+  return pixel;
+}
+
 let toneAudioCounter = 0;
 
 // `label` (defaulting to an auto-incrementing counter) guarantees a
@@ -646,6 +690,273 @@ async function main() {
     assert.strictEqual(probed.width, ssv.SIMPLE_STORY_WIDTH);
     assert.strictEqual(probed.height, ssv.SIMPLE_STORY_HEIGHT);
     assert.ok(Math.abs(probed.duration - totalSeconds) < 0.5, `expected ~${totalSeconds.toFixed(1)}s duration, got ${probed.duration}`);
+  });
+
+  // --- Selective video editing (videoEditSettings) ---
+
+  await test('normalizeVideoEditSettings returns the all-defaults shape for missing/empty input', () => {
+    for (const input of [undefined, null, {}, 'not an object']) {
+      assert.deepStrictEqual(ssv.normalizeVideoEditSettings(input), {
+        backgroundColor: null,
+        storyPosition: null,
+        fontWeight: null,
+        subtitleFontScale: 1,
+        subtitleColor: null,
+        subtitleTimingOffsetMs: 0,
+        voiceSpeed: 1,
+        voiceVolumeDb: 0,
+      });
+    }
+  });
+
+  await test('normalizeVideoEditSettings accepts valid values and lowercases hex colors', () => {
+    const normalized = ssv.normalizeVideoEditSettings({
+      backgroundColor: '1A2B3C',
+      storyPosition: 'top',
+      fontWeight: 'bold',
+      subtitleFontScale: 1.5,
+      subtitleColor: 'FF0000',
+      subtitleTimingOffsetMs: 250,
+      voiceSpeed: 1.25,
+      voiceVolumeDb: 6,
+    });
+    assert.deepStrictEqual(normalized, {
+      backgroundColor: '1a2b3c',
+      storyPosition: 'top',
+      fontWeight: 'bold',
+      subtitleFontScale: 1.5,
+      subtitleColor: 'ff0000',
+      subtitleTimingOffsetMs: 250,
+      voiceSpeed: 1.25,
+      voiceVolumeDb: 6,
+    });
+  });
+
+  await test('normalizeVideoEditSettings clamps out-of-range numbers and rejects invalid enums/hex', () => {
+    const normalized = ssv.normalizeVideoEditSettings({
+      backgroundColor: 'not-a-color',
+      storyPosition: 'sideways',
+      fontWeight: 'italic',
+      subtitleFontScale: 999,
+      subtitleColor: '12345', // one digit short
+      subtitleTimingOffsetMs: -999999,
+      voiceSpeed: 10,
+      voiceVolumeDb: -999,
+    });
+    assert.strictEqual(normalized.backgroundColor, null);
+    assert.strictEqual(normalized.storyPosition, null);
+    assert.strictEqual(normalized.fontWeight, null);
+    assert.strictEqual(normalized.subtitleFontScale, ssv.SUBTITLE_FONT_SCALE_MAX);
+    assert.strictEqual(normalized.subtitleColor, null);
+    assert.strictEqual(normalized.subtitleTimingOffsetMs, ssv.SUBTITLE_TIMING_OFFSET_MS_MIN);
+    assert.strictEqual(normalized.voiceSpeed, ssv.VOICE_SPEED_MAX);
+    assert.strictEqual(normalized.voiceVolumeDb, ssv.VOICE_VOLUME_DB_MIN);
+  });
+
+  await test('normalizeVideoEditSettings is pure — the same input always JSON-serializes identically', () => {
+    const input = { backgroundColor: '2d3142', voiceSpeed: 1.1 };
+    const a = JSON.stringify(ssv.normalizeVideoEditSettings(input));
+    const b = JSON.stringify(ssv.normalizeVideoEditSettings({ ...input }));
+    assert.strictEqual(a, b);
+  });
+
+  await test('applyCueTimingAdjustments returns the SAME array reference when speed=1 and offset=0', () => {
+    const cues = ssv.parseSrt(FIXTURE_SRT);
+    const result = ssv.applyCueTimingAdjustments(cues, ssv.normalizeVideoEditSettings({}));
+    assert.strictEqual(result, cues);
+  });
+
+  await test('applyCueTimingAdjustments rescales every timestamp by voiceSpeed', () => {
+    const cues = ssv.parseSrt(FIXTURE_SRT);
+    const adjusted = ssv.applyCueTimingAdjustments(cues, ssv.normalizeVideoEditSettings({ voiceSpeed: 2 }));
+    assert.strictEqual(adjusted.length, cues.length);
+    for (let i = 0; i < cues.length; i++) {
+      assert.ok(Math.abs(adjusted[i].start - cues[i].start / 2) < 1e-9);
+      assert.ok(Math.abs(adjusted[i].end - cues[i].end / 2) < 1e-9);
+    }
+  });
+
+  await test('applyCueTimingAdjustments shifts every timestamp by subtitleTimingOffsetMs, independent of speed', () => {
+    const cues = ssv.parseSrt(FIXTURE_SRT);
+    const adjusted = ssv.applyCueTimingAdjustments(cues, ssv.normalizeVideoEditSettings({ subtitleTimingOffsetMs: 500 }));
+    for (let i = 0; i < cues.length; i++) {
+      assert.ok(Math.abs(adjusted[i].start - (cues[i].start + 0.5)) < 1e-9);
+      assert.ok(Math.abs(adjusted[i].end - (cues[i].end + 0.5)) < 1e-9);
+    }
+  });
+
+  await test('applyCueTimingAdjustments drops a cue a large negative offset would push entirely before zero', () => {
+    const cues = ssv.parseSrt(FIXTURE_SRT); // first cue: 0 -> 2.5
+    const adjusted = ssv.applyCueTimingAdjustments(cues, ssv.normalizeVideoEditSettings({ subtitleTimingOffsetMs: -10000 }));
+    assert.ok(adjusted.length < cues.length, 'a cue clamped to start === end (or negative) must be dropped, not shown backwards');
+  });
+
+  await test('buildAssScript with default editSettings is byte-identical to omitting the argument', () => {
+    const cues = ssv.parseSrt(FIXTURE_SRT);
+    const withDefaults = ssv.buildAssScript(cues, 10, ssv.normalizeVideoEditSettings({}));
+    const withoutArg = ssv.buildAssScript(cues, 10);
+    assert.strictEqual(withDefaults, withoutArg);
+  });
+
+  await test('buildAssScript applies storyPosition/fontWeight/subtitleFontScale/subtitleColor to the ASS style rows', () => {
+    const cues = ssv.parseSrt(FIXTURE_SRT);
+    const edited = ssv.buildAssScript(
+      cues,
+      10,
+      ssv.normalizeVideoEditSettings({
+        storyPosition: 'top',
+        fontWeight: 'regular',
+        subtitleFontScale: 2,
+        subtitleColor: 'ff0000',
+      })
+    );
+
+    const storyLine = edited.split('\n').find((line) => line.startsWith('Style: Story,'));
+    const captionLine = edited.split('\n').find((line) => line.startsWith('Style: Caption,'));
+    const storyFields = storyLine.split(',');
+    const captionFields = captionLine.split(',');
+
+    // Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour,
+    // OutlineColour, BackColour, Bold, ..., Alignment, MarginL, MarginR, MarginV, Encoding
+    assert.strictEqual(storyFields[2], '128', 'story fontsize must be 64 * subtitleFontScale(2)');
+    assert.strictEqual(storyFields[3], ssv.assColorFromHex('ff0000'), 'story PrimaryColour must reflect subtitleColor');
+    assert.strictEqual(storyFields[7], '0', 'fontWeight "regular" must turn story Bold off');
+    assert.strictEqual(storyFields[18], '8', 'storyPosition "top" must set Story Alignment to 8');
+
+    // The caption line always stays bottom-center regardless of
+    // storyPosition — only its fontsize/color/weight follow editSettings.
+    assert.strictEqual(captionFields[2], '60', 'caption fontsize must be 30 * subtitleFontScale(2)');
+    assert.strictEqual(captionFields[3], ssv.assColorFromHex('ff0000'));
+    assert.strictEqual(captionFields[18], '2', 'the caption line must always stay bottom-center (Alignment 2)');
+  });
+
+  await test('assColorFromHex converts RRGGBB to ASS &H00BBGGRR and falls back to white for invalid input', () => {
+    assert.strictEqual(ssv.assColorFromHex('ffffff'), '&H00FFFFFF');
+    assert.strictEqual(ssv.assColorFromHex('ff0000'), '&H000000FF');
+    assert.strictEqual(ssv.assColorFromHex('00ff00'), '&H0000FF00');
+    assert.strictEqual(ssv.assColorFromHex('not-a-color'), '&H00FFFFFF');
+  });
+
+  await test('prepareEffectiveAudio returns the source path UNCHANGED when voiceSpeed=1 and voiceVolumeDb=0', async () => {
+    const audioPath = await makeToneAudio(workDir, 3, 'no-edit');
+    const result = await ssv.prepareEffectiveAudio(audioPath, ssv.normalizeVideoEditSettings({}), workDir);
+    assert.strictEqual(result, audioPath);
+  });
+
+  await test('prepareEffectiveAudio applies voiceSpeed locally, producing real audio at the new duration', async () => {
+    const audioPath = await makeToneAudio(workDir, 10, 'speed-edit');
+    const edited = await ssv.prepareEffectiveAudio(audioPath, ssv.normalizeVideoEditSettings({ voiceSpeed: 2 }), workDir);
+    assert.notStrictEqual(edited, audioPath);
+    const duration = await probeAudioDuration(edited);
+    assert.ok(Math.abs(duration - 5) < 0.3, `expected ~5s (10s / 2x speed), got ${duration}`);
+  });
+
+  await test('prepareEffectiveAudio applies voiceVolumeDb locally without changing duration', async () => {
+    const audioPath = await makeToneAudio(workDir, 4, 'volume-edit');
+    const originalDuration = await probeAudioDuration(audioPath);
+    const edited = await ssv.prepareEffectiveAudio(audioPath, ssv.normalizeVideoEditSettings({ voiceVolumeDb: -6 }), workDir);
+    assert.notStrictEqual(edited, audioPath);
+    const editedDuration = await probeAudioDuration(edited);
+    assert.ok(Math.abs(editedDuration - originalDuration) < 0.3);
+  });
+
+  await test('continueSimpleStoryVideoAssembly renders a real solid backgroundColor override into the actual pixels', async () => {
+    const audioPath = await makeToneAudio(workDir, 4, 'bg-color');
+    const result = await ssv.continueSimpleStoryVideoAssembly({
+      voiceover: { status: 'completed', url: audioPath },
+      subtitlesContent: FIXTURE_SRT,
+      existingRender: null,
+      jobId: 'test-job-bg-color',
+      editSettings: { backgroundColor: '204080' },
+    });
+    assert.strictEqual(result.status, 'completed', result.error);
+
+    const outPath = path.join(workDir, 'output-bg-color.mp4');
+    fs.writeFileSync(outPath, result.buffer);
+    // Top-left corner, well after the fade-in, is plain background — away
+    // from the centered story text box and the bottom caption line.
+    const pixel = await probePixelColor(outPath, 1.5, 10, 10);
+    assert.ok(Math.abs(pixel.r - 0x20) <= 20, `expected R≈0x20, got 0x${pixel.r.toString(16)}`);
+    assert.ok(Math.abs(pixel.g - 0x40) <= 20, `expected G≈0x40, got 0x${pixel.g.toString(16)}`);
+    assert.ok(Math.abs(pixel.b - 0x80) <= 20, `expected B≈0x80, got 0x${pixel.b.toString(16)}`);
+  });
+
+  await test('continueSimpleStoryVideoAssembly applies voiceSpeed to both the audio and the on-screen text timing', async () => {
+    const audioPath = await makeToneAudio(workDir, 12, 'speed-e2e');
+    const originalDuration = await probeAudioDuration(audioPath);
+    const result = await ssv.continueSimpleStoryVideoAssembly({
+      voiceover: { status: 'completed', url: audioPath },
+      subtitlesContent: FIXTURE_SRT,
+      existingRender: null,
+      jobId: 'test-job-speed-e2e',
+      editSettings: { voiceSpeed: 2 },
+    });
+    assert.strictEqual(result.status, 'completed', result.error);
+
+    const outPath = path.join(workDir, 'output-speed-e2e.mp4');
+    fs.writeFileSync(outPath, result.buffer);
+    const probed = await probe(outPath);
+    assert.ok(
+      Math.abs(probed.duration - originalDuration / 2) < 0.5,
+      `expected ~${(originalDuration / 2).toFixed(1)}s (half the original ${originalDuration.toFixed(1)}s), got ${probed.duration}`
+    );
+  });
+
+  await test('continueSimpleStoryVideoAssembly discards and fully re-renders every section when ONLY videoEditSettings changes', async () => {
+    const audioPath = await makeToneAudio(workDir, 4, 'edit-staleness');
+    const first = await ssv.continueSimpleStoryVideoAssembly({
+      voiceover: { status: 'completed', url: audioPath },
+      subtitlesContent: FIXTURE_SRT,
+      existingRender: null,
+      jobId: 'test-job-edit-staleness',
+    });
+    assert.strictEqual(first.status, 'completed', first.error);
+    const firstUrls = first.render.sections.map((s) => s.url);
+
+    // Same exact voice-over/subtitles — only a videoEditSettings change.
+    const second = await ssv.continueSimpleStoryVideoAssembly({
+      voiceover: { status: 'completed', url: audioPath },
+      subtitlesContent: FIXTURE_SRT,
+      existingRender: first.render,
+      jobId: 'test-job-edit-staleness',
+      editSettings: { backgroundColor: '112233' },
+    });
+    assert.strictEqual(second.status, 'completed', second.error);
+    const secondUrls = second.render.sections.map((s) => s.url);
+
+    assert.strictEqual(secondUrls.length, firstUrls.length);
+    for (let i = 0; i < firstUrls.length; i++) {
+      assert.notStrictEqual(secondUrls[i], firstUrls[i], `section ${i} must be genuinely re-rendered after an editSettings change`);
+    }
+    assert.strictEqual(second.render.editSettingsSnapshot, JSON.stringify(ssv.normalizeVideoEditSettings({ backgroundColor: '112233' })));
+  });
+
+  await test('continueSimpleStoryVideoAssembly is a no-op re-render (same section urls) when editSettings are unchanged', async () => {
+    const audioPath = await makeToneAudio(workDir, 4, 'edit-idempotent');
+    const editSettings = { backgroundColor: '445566' };
+    const first = await ssv.continueSimpleStoryVideoAssembly({
+      voiceover: { status: 'completed', url: audioPath },
+      subtitlesContent: FIXTURE_SRT,
+      existingRender: null,
+      jobId: 'test-job-edit-idempotent',
+      editSettings,
+    });
+    assert.strictEqual(first.status, 'completed', first.error);
+
+    const second = await ssv.continueSimpleStoryVideoAssembly({
+      voiceover: { status: 'completed', url: audioPath },
+      subtitlesContent: FIXTURE_SRT,
+      existingRender: first.render,
+      jobId: 'test-job-edit-idempotent',
+      editSettings,
+    });
+    assert.strictEqual(second.status, 'completed', second.error);
+
+    assert.deepStrictEqual(
+      second.render.sections.map((s) => s.url),
+      first.render.sections.map((s) => s.url),
+      'identical editSettings must never trigger a wasted re-render'
+    );
   });
 
   fs.rmSync(workDir, { recursive: true, force: true });
