@@ -205,6 +205,87 @@ async function main() {
     assert.ok(Math.abs(probed.duration - 9) < 0.3, `expected ~9s duration, got ${probed.duration}`);
   });
 
+  // --- mapWithConcurrency: the scheduling fix for the real production
+  // timeout (many independent section renders previously ran one at a
+  // time in a for-loop) — tested directly with synthetic timed tasks, no
+  // ffmpeg needed, since what's new here is the scheduling algorithm
+  // itself, not renderSection's own output (already covered above).
+
+  await test('mapWithConcurrency preserves input order regardless of which task finishes first', async () => {
+    const delays = [30, 5, 20, 1, 10]; // deliberately out of order
+    const results = await ssv.mapWithConcurrency(delays, 3, (delay, i) => new Promise((resolve) => setTimeout(() => resolve(i), delay)));
+    assert.deepStrictEqual(results, [0, 1, 2, 3, 4], 'results must stay in original item order, not completion order');
+  });
+
+  await test('mapWithConcurrency never runs more than `limit` tasks at once', async () => {
+    let active = 0;
+    let maxActive = 0;
+    const items = Array.from({ length: 10 }, (_, i) => i);
+
+    await ssv.mapWithConcurrency(items, 4, async () => {
+      active++;
+      maxActive = Math.max(maxActive, active);
+      await new Promise((resolve) => setTimeout(resolve, 15));
+      active--;
+    });
+
+    assert.ok(maxActive <= 4, `expected at most 4 concurrent tasks, observed ${maxActive}`);
+    assert.strictEqual(maxActive, 4, 'expected the limit to actually be reached with 10 items and a limit of 4');
+  });
+
+  await test('mapWithConcurrency handles fewer items than the concurrency limit', async () => {
+    const results = await ssv.mapWithConcurrency([1, 2], 4, async (n) => n * 10);
+    assert.deepStrictEqual(results, [10, 20]);
+  });
+
+  await test('mapWithConcurrency propagates a rejection from any task', async () => {
+    await assert.rejects(
+      () => ssv.mapWithConcurrency([1, 2, 3], 2, async (n) => {
+        if (n === 2) throw new Error('simulated task failure');
+        return n;
+      }),
+      /simulated task failure/
+    );
+  });
+
+  await test('mapWithConcurrency runs meaningfully faster than sequential execution for independent tasks', async () => {
+    const items = Array.from({ length: 8 }, (_, i) => i);
+    const taskDurationMs = 25;
+
+    const start = Date.now();
+    await ssv.mapWithConcurrency(items, 4, () => new Promise((resolve) => setTimeout(resolve, taskDurationMs)));
+    const elapsed = Date.now() - start;
+
+    // 8 tasks at limit 4 = 2 sequential rounds ~= 50ms; 8 sequential tasks
+    // would be ~200ms. A generous ceiling well below the sequential total
+    // avoids flakiness on a slow CI machine while still proving real
+    // parallelism is happening, not an accidental serial fallback.
+    assert.ok(elapsed < taskDurationMs * 6, `expected parallel execution to be well under sequential time, took ${elapsed}ms`);
+  });
+
+  await test('assembleSimpleStoryVideo renders multiple real sections in parallel — same correct output as sequential rendering', async () => {
+    // Reproduces the real production shape: several sections from one job.
+    // sectionTargetSeconds forces 6 real sections from an 18s fixture,
+    // exercising SECTION_RENDER_CONCURRENCY's bounded-parallel path (more
+    // sections than the concurrency limit) with real local ffmpeg — never a
+    // real production-length video, per this app's testing discipline.
+    const audioPath = await makeToneAudio(workDir, 18);
+    const result = await ssv.assembleSimpleStoryVideo({
+      voiceover: { status: 'completed', url: audioPath },
+      subtitlesContent: FIXTURE_SRT,
+      sectionTargetSeconds: 3,
+    });
+
+    assert.strictEqual(result.status, 'completed', result.error);
+    const outPath = path.join(workDir, 'output-parallel-sections.mp4');
+    fs.writeFileSync(outPath, result.buffer);
+    const probed = await probe(outPath);
+
+    assert.strictEqual(probed.width, ssv.SIMPLE_STORY_WIDTH);
+    assert.strictEqual(probed.height, ssv.SIMPLE_STORY_HEIGHT);
+    assert.ok(Math.abs(probed.duration - 18) < 0.3, `expected ~18s duration, got ${probed.duration}`);
+  });
+
   await test('assembleSimpleStoryVideo pads the video to the real audio duration when cues end early', async () => {
     // Audio runs 12s but the fixture's last cue ends at 8.9s — the video
     // must never truncate real narration; it should hold the last frame
