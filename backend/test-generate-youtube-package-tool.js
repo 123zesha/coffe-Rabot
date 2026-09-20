@@ -171,7 +171,9 @@ async function main() {
 
     const persisted = await jobStore.getJob(job.id);
     assert.strictEqual(persisted.youtubePackage.status, 'completed');
-    assert.ok(persisted.youtubePackage.thumbnailUrl && persisted.youtubePackage.thumbnailUrl.startsWith('data:image/'));
+    // The thumbnail is stored OUTSIDE the job record (video-storage.js),
+    // same as scene images and voice-over audio.
+    assert.ok(persisted.youtubePackage.thumbnailUrl && persisted.youtubePackage.thumbnailUrl.startsWith('/generated/image-'));
     assert.strictEqual(persisted.youtubePackage.generatedFromScript, REAL_SCRIPT);
   });
 
@@ -400,9 +402,9 @@ async function main() {
     assert.strictEqual(openAiRequestCount, 1);
     assert.strictEqual(body.youtubePackage.status, 'completed');
     // The REST route returns the RAW job (like GET /api/jobs/:id) — the
-    // real thumbnail data URI must be present here, unlike the agent's
+    // real thumbnail reference must be present here, unlike the agent's
     // stripped-down summary.
-    assert.ok(body.youtubePackage.thumbnailUrl && body.youtubePackage.thumbnailUrl.startsWith('data:image/'));
+    assert.ok(body.youtubePackage.thumbnailUrl && body.youtubePackage.thumbnailUrl.startsWith('/generated/image-'));
   });
 
   await test('POST /generate-youtube-package refuses with the same reason as the tool (no script)', async () => {

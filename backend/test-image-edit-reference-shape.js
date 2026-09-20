@@ -86,7 +86,7 @@ async function main() {
 
     assert.strictEqual(images.length, 2);
     assert.ok(images.every((image) => image.status === 'completed'), 'both scenes (generate path and edit/reference path) must succeed');
-    assert.ok(images.every((image) => image.url && image.url.startsWith('data:image/')));
+    assert.ok(images.every((image) => image.url && image.url.startsWith('/generated/image-')));
   });
 
   mockServer.close();

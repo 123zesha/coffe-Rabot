@@ -1,13 +1,15 @@
 // Tests for backend/video-storage.js — the module that stores an assembled
-// final video's, a scene clip's, or a generated voice-over's real bytes
-// OUTSIDE the job record (Vercel Blob in production, a local file in dev),
-// returning only a lightweight reference URL for job.finalVideo.url /
-// job.videoGeneration.clips[i].url / job.voiceover.url. See that module's
-// own comment for why: a multi-scene final video or a real 15-20 minute
-// voice-over track is far larger than the base64 images still embedded
-// directly in a job record, and risks the same Redis/Upstash payload-size
-// failure PR #25 fixed for job-store.js (and that a real voice-over
-// generation actually hit in production before storeAudioFile existed).
+// final video's, a scene clip's, a generated voice-over's, or a generated
+// image's real bytes OUTSIDE the job record (Vercel Blob in production, a
+// local file in dev), returning only a lightweight reference URL for
+// job.finalVideo.url / job.videoGeneration.clips[i].url / job.voiceover.url /
+// job.images[i].url / job.youtubePackage.thumbnailUrl. See that module's own
+// comment for why: a multi-scene final video, a real 15-20 minute voice-over
+// track, or several scene images in one job can add up to more than the
+// Redis/Upstash per-request payload limit allows — the failure PR #25 fixed
+// for job-store.js, and that a real voice-over generation and a real
+// 8-image generation each actually hit in production before storeAudioFile
+// and storeImageFile existed.
 //
 // The Vercel Blob upload path is exercised with a fake injected `putBlob`
 // (no real network call to Vercel Blob — this app's zero-real-external-call
@@ -25,7 +27,7 @@ const fs = require('fs');
 const path = require('path');
 const assert = require('assert');
 
-const { storeFinalVideo, storeAudioFile, hasBlobToken, GENERATED_DIR } = require('./video-storage');
+const { storeFinalVideo, storeAudioFile, storeImageFile, hasBlobToken, GENERATED_DIR } = require('./video-storage');
 
 let failures = 0;
 
@@ -205,6 +207,68 @@ async function main() {
 
       assert.strictEqual(calls[0].options.contentType, 'video/mp4');
       assert.ok(calls[0].filename.endsWith('.mp4'));
+    } finally {
+      delete process.env.BLOB_READ_WRITE_TOKEN;
+    }
+  });
+
+  await test('storeImageFile writes a real local .png file and returns a /generated/ reference when no Blob token is set', async () => {
+    const buffer = Buffer.from('fake png bytes for the local-fallback path');
+
+    const url = await storeImageFile(buffer, 'job-image-123');
+
+    assert.ok(url.startsWith('/generated/image-job-image-123-'), `unexpected url: ${url}`);
+    assert.ok(url.endsWith('.png'));
+
+    const filename = url.replace('/generated/', '');
+    const onDisk = fs.readFileSync(path.join(GENERATED_DIR, filename));
+    assert.ok(onDisk.equals(buffer), 'the exact bytes passed in must be the exact bytes written to disk');
+  });
+
+  await test('storeImageFile never embeds the image bytes in its returned reference (stays small regardless of image size)', async () => {
+    // Simulates a real gpt-image-2 output — real images will be real PNG
+    // bytes, but size is what this test cares about: even at several MB,
+    // the reference this function returns must stay a short string.
+    const bigBuffer = Buffer.alloc(3 * 1024 * 1024, 1);
+
+    const url = await storeImageFile(bigBuffer, 'job-big-image');
+
+    assert.ok(url.length < 200, `expected a short reference, got ${url.length} characters`);
+    assert.ok(!url.startsWith('data:'), 'must never fall back to embedding the image as a data: URI');
+  });
+
+  await test('storeImageFile gives two images of the same job different filenames (no collision on retry)', async () => {
+    const buffer = Buffer.from('same job, two different scene images');
+
+    const urlA = await storeImageFile(buffer, 'job-image-retry');
+    const urlB = await storeImageFile(buffer, 'job-image-retry');
+
+    assert.notStrictEqual(urlA, urlB);
+  });
+
+  await test('storeImageFile rejects an empty buffer instead of writing/uploading nothing silently', async () => {
+    await assert.rejects(() => storeImageFile(Buffer.alloc(0), 'job-image-empty'));
+  });
+
+  await test('storeImageFile uploads to Vercel Blob as image/png (via the injected put) when BLOB_READ_WRITE_TOKEN is set', async () => {
+    process.env.BLOB_READ_WRITE_TOKEN = 'fake-token-for-this-test';
+    try {
+      const buffer = Buffer.from('fake png bytes for the blob path');
+      const calls = [];
+      const fakePutBlob = async (filename, body, options) => {
+        calls.push({ filename, body, options });
+        return { url: `https://fake-store.public.blob.vercel-storage.com/${filename}` };
+      };
+
+      const url = await storeImageFile(buffer, 'job-image-456', { putBlob: fakePutBlob });
+
+      assert.strictEqual(calls.length, 1, 'must call the Blob put exactly once, never fall back to a local file');
+      assert.strictEqual(calls[0].body, buffer);
+      assert.strictEqual(calls[0].options.access, 'public');
+      assert.strictEqual(calls[0].options.contentType, 'image/png');
+      assert.ok(calls[0].filename.endsWith('.png'));
+      assert.strictEqual(url, `https://fake-store.public.blob.vercel-storage.com/${calls[0].filename}`);
+      assert.ok(url.startsWith('https://'));
     } finally {
       delete process.env.BLOB_READ_WRITE_TOKEN;
     }
