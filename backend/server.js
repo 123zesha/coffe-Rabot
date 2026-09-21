@@ -2031,6 +2031,14 @@ app.post('/api/agent', async (req, res) => {
     let response = await client.messages.create({
       model: 'claude-opus-5',
       max_tokens: 16000,
+      // Top-level cache_control auto-places a second breakpoint on the last
+      // cacheable block of `messages` (the frontend-resent conversation
+      // history), separate from the explicit breakpoint on SYSTEM_PROMPT_BASE
+      // above. It composes with that explicit marker (2 of the 4 allowed
+      // breakpoints) and defaults to the same 5-minute TTL, so a long
+      // conversation's already-seen turns are read from cache instead of
+      // re-processed at full price on every follow-up request.
+      cache_control: { type: 'ephemeral' },
       system: await buildSystemPrompt(),
       tools: TOOLS,
       messages,
@@ -2095,6 +2103,11 @@ app.post('/api/agent', async (req, res) => {
       response = await client.messages.create({
         model: 'claude-opus-5',
         max_tokens: 16000,
+        // Same top-level breakpoint as the first call above — this follow-up
+        // reuses the same `messages` array (now extended with the tool_use/
+        // tool_result turn) so its shared prefix reads from what the first
+        // call just wrote.
+        cache_control: { type: 'ephemeral' },
         system: await buildSystemPrompt(),
         tools: TOOLS,
         messages,

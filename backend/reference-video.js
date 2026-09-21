@@ -17,9 +17,16 @@
 // channel, and a best-effort scrape of the watch page's own caption-track
 // data when captions exist) — never the YouTube Data API, never a
 // third-party transcript service. The one real API call this module makes
-// is to Claude, reusing the exact same Anthropic integration (API key,
-// model) already central to the whole app — not a new service, just an
+// is to Claude, reusing the exact same Anthropic integration (API key)
+// already central to the whole app — not a new service, just an
 // additional call within the one already in use.
+//
+// Uses claude-sonnet-5, not the Opus 5 the main agent loop runs on: this
+// call has no tool use and never touches job state, script generation, or
+// the rendering pipeline — it only produces an advisory storytelling-format
+// summary that the main agent (still Opus 5) later reads while writing the
+// actual script. Any failure here (no usable source material) already
+// fails honestly with a clear error instead of guessing.
 //
 // A bare video URL alone is often NOT enough to honestly answer several of
 // the requested elements (pacing, scene count, dialogue style) — oEmbed
@@ -34,7 +41,7 @@ const Anthropic = require('@anthropic-ai/sdk');
 
 const OEMBED_BASE_URL = process.env.YOUTUBE_OEMBED_BASE_URL || 'https://www.youtube.com/oembed';
 const WATCH_PAGE_BASE_URL = process.env.YOUTUBE_WATCH_BASE_URL || 'https://www.youtube.com/watch';
-const ANALYSIS_MODEL = 'claude-opus-5';
+const ANALYSIS_MODEL = 'claude-sonnet-5';
 // Generous enough for a real video's auto-captions to convey pacing/
 // structure, small enough to keep this one-off analysis call cheap and
 // fast — this is a format inspiration aid, not a transcription service.

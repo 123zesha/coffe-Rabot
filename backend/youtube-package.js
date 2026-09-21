@@ -15,14 +15,21 @@
 // the stage/confirmation gates in job-store.js, are untouched.
 //
 // No new paid service: this reuses the exact same Anthropic integration
-// (API key, model) already central to the whole app for its text half. The
+// (API key) already central to the whole app for its text half. The
 // thumbnail IMAGE itself is generated separately, by
 // backend/image-generation.js's generateThumbnailImage, reusing the app's
 // existing OpenAI image integration.
+//
+// Uses claude-sonnet-5, not the Opus 5 the main agent loop runs on: this
+// call has no tool use and never touches job state or the rendering
+// pipeline — it only turns an already-finished script into publishing
+// metadata (titles/description/tags/thumbnail concept), and any failure
+// here (unparseable/incomplete JSON) already fails honestly via
+// failedResult(...) rather than corrupting or blocking anything else.
 
 const Anthropic = require('@anthropic-ai/sdk');
 
-const PACKAGE_MODEL = 'claude-opus-5';
+const PACKAGE_MODEL = 'claude-sonnet-5';
 
 let cachedClient = null;
 
