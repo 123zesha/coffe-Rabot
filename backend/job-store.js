@@ -109,6 +109,7 @@ const JOB_FIELDS = [
   'outputFormat',
   'resolutionTier',
   'videoMode',
+  'chatToVideoAutoPipeline',
 ];
 
 // The only real, supported output-format values — 'horizontal' (16:9),
@@ -602,6 +603,19 @@ function createDefaultJob(id) {
       error: null,
       generatedFromScript: null,
     },
+    // Chat-to-Video: true only for a job created from a pasted script (see
+    // server.js's isScriptPaste), never for a job created via the Create
+    // Video form or the guided chat flow — those always default to false
+    // and are completely unaffected by this field. When true, once the
+    // user confirms the extracted production plan (confirmVideoJob),
+    // server.js's continueChatToVideoPipeline automatically drives the
+    // rest of production — voice-over, subtitles, the final video, and
+    // (since generateYoutubePackage is also turned on for these jobs) the
+    // thumbnail/YouTube package — through short, separate, polled requests
+    // with no further chat turns needed. Not writable by the conversational
+    // agent (see UPDATABLE_JOB_FIELDS in server.js) — set once at job
+    // creation and never changed afterward.
+    chatToVideoAutoPipeline: false,
   };
 }
 

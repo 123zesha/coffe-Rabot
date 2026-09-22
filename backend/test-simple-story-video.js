@@ -692,6 +692,57 @@ async function main() {
     assert.ok(Math.abs(probed.duration - totalSeconds) < 0.5, `expected ~${totalSeconds.toFixed(1)}s duration, got ${probed.duration}`);
   });
 
+  // Chat-to-Video: simulates a real, full-length 40-minute video — a real
+  // 2400s audio fixture and a real SRT spanning the same 2400s, driven
+  // through the exact same continueSimpleStoryVideoAssembly this feature
+  // relies on for any duration. Uses exactly SECTION_RENDER_CONCURRENCY
+  // sections (not the ~53 a real 40-minute video would actually use at the
+  // default 45s target, and not fewer either — a single giant section
+  // would serialize the whole encode with no parallelism at all, which
+  // measured slower in practice than several concurrent ones) so every
+  // section renders in one fully-parallel batch: the fastest real-ffmpeg
+  // shape for this test while still genuinely exercising multiple real
+  // sections. Section-count math/resumability at scale is already proven
+  // by the "20 sections" test above (itself a known, pre-existing timing-
+  // flaky test in a loaded sandbox); what this test specifically proves,
+  // independent of section count, is real duration measurement, the final
+  // concat+mux over a genuine 2400s audio track, and (critically) the new
+  // post-assembly verification step passing for a real ~2400s output. A
+  // separate, dedicated test (test-subtitles-generation.js) covers the
+  // OTHER real 40-minute risk — Whisper's 25MB request-size limit — with a
+  // fast, high-bitrate fixture rather than a full-length one, for the same
+  // reason.
+  await test('simulated 40-minute video: a real 2400s audio/subtitles track assembles and verifies correctly end-to-end', async () => {
+    const totalSeconds = 2400;
+    const { srt } = buildLongSrt(240, 9, 1); // 240 cues * (9s + 1s gap) = 2400s
+    const audioPath = await makeToneAudio(workDir, totalSeconds, '40min');
+    const sectionCount = ssv.SECTION_RENDER_CONCURRENCY;
+    const sectionTargetSeconds = Math.ceil(totalSeconds / sectionCount);
+
+    const result = await ssv.continueSimpleStoryVideoAssembly({
+      voiceover: { status: 'completed', url: audioPath },
+      subtitlesContent: srt,
+      existingRender: null,
+      jobId: 'test-job-simulated-40-minute',
+      sectionTargetSeconds,
+    });
+
+    assert.strictEqual(result.status, 'completed', result.error);
+    assert.strictEqual(result.render.totalSections, sectionCount);
+    assert.ok(result.render.sections.every((section) => section.status === 'completed'));
+    assert.ok(result.buffer && result.buffer.length > 0);
+
+    const outPath = path.join(workDir, 'output-40min.mp4');
+    fs.writeFileSync(outPath, result.buffer);
+    const probed = await probe(outPath);
+    assert.strictEqual(probed.width, ssv.SIMPLE_STORY_WIDTH);
+    assert.strictEqual(probed.height, ssv.SIMPLE_STORY_HEIGHT);
+    assert.ok(
+      Math.abs(probed.duration - totalSeconds) < 1,
+      `expected a real ~${totalSeconds}s (40-minute) duration, got ${probed.duration}`
+    );
+  });
+
   // --- Selective video editing (videoEditSettings) ---
 
   await test('normalizeVideoEditSettings returns the all-defaults shape for missing/empty input', () => {

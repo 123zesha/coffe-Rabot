@@ -532,6 +532,31 @@ function isFinalVideoStillAccurate(job) {
   return (job.finalVideo.resolutionUsed || jobStore.DEFAULT_RESOLUTION_TIER) === desiredResolutionUsed;
 }
 
+// Runs the real assembly (or Simple Story Video's local pipeline) and
+// persists the result. Shared by the assembleFinalVideo Agent tool, its
+// REST route, and continueChatToVideoPipeline so all three can never
+// drift (mirrors runGenerateSubtitles/runGenerateYoutubePackage's role for
+// their own pipelines below). Callers remain responsible for the
+// idempotency (isFinalVideoStillAccurate) and readiness
+// (findFinalVideoBlocker) checks first — this always makes a real
+// assembly attempt.
+async function runAssembleFinalVideo(job, jobId) {
+  const desiredSubtitlesContent =
+    job.burnInSubtitles && job.subtitles && job.subtitles.status === 'completed' ? job.subtitles.content : null;
+  const desiredMusicUsed = computeDesiredMusicUsed(job);
+  const desiredResolutionUsed = computeDesiredResolutionUsed(job);
+  const desiredVideoModeUsed = computeDesiredVideoModeUsed(job);
+  const { finalVideo, simpleStoryRender } = await assembleAndStoreFinalVideo(
+    job,
+    jobId,
+    desiredSubtitlesContent,
+    desiredMusicUsed,
+    desiredResolutionUsed,
+    desiredVideoModeUsed
+  );
+  return jobStore.updateJob(jobId, { finalVideo, simpleStoryRender });
+}
+
 // job.script must be a real, complete script and voiceStyle must not be
 // 'none' before any real OpenAI TTS call — checked once here so the
 // existing REST route (the Final Review "Generate Voice-over" button) and
@@ -555,6 +580,51 @@ function findVoiceoverBlocker(job) {
   }
 
   return null;
+}
+
+// Runs the real OpenAI TTS call and persists the result, including the
+// consequential resets (finalVideo/simpleStoryRender/subtitles) a fresh
+// voice-over always requires — the previous narration those reflected no
+// longer matches. Shared by the generateVoiceover Agent tool, its REST
+// route, and continueChatToVideoPipeline so all three can never drift
+// (mirrors runGenerateSubtitles/runGenerateYoutubePackage's role for their
+// own pipelines). Callers remain responsible for the findVoiceoverBlocker
+// and OPENAI_API_KEY checks first (each has its own audience-appropriate
+// error message) — this always makes a real generation attempt.
+async function runGenerateVoiceover(job, jobId) {
+  const voiceover = await voiceoverGeneration.generateVoiceover({
+    script: job.script,
+    voiceStyle: job.voiceStyle,
+    jobId: job.id,
+    storyStyle: job.storyStyle,
+    videoMode: job.videoMode,
+    topic: job.topic,
+  });
+
+  const updates = { voiceover };
+  if (voiceover.status === 'completed') {
+    updates.finalVideo = {
+      url: null,
+      status: 'pending',
+      subtitlesUsed: null,
+      musicUsed: null,
+      resolutionUsed: null,
+      videoModeUsed: null,
+      editSettingsUsed: null,
+    };
+    updates.simpleStoryRender = {
+      status: 'not_started',
+      totalSections: null,
+      sections: [],
+      audioUrlSnapshot: null,
+      subtitlesContentSnapshot: null,
+      editSettingsSnapshot: null,
+      error: null,
+    };
+    updates.subtitles = { status: 'pending', format: 'srt', content: null, error: null, generatedFromVoiceoverUrl: null };
+  }
+
+  return jobStore.updateJob(jobId, updates);
 }
 
 // job.script must be a real, complete script before generating an optional
@@ -734,6 +804,144 @@ async function runGenerateSubtitles(job, jobId, { forceRegenerate } = {}) {
         };
 
   return jobStore.updateJob(jobId, { subtitles: subtitlesField });
+}
+
+// Chat-to-Video: for a job with chatToVideoAutoPipeline true, advances
+// production by exactly ONE real step per call — the voice-over, then
+// subtitles, then the final video (which may itself take several calls to
+// fully finish for a long story — see continueSimpleStoryVideoAssembly),
+// then the optional thumbnail/YouTube package — reusing the exact same
+// runGenerateVoiceover/runGenerateSubtitles/runAssembleFinalVideo/
+// runGenerateYoutubePackage functions the Agent tools and REST routes
+// already use, so this never duplicates or diverges from them. Never
+// advances an unconfirmed job (the user must have explicitly confirmed the
+// extracted production plan first — see the Confirmation Gate) and never
+// touches a job this flag isn't set on, so a guided-form job is completely
+// unaffected even if this were ever called for one by mistake.
+//
+// The caller (POST /api/jobs/:id/continue-pipeline, polled by the frontend
+// — see app.js's pollChatToVideoPipeline) is expected to call this again
+// and again, exactly like the existing assemble-video polling loop, until
+// it reports 'done' or 'failed'. This never blocks on more than one real
+// step, so a 30-40 minute video's production can never run into the
+// serverless function's own time limit, and it never asks Claude to decide
+// anything — purely mechanical, job-state-driven sequencing, so completing
+// the whole pipeline after the user's one confirmation costs zero
+// additional Claude calls. A step whose own status is already 'completed'
+// (or, for the final video, still accurate — see isFinalVideoStillAccurate)
+// is skipped without a real call, so a paid step is never repeated once it
+// has genuinely succeeded.
+async function continueChatToVideoPipeline(jobId) {
+  const job = await jobStore.getJob(jobId);
+  if (!job) {
+    return { status: 'not_found' };
+  }
+  if (!job.chatToVideoAutoPipeline) {
+    return { status: 'not_applicable', job };
+  }
+  if (!job.confirmed) {
+    return { status: 'waiting_for_confirmation', job };
+  }
+
+  if (job.voiceover.status !== 'completed') {
+    const blocker = findVoiceoverBlocker(job);
+    if (blocker) {
+      return { status: 'failed', step: 'voiceover', error: blocker, job };
+    }
+    if (!process.env.OPENAI_API_KEY) {
+      return {
+        status: 'failed',
+        step: 'voiceover',
+        error: 'Voice-over generation is not configured on the server (OPENAI_API_KEY missing).',
+        job,
+      };
+    }
+    const updatedJob = await runGenerateVoiceover(job, jobId);
+    if (updatedJob.voiceover.status !== 'completed') {
+      return {
+        status: 'failed',
+        step: 'voiceover',
+        error: updatedJob.voiceover.error || 'Voice-over generation failed.',
+        job: updatedJob,
+      };
+    }
+    return { status: 'in_progress', step: 'voiceover', job: updatedJob };
+  }
+
+  if (job.subtitles.status !== 'completed') {
+    const blocker = findSubtitlesBlocker(job);
+    if (blocker) {
+      return { status: 'failed', step: 'subtitles', error: blocker, job };
+    }
+    if (!process.env.OPENAI_API_KEY) {
+      return {
+        status: 'failed',
+        step: 'subtitles',
+        error: 'Subtitle generation is not configured on the server (OPENAI_API_KEY missing).',
+        job,
+      };
+    }
+    const updatedJob = await runGenerateSubtitles(job, jobId);
+    if (updatedJob.subtitles.status !== 'completed') {
+      return {
+        status: 'failed',
+        step: 'subtitles',
+        error: updatedJob.subtitles.error || 'Subtitle generation failed.',
+        job: updatedJob,
+      };
+    }
+    return { status: 'in_progress', step: 'subtitles', job: updatedJob };
+  }
+
+  if (!isFinalVideoStillAccurate(job)) {
+    const blocker = findFinalVideoBlocker(job);
+    if (blocker) {
+      return { status: 'failed', step: 'assembly', error: blocker, job };
+    }
+    const updatedJob = await runAssembleFinalVideo(job, jobId);
+    if (updatedJob.finalVideo.status === 'failed') {
+      return {
+        status: 'failed',
+        step: 'assembly',
+        error: updatedJob.finalVideo.error || 'Final video assembly failed.',
+        job: updatedJob,
+      };
+    }
+    // 'processing' (a long story still needing more sections) is real
+    // progress, not done yet — the caller just keeps polling exactly as it
+    // already does for any Simple Story Video render.
+    return { status: 'in_progress', step: 'assembly', job: updatedJob };
+  }
+
+  if (job.generateYoutubePackage) {
+    const blocker = findYoutubePackageBlocker(job);
+    if (blocker) {
+      return { status: 'failed', step: 'youtubePackage', error: blocker, job };
+    }
+    if (!process.env.ANTHROPIC_API_KEY) {
+      return {
+        status: 'failed',
+        step: 'youtubePackage',
+        error: 'YouTube package generation is not configured on the server (ANTHROPIC_API_KEY missing).',
+        job,
+      };
+    }
+    // Idempotent (see runGenerateYoutubePackage) — a no-op when the
+    // package is already current for this exact script, so calling this
+    // again after 'done' never re-spends a real call.
+    const updatedJob = await runGenerateYoutubePackage(job, jobId);
+    if (updatedJob.youtubePackage.status !== 'completed') {
+      return {
+        status: 'failed',
+        step: 'youtubePackage',
+        error: updatedJob.youtubePackage.error || 'YouTube package generation failed.',
+        job: updatedJob,
+      };
+    }
+    return { status: 'done', job: updatedJob };
+  }
+
+  return { status: 'done', job };
 }
 
 const client = new Anthropic();
@@ -1682,59 +1890,12 @@ async function executeTool(name, jobId, input) {
     }
 
     try {
-      // Reuses the exact same voice-over implementation the REST route
-      // already uses (backend/voiceover-generation.js) — no second
-      // voice-over system.
-      const voiceover = await voiceoverGeneration.generateVoiceover({
-        script: job.script,
-        voiceStyle: job.voiceStyle,
-        jobId: job.id,
-        storyStyle: job.storyStyle,
-        videoMode: job.videoMode,
-        topic: job.topic,
-      });
-
-      const updates = { voiceover };
-      if (voiceover.status === 'completed') {
-        // A fresh voice-over invalidates any already-assembled final video
-        // — it was combined from whatever narration (or silence) existed
-        // before, and no longer reflects this new one. Resetting finalVideo
-        // here means assembleFinalVideo's own "already completed, skip"
-        // check never keeps serving a stale, out-of-sync video afterward.
-        updates.finalVideo = {
-          url: null,
-          status: 'pending',
-          subtitlesUsed: null,
-          musicUsed: null,
-          resolutionUsed: null,
-          videoModeUsed: null,
-          editSettingsUsed: null,
-        };
-        // Any already-rendered Simple Story Video sections were rendered
-        // from the PREVIOUS narration audio's own timing and no longer
-        // match this new one — resetting this alongside finalVideo means a
-        // fresh voice-over never resumes stale section progress (see
-        // continueSimpleStoryVideoAssembly's own staleness check, which
-        // would also catch this on its own since audioUrlSnapshot no
-        // longer matches, but resetting here keeps the job's own record
-        // honest immediately rather than only at the next assembly call).
-        updates.simpleStoryRender = {
-          status: 'not_started',
-          totalSections: null,
-          sections: [],
-          audioUrlSnapshot: null,
-          subtitlesContentSnapshot: null,
-          editSettingsSnapshot: null,
-          error: null,
-        };
-        // Existing subtitles were transcribed from the PREVIOUS narration
-        // audio and no longer match this new one — resetting them here
-        // means generateSubtitles never serves stale captions, and
-        // findSubtitlesBlocker correctly requires a fresh transcription.
-        updates.subtitles = { status: 'pending', format: 'srt', content: null, error: null, generatedFromVoiceoverUrl: null };
-      }
-
-      const updatedJob = await jobStore.updateJob(jobId, updates);
+      // Reuses the exact same voice-over implementation the REST route and
+      // continueChatToVideoPipeline already use — no second voice-over
+      // system (see runGenerateVoiceover's own comment for the consequential
+      // finalVideo/simpleStoryRender/subtitles resets a fresh voice-over
+      // always requires).
+      const updatedJob = await runGenerateVoiceover(job, jobId);
       return JSON.stringify(updatedJob ? summarizeJobForAgent(updatedJob) : { error: 'job not found' });
     } catch (error) {
       console.error(
@@ -1773,24 +1934,11 @@ async function executeTool(name, jobId, input) {
 
     try {
       // Reuses the exact same assembly + storage implementation the REST
-      // route already uses (backend/video-assembly.js, backend/
-      // video-storage.js) — no second assembly system. Calls no paid API:
-      // every clip and the voice-over were already generated (and, for the
-      // clips, already paid for) earlier.
-      const desiredSubtitlesContent =
-        job.burnInSubtitles && job.subtitles && job.subtitles.status === 'completed' ? job.subtitles.content : null;
-      const desiredMusicUsed = computeDesiredMusicUsed(job);
-      const desiredResolutionUsed = computeDesiredResolutionUsed(job);
-      const desiredVideoModeUsed = computeDesiredVideoModeUsed(job);
-      const { finalVideo, simpleStoryRender } = await assembleAndStoreFinalVideo(
-        job,
-        jobId,
-        desiredSubtitlesContent,
-        desiredMusicUsed,
-        desiredResolutionUsed,
-        desiredVideoModeUsed
-      );
-      const updatedJob = await jobStore.updateJob(jobId, { finalVideo, simpleStoryRender });
+      // route and continueChatToVideoPipeline already use (backend/
+      // video-assembly.js, backend/video-storage.js) — no second assembly
+      // system. Calls no paid API: every clip and the voice-over were
+      // already generated (and, for the clips, already paid for) earlier.
+      const updatedJob = await runAssembleFinalVideo(job, jobId);
       return JSON.stringify(updatedJob ? summarizeJobForAgent(updatedJob) : { error: 'job not found' });
     } catch (error) {
       console.error(
@@ -2045,38 +2193,44 @@ app.post('/api/agent', async (req, res) => {
     return res.status(400).json({ error: 'message is required' });
   }
 
-  const existingJob = requestedJobId ? await jobStore.getJob(requestedJobId) : null;
-  const job = existingJob || (await jobStore.createJob());
-  const jobId = job.id;
-
-  // Chat-to-Video: save a detected script paste directly to job.script —
-  // BEFORE Claude ever sees this request — so the user's original wording
-  // is preserved byte-for-byte and Claude never has to retype or
-  // paraphrase a possibly long script back out as tool-call output just to
-  // record it (that would cost real output tokens and risk drifting from
-  // what the user actually pasted). isScriptPaste also gates the tool-loop
-  // guards below: one strips any `script` field Claude's own
-  // updateVideoJob call tries to add THIS turn (protecting the just-saved
-  // original even if the prompt instruction is ignored), and the other
-  // blocks every paid/confirm tool this same turn (see
-  // PAID_OR_CONFIRM_TOOLS) so the user always sees the extracted plan and
-  // explicitly confirms it in a later message first. Pasting a script that
-  // actually differs from an already-confirmed job's current script resets
-  // confirmed to false — that earlier confirmation applied to the OLD
-  // script, so the new one must be shown and confirmed again before any
-  // paid step can run; re-sending the exact same text is a no-op and never
-  // un-confirms a job for no reason.
   const isScriptPaste = isScriptPasteRequest({ message, isScriptPaste: isScriptPasteFlag, continueAutomatically });
-  if (isScriptPaste) {
-    const trimmedScript = message.trim();
-    const updates = { script: trimmedScript };
-    if (job.confirmed && job.script !== trimmedScript) {
-      updates.confirmed = false;
-    }
-    await jobStore.updateJob(jobId, updates);
-  }
 
-  const history = Array.isArray(conversationHistory) ? conversationHistory : [];
+  // Chat-to-Video: a detected script paste ALWAYS starts a brand-new,
+  // independent job — never reuses whatever job the frontend was last
+  // pointed at, even if a jobId was supplied. This guarantees a paste can
+  // never overwrite a previous job's script, voice-over, subtitles, or
+  // final video: every paste begins its own clean production run.
+  // conversationHistory is reset to empty for the same reason — a
+  // previous job's messages have nothing to do with this new one, and
+  // forwarding them would only add irrelevant tokens to every later
+  // request. The script is saved directly to job.script — BEFORE Claude
+  // ever sees this request — so the user's original wording is preserved
+  // byte-for-byte and Claude never has to retype or paraphrase a possibly
+  // long script back out as tool-call output just to record it (that
+  // would cost real output tokens and risk drifting from what the user
+  // actually pasted). chatToVideoAutoPipeline and generateYoutubePackage
+  // are turned on so that, once the user confirms the extracted plan, the
+  // rest of production (voice-over, subtitles, the final video, and the
+  // thumbnail/YouTube package) proceeds automatically — see
+  // continueChatToVideoPipeline below and prompts/system-prompt.md.
+  let job;
+  let jobId;
+  let history;
+  if (isScriptPaste) {
+    job = await jobStore.createJob();
+    jobId = job.id;
+    history = [];
+    await jobStore.updateJob(jobId, {
+      script: message.trim(),
+      chatToVideoAutoPipeline: true,
+      generateYoutubePackage: true,
+    });
+  } else {
+    const existingJob = requestedJobId ? await jobStore.getJob(requestedJobId) : null;
+    job = existingJob || (await jobStore.createJob());
+    jobId = job.id;
+    history = Array.isArray(conversationHistory) ? conversationHistory : [];
+  }
   // A continuation request resumes an already-started turn (its history
   // already ends with the pending tool_use/tool_result exchange) rather
   // than starting a new one, so it must NOT append another user message —
@@ -2362,43 +2516,7 @@ app.post('/api/jobs/:id/generate-voiceover', async (req, res) => {
   }
 
   try {
-    const voiceover = await voiceoverGeneration.generateVoiceover({
-      script: job.script,
-      voiceStyle: job.voiceStyle,
-      jobId: job.id,
-      storyStyle: job.storyStyle,
-      videoMode: job.videoMode,
-      topic: job.topic,
-    });
-
-    const updates = { voiceover };
-    if (voiceover.status === 'completed') {
-      // See the generateVoiceover Agent tool's identical comment: a fresh
-      // voice-over invalidates any already-assembled final video, any
-      // already-rendered Simple Story Video section progress, and any
-      // existing subtitles (transcribed from the previous narration audio).
-      updates.finalVideo = {
-        url: null,
-        status: 'pending',
-        subtitlesUsed: null,
-        musicUsed: null,
-        resolutionUsed: null,
-        videoModeUsed: null,
-        editSettingsUsed: null,
-      };
-      updates.simpleStoryRender = {
-        status: 'not_started',
-        totalSections: null,
-        sections: [],
-        audioUrlSnapshot: null,
-        subtitlesContentSnapshot: null,
-        editSettingsSnapshot: null,
-        error: null,
-      };
-      updates.subtitles = { status: 'pending', format: 'srt', content: null, error: null, generatedFromVoiceoverUrl: null };
-    }
-
-    const updatedJob = await jobStore.updateJob(job.id, updates);
+    const updatedJob = await runGenerateVoiceover(job, job.id);
     res.json(updatedJob);
   } catch (error) {
     console.error(
@@ -2594,20 +2712,7 @@ app.post('/api/jobs/:id/assemble-video', async (req, res) => {
   }
 
   try {
-    const desiredSubtitlesContent =
-      job.burnInSubtitles && job.subtitles && job.subtitles.status === 'completed' ? job.subtitles.content : null;
-    const desiredMusicUsed = computeDesiredMusicUsed(job);
-    const desiredResolutionUsed = computeDesiredResolutionUsed(job);
-    const desiredVideoModeUsed = computeDesiredVideoModeUsed(job);
-    const { finalVideo, simpleStoryRender } = await assembleAndStoreFinalVideo(
-      job,
-      job.id,
-      desiredSubtitlesContent,
-      desiredMusicUsed,
-      desiredResolutionUsed,
-      desiredVideoModeUsed
-    );
-    const updatedJob = await jobStore.updateJob(job.id, { finalVideo, simpleStoryRender });
+    const updatedJob = await runAssembleFinalVideo(job, job.id);
     res.json(updatedJob);
   } catch (error) {
     console.error(
@@ -2615,6 +2720,34 @@ app.post('/api/jobs/:id/assemble-video', async (req, res) => {
       JSON.stringify({ name: error?.name, message: error?.message }, null, 2)
     );
     res.status(502).json({ error: 'Final video assembly failed unexpectedly.' });
+  }
+});
+
+// Chat-to-Video: advances a confirmed auto-pipeline job by exactly one real
+// step per call — see continueChatToVideoPipeline's own comment. Polled
+// repeatedly by the frontend (app.js's pollChatToVideoPipeline) the same
+// way /assemble-video is already polled for a long Simple Story Video
+// render, so completing voice-over -> subtitles -> final video -> thumbnail/
+// YouTube package after the user's one confirmation needs no long-held HTTP
+// request and no further Claude calls. Always 200 with a `status` field
+// ('waiting_for_confirmation' | 'in_progress' | 'done' | 'failed' |
+// 'not_applicable') plus the current job — never a 4xx/5xx for an expected
+// pipeline state, since a poller needs to keep reading job state either
+// way; only a genuinely unknown job id or an unexpected exception is a real
+// HTTP error.
+app.post('/api/jobs/:id/continue-pipeline', async (req, res) => {
+  try {
+    const result = await continueChatToVideoPipeline(req.params.id);
+    if (result.status === 'not_found') {
+      return res.status(404).json({ error: 'job not found' });
+    }
+    res.json(result);
+  } catch (error) {
+    console.error(
+      'Unexpected error continuing the Chat-to-Video pipeline:',
+      JSON.stringify({ name: error?.name, message: error?.message }, null, 2)
+    );
+    res.status(502).json({ error: 'Continuing production failed unexpectedly.' });
   }
 });
 
@@ -2674,3 +2807,4 @@ module.exports.SYSTEM_PROMPT_BASE = SYSTEM_PROMPT_BASE;
 module.exports.TOOLS = TOOLS;
 module.exports.isScriptPasteRequest = isScriptPasteRequest;
 module.exports.PAID_OR_CONFIRM_TOOLS = PAID_OR_CONFIRM_TOOLS;
+module.exports.continueChatToVideoPipeline = continueChatToVideoPipeline;

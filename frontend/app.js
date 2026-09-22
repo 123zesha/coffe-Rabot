@@ -254,6 +254,7 @@
       refreshFinalVideoCard();
       refreshYoutubePackageCard();
       refreshSubtitlesCard();
+      maybeStartChatToVideoPipeline();
     }
   });
 
@@ -457,6 +458,7 @@
       refreshFinalVideoCard();
       refreshYoutubePackageCard();
       refreshSubtitlesCard();
+      maybeStartChatToVideoPipeline();
     }
   });
 
@@ -735,16 +737,27 @@
       return;
     }
 
+    // Captures the target job id NOW, at schedule time, rather than reading
+    // the outer `jobId` when the timer actually fires — Chat-to-Video can
+    // switch `jobId` to a brand-new job while this timer is still pending
+    // (e.g. the user pastes another script while an earlier job's render is
+    // still in progress), and without this a stale timer would wrongly poll
+    // the NEW job's assemble-video route instead of the one it was
+    // originally scheduled for.
+    const targetJobId = jobId;
+
     simpleStoryPollTimer = setTimeout(async () => {
       simpleStoryPollTimer = null;
       try {
-        await fetch(`/api/jobs/${jobId}/assemble-video`, { method: 'POST' });
+        await fetch(`/api/jobs/${targetJobId}/assemble-video`, { method: 'POST' });
       } catch (error) {
         // Ignored — the job's own real, persisted state (checked on the
         // next poll or the next page load) is the source of truth, not
         // this fire-and-forget continuation call.
       }
-      await refreshFinalVideoCard();
+      if (targetJobId === jobId) {
+        await refreshFinalVideoCard();
+      }
     }, SIMPLE_STORY_POLL_INTERVAL_MS);
   }
 
@@ -950,6 +963,74 @@
     renderSubtitlesCard(await fetchCurrentJob());
   }
 
+  // --- Chat-to-Video: fully-automatic post-confirmation pipeline ---
+  // Once a job created by pasting a script (job.chatToVideoAutoPipeline)
+  // has been confirmed, this drives voice-over -> subtitles -> final video
+  // -> thumbnail/YouTube package forward with plain, separate HTTP calls
+  // on a timer — mirrors pollSimpleStoryRenderProgress's own reasoning:
+  // never loop the conversational agent purely to advance a mechanical
+  // sequence with nothing left to reason about, and never hold one HTTP
+  // request open for the whole thing. Renders each card directly from the
+  // response's own job data (never calling refreshFinalVideoCard, which
+  // would also kick off pollSimpleStoryRenderProgress and risk two
+  // independent timers both trying to advance the same Simple Story Video
+  // render at once) so this is the single driver of progress while it's
+  // running. Guarded by chatToVideoPollTimer so a chat-triggered
+  // confirmation and a page reload can never start two overlapping
+  // loops for the same job. Stops itself once the pipeline reports 'done',
+  // 'failed', or 'not_applicable' — nothing further to advance.
+  let chatToVideoPollTimer = null;
+  const CHAT_TO_VIDEO_POLL_INTERVAL_MS = 4000;
+
+  function renderAllCards(job) {
+    renderVoiceoverCard(job);
+    renderSubtitlesCard(job);
+    renderFinalVideoCard(job);
+    renderYoutubePackageCard(job);
+  }
+
+  function pollChatToVideoPipeline(job) {
+    if (!jobId || !job || !job.chatToVideoAutoPipeline || !job.confirmed || chatToVideoPollTimer) {
+      return;
+    }
+
+    // Captures the target job id now, at schedule time — see
+    // pollSimpleStoryRenderProgress's identical reasoning for why reading
+    // the outer, mutable `jobId` when the timer fires would be wrong if a
+    // new script paste switches to a different job in the meantime.
+    const targetJobId = jobId;
+
+    chatToVideoPollTimer = setTimeout(async () => {
+      chatToVideoPollTimer = null;
+      let result = null;
+      try {
+        const res = await fetch(`/api/jobs/${targetJobId}/continue-pipeline`, { method: 'POST' });
+        result = await res.json();
+      } catch (error) {
+        // Ignored — the job's own real, persisted state (checked on the
+        // next poll or the next page load) is the source of truth, not
+        // this fire-and-forget continuation call.
+      }
+
+      if (targetJobId !== jobId) {
+        return;
+      }
+
+      if (result && result.job) {
+        renderAllCards(result.job);
+      }
+
+      if (result && (result.status === 'in_progress' || result.status === 'waiting_for_confirmation')) {
+        pollChatToVideoPipeline(result.job);
+      }
+    }, CHAT_TO_VIDEO_POLL_INTERVAL_MS);
+  }
+
+  async function maybeStartChatToVideoPipeline() {
+    if (!jobId) return;
+    pollChatToVideoPipeline(await fetchCurrentJob());
+  }
+
   generateSubtitlesBtn.addEventListener('click', async () => {
     if (subtitlesGenerating || !jobId) {
       return;
@@ -1047,4 +1128,5 @@
   refreshFinalVideoCard();
   refreshYoutubePackageCard();
   refreshSubtitlesCard();
+  maybeStartChatToVideoPipeline();
 })();
