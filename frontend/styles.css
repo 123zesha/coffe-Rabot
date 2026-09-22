@@ -709,6 +709,38 @@ a {
   white-space: pre-wrap;
 }
 
+.chat-script-paste-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  border-top: 1px solid var(--color-border);
+  background: var(--color-bg);
+  font-size: 0.78rem;
+}
+
+.script-paste-toggle {
+  flex-shrink: 0;
+  border: 1px solid var(--color-border);
+  border-radius: 999px;
+  padding: 4px 10px;
+  background: var(--color-surface);
+  color: var(--color-text);
+  font-size: 0.78rem;
+  cursor: pointer;
+  transition: background 0.2s ease, color 0.2s ease, border-color 0.2s ease;
+}
+
+.script-paste-toggle.active {
+  background: var(--color-primary);
+  border-color: var(--color-primary);
+  color: #fff;
+}
+
+.script-paste-hint {
+  color: var(--color-primary);
+}
+
 .chat-bubble.user {
   align-self: flex-end;
   background: var(--color-primary);

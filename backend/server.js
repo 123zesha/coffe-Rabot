@@ -1997,23 +1997,49 @@ function buildCachedSystemPrompt(job) {
 // inside the time limit — without the user having to type anything.
 const HEAVY_TOOLS = new Set(['generateVoiceover', 'generateSubtitles', 'assembleFinalVideo']);
 
-// Chat-to-Video: a message this long, on a fresh (non-continuation) turn,
-// is treated as a complete, already-written script (e.g. pasted from
-// ChatGPT) plus production instructions, rather than an ordinary chat
-// reply — see the "Chat-to-Video" section of prompts/system-prompt.md.
-// The threshold sits well above any normal conversational message (a
-// question, a short instruction, a confirmation) but comfortably below
-// even a short video's full narration once combined with any
-// instructions, so it reliably tells the two apart without the user
-// needing to flag it explicitly.
-const SCRIPT_PASTE_MIN_LENGTH = 500;
+// Chat-to-Video: which tools may never execute on the SAME turn as a
+// detected script paste — every real paid call, plus confirmVideoJob
+// itself — so the extracted script/settings are always shown to the user
+// and explicitly confirmed in a SEPARATE, later message before any of them
+// can run. This is a hard, code-level guarantee (see the tool-loop guard
+// below), not just a prompt instruction the model could skip under time
+// pressure. assembleFinalVideo is deliberately excluded: it calls no paid
+// API, and it cannot meaningfully succeed yet anyway (no voice-over/
+// subtitles exist on a same-turn paste), so blocking it adds no protection.
+const PAID_OR_CONFIRM_TOOLS = new Set([
+  'generateVoiceover',
+  'generateSubtitles',
+  'generateSceneImages',
+  'generateSceneVideo',
+  'generateYoutubePackage',
+  'confirmVideoJob',
+]);
 
-function looksLikePastedScript(message) {
-  return typeof message === 'string' && message.trim().length >= SCRIPT_PASTE_MIN_LENGTH;
+// Chat-to-Video: whether THIS request should be treated as the user
+// pasting a complete, already-written script (e.g. from ChatGPT) plus
+// production instructions, rather than an ordinary chat reply — see the
+// "Chat-to-Video" section of prompts/system-prompt.md. Deliberately NOT a
+// length/shape heuristic: an ordinary chat message can be arbitrarily
+// long (a detailed question, a long clarification), and a real script can
+// be short (a 30-second video), so message length alone cannot reliably
+// tell the two apart — guessing from it previously caused long ordinary
+// messages to be mistaken for scripts. Instead this relies on the
+// frontend's explicit "Paste Script" toggle (isScriptPaste in the request
+// body), which only reflects the user's own deliberate action for that
+// one message — a clear, unambiguous signal that works the same for a
+// short or a long script.
+function isScriptPasteRequest({ message, isScriptPaste, continueAutomatically }) {
+  return !continueAutomatically && Boolean(isScriptPaste) && typeof message === 'string' && message.trim().length > 0;
 }
 
 app.post('/api/agent', async (req, res) => {
-  const { message, conversationHistory, jobId: requestedJobId, continueAutomatically } = req.body || {};
+  const {
+    message,
+    conversationHistory,
+    jobId: requestedJobId,
+    continueAutomatically,
+    isScriptPaste: isScriptPasteFlag,
+  } = req.body || {};
 
   if (!continueAutomatically && !message) {
     return res.status(400).json({ error: 'message is required' });
@@ -2028,16 +2054,26 @@ app.post('/api/agent', async (req, res) => {
   // is preserved byte-for-byte and Claude never has to retype or
   // paraphrase a possibly long script back out as tool-call output just to
   // record it (that would cost real output tokens and risk drifting from
-  // what the user actually pasted). A job that has already been confirmed
-  // never has its script silently replaced this way — only the normal
-  // updateVideoJob/updateVideoEditSettings tools can still change it
-  // explicitly after that point. isScriptPaste also gates the tool-loop
-  // guard below, which strips any `script` field Claude's own
-  // updateVideoJob call tries to add THIS turn, protecting the
-  // just-saved original even if the prompt instruction is ignored.
-  const isScriptPaste = !continueAutomatically && !job.confirmed && looksLikePastedScript(message);
+  // what the user actually pasted). isScriptPaste also gates the tool-loop
+  // guards below: one strips any `script` field Claude's own
+  // updateVideoJob call tries to add THIS turn (protecting the just-saved
+  // original even if the prompt instruction is ignored), and the other
+  // blocks every paid/confirm tool this same turn (see
+  // PAID_OR_CONFIRM_TOOLS) so the user always sees the extracted plan and
+  // explicitly confirms it in a later message first. Pasting a script that
+  // actually differs from an already-confirmed job's current script resets
+  // confirmed to false — that earlier confirmation applied to the OLD
+  // script, so the new one must be shown and confirmed again before any
+  // paid step can run; re-sending the exact same text is a no-op and never
+  // un-confirms a job for no reason.
+  const isScriptPaste = isScriptPasteRequest({ message, isScriptPaste: isScriptPasteFlag, continueAutomatically });
   if (isScriptPaste) {
-    await jobStore.updateJob(jobId, { script: message.trim() });
+    const trimmedScript = message.trim();
+    const updates = { script: trimmedScript };
+    if (job.confirmed && job.script !== trimmedScript) {
+      updates.confirmed = false;
+    }
+    await jobStore.updateJob(jobId, updates);
   }
 
   const history = Array.isArray(conversationHistory) ? conversationHistory : [];
@@ -2108,6 +2144,28 @@ app.post('/api/agent', async (req, res) => {
             Object.prototype.hasOwnProperty.call(tool.input, 'script')
           ) {
             delete tool.input.script;
+          }
+          // Chat-to-Video: hard-block every paid tool and confirmVideoJob on
+          // the SAME turn as a detected script paste (see
+          // PAID_OR_CONFIRM_TOOLS) — the user must see the extracted script
+          // receipt and settings and reply with explicit confirmation in a
+          // SEPARATE, later message before any of these can run. This is
+          // enforced here in code, not just prompted for, so it holds even
+          // if the model tries to skip straight to generating or
+          // confirming.
+          if (isScriptPaste && PAID_OR_CONFIRM_TOOLS.has(tool.name)) {
+            return {
+              type: 'tool_result',
+              tool_use_id: tool.id,
+              content: JSON.stringify({
+                error: 'blocked_until_user_confirms_plan',
+                note:
+                  'The user just pasted a script this turn. Present a short receipt (topic/title and roughly ' +
+                  'how long the script is — never reprint the full script text, the user can already see it ' +
+                  'in their own message above) plus every video setting you extracted, and ask them to ' +
+                  'confirm. Do not call this tool again until the user explicitly confirms in a new message.',
+              }),
+            };
           }
           // A second heavy tool call in the same request is deferred, never
           // executed — its own tool_result says so, so Claude's next reply
@@ -2614,5 +2672,5 @@ module.exports.executeTool = executeTool;
 module.exports.buildCachedSystemPrompt = buildCachedSystemPrompt;
 module.exports.SYSTEM_PROMPT_BASE = SYSTEM_PROMPT_BASE;
 module.exports.TOOLS = TOOLS;
-module.exports.looksLikePastedScript = looksLikePastedScript;
-module.exports.SCRIPT_PASTE_MIN_LENGTH = SCRIPT_PASTE_MIN_LENGTH;
+module.exports.isScriptPasteRequest = isScriptPasteRequest;
+module.exports.PAID_OR_CONFIRM_TOOLS = PAID_OR_CONFIRM_TOOLS;

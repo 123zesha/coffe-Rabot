@@ -8,6 +8,8 @@
   const input = document.getElementById('chat-input');
   const sendBtn = form.querySelector('.chat-send');
   const messages = document.getElementById('chat-messages');
+  const scriptPasteToggle = document.getElementById('script-paste-toggle');
+  const scriptPasteHint = document.getElementById('script-paste-hint');
 
   const generateBtn = document.getElementById('generate-video-btn');
   const generateStatus = document.getElementById('generate-status');
@@ -117,8 +119,13 @@
   // one message still produces one complete video with no extra prompts.
   // onProgress, if given, is called with each intermediate step's reply as
   // it completes (the final reply is returned normally, not passed here).
-  async function callAgent(message, onProgress) {
-    let data = await postAgentRequest({ message, conversationHistory, jobId });
+  // isScriptPaste (Chat-to-Video), when true, tells the backend this exact
+  // message is a complete, already-written script the user explicitly
+  // flagged via the "Paste Script" toggle — never inferred from the
+  // message's length or shape, so an ordinary long chat message is never
+  // mistaken for one, and a short script is recognized just as reliably.
+  async function callAgent(message, onProgress, isScriptPaste) {
+    let data = await postAgentRequest({ message, conversationHistory, jobId, isScriptPaste: Boolean(isScriptPaste) });
     applyAgentResponse(data);
 
     while (data.autoContinue) {
@@ -195,14 +202,33 @@
   }
   input.addEventListener('input', autoGrowInput);
 
+  // Chat-to-Video: the ONLY signal that a message is a complete pasted
+  // script — the user explicitly turns this on right before sending it.
+  // It always resets to off after one send (success or failure), so it
+  // never silently stays on and flags a later, unrelated message.
+  let scriptPasteMode = false;
+
+  function setScriptPasteMode(on) {
+    scriptPasteMode = on;
+    scriptPasteToggle.classList.toggle('active', on);
+    scriptPasteToggle.setAttribute('aria-pressed', String(on));
+    scriptPasteHint.hidden = !on;
+    input.placeholder = on ? 'Paste your complete script + instructions here…' : 'Type a message…';
+  }
+
+  scriptPasteToggle.addEventListener('click', () => setScriptPasteMode(!scriptPasteMode));
+
   form.addEventListener('submit', async (event) => {
     event.preventDefault();
     const text = input.value.trim();
     if (!text) return;
 
+    const isScriptPaste = scriptPasteMode;
+
     addMessage(text, 'user');
     input.value = '';
     autoGrowInput();
+    setScriptPasteMode(false);
     input.disabled = true;
     sendBtn.disabled = true;
 
@@ -213,7 +239,7 @@
         typingBubble.remove();
         addMessage(progressReply, 'bot');
         typingBubble = showTypingIndicator();
-      });
+      }, isScriptPaste);
       typingBubble.remove();
       addMessage(reply, 'bot');
     } catch (error) {
