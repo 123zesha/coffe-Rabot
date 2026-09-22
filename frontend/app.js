@@ -174,6 +174,27 @@
 
   closeBtn.addEventListener('click', closeChat);
 
+  // Chat-to-Video: the chat box is a textarea (not a single-line input) so
+  // a complete, multi-paragraph script + instructions can be pasted in
+  // comfortably. Enter still sends the message like a normal chat input;
+  // Shift+Enter inserts a newline instead, so a pasted script's own line
+  // breaks are never mistaken for "send".
+  input.addEventListener('keydown', (event) => {
+    if (event.key === 'Enter' && !event.shiftKey) {
+      event.preventDefault();
+      form.requestSubmit();
+    }
+  });
+
+  // Grows the textarea with its content (up to the CSS max-height, where it
+  // scrolls instead) so a longer paste stays fully visible while typing,
+  // without needing a separate library.
+  function autoGrowInput() {
+    input.style.height = 'auto';
+    input.style.height = `${input.scrollHeight}px`;
+  }
+  input.addEventListener('input', autoGrowInput);
+
   form.addEventListener('submit', async (event) => {
     event.preventDefault();
     const text = input.value.trim();
@@ -181,6 +202,7 @@
 
     addMessage(text, 'user');
     input.value = '';
+    autoGrowInput();
     input.disabled = true;
     sendBtn.disabled = true;
 

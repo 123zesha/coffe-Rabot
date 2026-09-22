@@ -34,7 +34,8 @@
     "test:prompt-caching": "node test-prompt-caching.js",
     "test:simple-story-video": "node test-simple-story-video.js",
     "test:simple-story-video-mode": "node test-simple-story-video-mode.js",
-    "test:agent-multi-step-flow": "node test-agent-multi-step-flow.js"
+    "test:agent-multi-step-flow": "node test-agent-multi-step-flow.js",
+    "test:chat-to-video": "node test-chat-to-video.js"
   },
   "keywords": [],
   "author": "",

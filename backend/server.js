@@ -1997,6 +1997,21 @@ function buildCachedSystemPrompt(job) {
 // inside the time limit — without the user having to type anything.
 const HEAVY_TOOLS = new Set(['generateVoiceover', 'generateSubtitles', 'assembleFinalVideo']);
 
+// Chat-to-Video: a message this long, on a fresh (non-continuation) turn,
+// is treated as a complete, already-written script (e.g. pasted from
+// ChatGPT) plus production instructions, rather than an ordinary chat
+// reply — see the "Chat-to-Video" section of prompts/system-prompt.md.
+// The threshold sits well above any normal conversational message (a
+// question, a short instruction, a confirmation) but comfortably below
+// even a short video's full narration once combined with any
+// instructions, so it reliably tells the two apart without the user
+// needing to flag it explicitly.
+const SCRIPT_PASTE_MIN_LENGTH = 500;
+
+function looksLikePastedScript(message) {
+  return typeof message === 'string' && message.trim().length >= SCRIPT_PASTE_MIN_LENGTH;
+}
+
 app.post('/api/agent', async (req, res) => {
   const { message, conversationHistory, jobId: requestedJobId, continueAutomatically } = req.body || {};
 
@@ -2005,7 +2020,25 @@ app.post('/api/agent', async (req, res) => {
   }
 
   const existingJob = requestedJobId ? await jobStore.getJob(requestedJobId) : null;
-  const jobId = existingJob ? existingJob.id : (await jobStore.createJob()).id;
+  const job = existingJob || (await jobStore.createJob());
+  const jobId = job.id;
+
+  // Chat-to-Video: save a detected script paste directly to job.script —
+  // BEFORE Claude ever sees this request — so the user's original wording
+  // is preserved byte-for-byte and Claude never has to retype or
+  // paraphrase a possibly long script back out as tool-call output just to
+  // record it (that would cost real output tokens and risk drifting from
+  // what the user actually pasted). A job that has already been confirmed
+  // never has its script silently replaced this way — only the normal
+  // updateVideoJob/updateVideoEditSettings tools can still change it
+  // explicitly after that point. isScriptPaste also gates the tool-loop
+  // guard below, which strips any `script` field Claude's own
+  // updateVideoJob call tries to add THIS turn, protecting the
+  // just-saved original even if the prompt instruction is ignored.
+  const isScriptPaste = !continueAutomatically && !job.confirmed && looksLikePastedScript(message);
+  if (isScriptPaste) {
+    await jobStore.updateJob(jobId, { script: message.trim() });
+  }
 
   const history = Array.isArray(conversationHistory) ? conversationHistory : [];
   // A continuation request resumes an already-started turn (its history
@@ -2061,6 +2094,21 @@ app.post('/api/agent', async (req, res) => {
       messages.push({ role: 'assistant', content: response.content });
       const toolResults = await Promise.all(
         toolUseBlocks.map(async (tool) => {
+          // Chat-to-Video: job.script was already saved verbatim from the
+          // user's own pasted message above (see isScriptPaste) — never let
+          // this turn's updateVideoJob call overwrite it with Claude's own
+          // retyped/paraphrased copy, even if it ignores
+          // prompts/system-prompt.md's instruction not to include one.
+          // Every other field in the same call (duration, language,
+          // videoMode, etc.) is unaffected.
+          if (
+            isScriptPaste &&
+            tool.name === 'updateVideoJob' &&
+            tool.input &&
+            Object.prototype.hasOwnProperty.call(tool.input, 'script')
+          ) {
+            delete tool.input.script;
+          }
           // A second heavy tool call in the same request is deferred, never
           // executed — its own tool_result says so, so Claude's next reply
           // (still generated below) can tell the user what happens next
@@ -2566,3 +2614,5 @@ module.exports.executeTool = executeTool;
 module.exports.buildCachedSystemPrompt = buildCachedSystemPrompt;
 module.exports.SYSTEM_PROMPT_BASE = SYSTEM_PROMPT_BASE;
 module.exports.TOOLS = TOOLS;
+module.exports.looksLikePastedScript = looksLikePastedScript;
+module.exports.SCRIPT_PASTE_MIN_LENGTH = SCRIPT_PASTE_MIN_LENGTH;
