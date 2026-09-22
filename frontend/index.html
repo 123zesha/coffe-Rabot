@@ -376,8 +376,17 @@
 
       <div id="chat-messages" class="chat-messages" aria-live="polite"></div>
 
+      <div class="chat-script-paste-bar">
+        <button type="button" id="script-paste-toggle" class="script-paste-toggle" aria-pressed="false">
+          📝 Paste Script
+        </button>
+        <span id="script-paste-hint" class="script-paste-hint" hidden>
+          Script Paste mode is on — your next message is saved as the complete script, exactly as written.
+        </span>
+      </div>
+
       <form id="chat-form" class="chat-form">
-        <input id="chat-input" type="text" class="chat-input" placeholder="Type a message…" autocomplete="off" aria-label="Message">
+        <textarea id="chat-input" class="chat-input" rows="1" placeholder="Type a message…" autocomplete="off" aria-label="Message"></textarea>
         <button type="submit" class="chat-send">Send</button>
       </form>
     </div>
