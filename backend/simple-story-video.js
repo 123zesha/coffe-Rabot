@@ -51,7 +51,7 @@ const os = require('os');
 const path = require('path');
 const { execFile } = require('child_process');
 
-const { ffmpegPath, getMediaDuration } = require('./video-assembly');
+const { ffmpegPath, getMediaDuration, verifyAssembledVideoBuffer } = require('./video-assembly');
 const videoStorage = require('./video-storage');
 
 const FONTS_DIR = path.resolve(__dirname, '..', 'assets', 'fonts');
@@ -871,6 +871,25 @@ async function continueSimpleStoryVideoAssembly({
     if (buffer.length === 0) {
       throw new Error('ffmpeg produced an empty output file.');
     }
+
+    // Verify before reporting success — ffmpeg's own exit code is not, by
+    // itself, proof the output is a real, complete, playable video (a
+    // truncated mux or a dropped stream can still exit 0). Always expects
+    // an audio stream: this pipeline requires a completed voice-over to
+    // even start (checked above), and always muxes it into the final
+    // file.
+    const verification = await verifyAssembledVideoBuffer(buffer, {
+      expectAudioStream: true,
+      minDurationSeconds: audioDuration,
+    });
+    if (!verification.ok) {
+      const message = `Assembly finished but failed verification: ${verification.reason}`;
+      console.error('Simple Story Video assembly error:', JSON.stringify({ message }, null, 2));
+      render.status = 'failed';
+      render.error = message;
+      return { status: 'failed', error: message, render };
+    }
+    log(`verified, real duration ${verification.durationSeconds.toFixed(1)}s`);
 
     render.status = 'completed';
     return { status: 'completed', buffer, render };

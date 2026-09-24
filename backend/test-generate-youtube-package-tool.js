@@ -15,12 +15,30 @@
 
 const path = require('path');
 const fs = require('fs');
+const os = require('os');
 const http = require('http');
 const assert = require('assert');
+const { execFileSync } = require('child_process');
+const ffmpegPath = require('ffmpeg-static');
 
 const JOBS_FILE = path.resolve(__dirname, '..', 'data', 'jobs.json');
 const originalJobsFile = fs.existsSync(JOBS_FILE) ? fs.readFileSync(JOBS_FILE, 'utf8') : null;
 fs.writeFileSync(JOBS_FILE, '[]\n');
+
+// A real, tiny local MP4 — stands in for an already-assembled Simple Story
+// Video final video (job.finalVideo.url) so the 'simple-story' thumbnail
+// tests below can extract a real frame from it via local ffmpeg, with no
+// paid API and no dependency on backend/video-assembly.js's own tests.
+const fixturesDir = fs.mkdtempSync(path.join(os.tmpdir(), 'youtube-package-tool-fixtures-'));
+function makeFixtureFinalVideo() {
+  const outPath = path.join(fixturesDir, `final-${Date.now()}-${Math.random().toString(36).slice(2)}.mp4`);
+  execFileSync(
+    ffmpegPath,
+    ['-y', '-f', 'lavfi', '-i', 'color=c=teal:s=320x240:d=3', '-r', '30', '-pix_fmt', 'yuv420p', outPath],
+    { stdio: 'ignore' }
+  );
+  return outPath;
+}
 
 let failures = 0;
 
@@ -284,6 +302,48 @@ async function main() {
     assert.strictEqual(persisted.youtubePackage.thumbnailUrl, null);
   });
 
+  await test('generateYoutubePackage NEVER calls the OpenAI image API for a simple-story job — the thumbnail is a real local ffmpeg frame instead', async () => {
+    const job = await jobStore.createJob();
+    const finalVideoPath = makeFixtureFinalVideo();
+    await jobStore.updateJob(job.id, {
+      script: REAL_SCRIPT,
+      videoMode: 'simple-story',
+      finalVideo: { status: 'completed', url: finalVideoPath },
+    });
+
+    anthropicRequestCount = 0;
+    openAiRequestCount = 0;
+    const result = JSON.parse(await app.executeTool('generateYoutubePackage', job.id, {}));
+
+    assert.strictEqual(anthropicRequestCount, 1, 'the text package is still a real Claude call');
+    assert.strictEqual(openAiRequestCount, 0, 'simple-story mode must never call the paid OpenAI image API');
+    assert.strictEqual(result.youtubePackage.status, 'completed', JSON.stringify(result));
+    assert.strictEqual(result.youtubePackage.hasThumbnailImage, true);
+
+    const persisted = await jobStore.getJob(job.id);
+    assert.strictEqual(persisted.youtubePackage.status, 'completed');
+    assert.ok(
+      persisted.youtubePackage.thumbnailUrl && persisted.youtubePackage.thumbnailUrl.startsWith('/generated/image-'),
+      `expected a locally-stored frame, got: ${persisted.youtubePackage.thumbnailUrl}`
+    );
+    assert.strictEqual(persisted.youtubePackage.error, null);
+  });
+
+  await test('generateYoutubePackage for a simple-story job with no final video yet reports a clear thumbnail error, but still completes the text package', async () => {
+    const job = await jobStore.createJob();
+    await jobStore.updateJob(job.id, { script: REAL_SCRIPT, videoMode: 'simple-story' });
+
+    anthropicRequestCount = 0;
+    openAiRequestCount = 0;
+    const result = JSON.parse(await app.executeTool('generateYoutubePackage', job.id, {}));
+
+    assert.strictEqual(anthropicRequestCount, 1);
+    assert.strictEqual(openAiRequestCount, 0);
+    assert.strictEqual(result.youtubePackage.status, 'completed', 'titles/description/tags must still be reported as completed');
+    assert.strictEqual(result.youtubePackage.hasThumbnailImage, false);
+    assert.ok(result.youtubePackage.error && result.youtubePackage.error.toLowerCase().includes('final'), JSON.stringify(result));
+  });
+
   await test('generateYoutubePackage still completes the text package when OPENAI_API_KEY is missing (no thumbnail image)', async () => {
     const job = await jobStore.createJob();
     await jobStore.updateJob(job.id, { script: REAL_SCRIPT });
@@ -446,6 +506,7 @@ async function main() {
   server.close();
   anthropicServer.close();
   openAiServer.close();
+  fs.rmSync(fixturesDir, { recursive: true, force: true });
 
   if (originalJobsFile !== null) {
     fs.writeFileSync(JOBS_FILE, originalJobsFile);

@@ -25,6 +25,8 @@ const { execFileSync, spawnSync } = require('child_process');
 const {
   assembleFinalVideo,
   getMediaDuration,
+  verifyAssembledVideoBuffer,
+  extractThumbnailFrame,
   ffmpegPath,
   OUTPUT_DIMENSIONS_BY_FORMAT,
   OUTPUT_DIMENSIONS_BY_FORMAT_AND_TIER,
@@ -688,6 +690,83 @@ async function main() {
     assert.strictEqual(result.status, 'failed');
     assert.strictEqual(result.buffer, null);
     assert.ok(result.error && result.error.length > 0);
+  });
+
+  await test('verifyAssembledVideoBuffer tolerates the small, roughly-fixed encode shortfall on a short clip without flagging it as truncated', async () => {
+    const shortClipPath = makeClip('verify-short.mp4', 'red', 1);
+    const buffer = fs.readFileSync(shortClipPath);
+    const actualDuration = await getMediaDuration(shortClipPath);
+
+    // Expect ~0.4s more than the real output — inside the 0.5s absolute
+    // floor but outside the old flat 10% relative margin (0.1s for a ~1s
+    // clip). This is exactly the shape of the real flakiness this fix
+    // targets: encode/mux overhead eating a small, roughly fixed amount of
+    // a very short fixture's duration.
+    const result = await verifyAssembledVideoBuffer(buffer, {
+      expectAudioStream: false,
+      minDurationSeconds: actualDuration + 0.4,
+    });
+
+    assert.strictEqual(result.ok, true, JSON.stringify(result));
+  });
+
+  await test('verifyAssembledVideoBuffer still rejects a short clip that is genuinely truncated, not just rounding-short', async () => {
+    const shortClipPath = makeClip('verify-short-truncated.mp4', 'red', 1);
+    const buffer = fs.readFileSync(shortClipPath);
+    const actualDuration = await getMediaDuration(shortClipPath);
+
+    const result = await verifyAssembledVideoBuffer(buffer, {
+      expectAudioStream: false,
+      minDurationSeconds: actualDuration * 3,
+    });
+
+    assert.strictEqual(result.ok, false, 'a video 1/3 of its expected narration length must still fail verification');
+    assert.ok(/short/i.test(result.reason || ''), `expected a duration-shortfall reason, got: ${result.reason}`);
+  });
+
+  await test('verifyAssembledVideoBuffer keeps the real 10% relative margin (not just the absolute floor) once clips are long enough for it to matter', async () => {
+    const longerClipPath = makeClip('verify-longer.mp4', 'blue', 10);
+    const buffer = fs.readFileSync(longerClipPath);
+    const actualDuration = await getMediaDuration(longerClipPath);
+
+    // ~0.8s short of expected: bigger than the 0.5s absolute floor, but
+    // still within the 10% relative margin at this duration (~1s) — must
+    // pass, proving longer content isn't held to the short-clip floor.
+    const withinRelativeMargin = await verifyAssembledVideoBuffer(buffer, {
+      expectAudioStream: false,
+      minDurationSeconds: actualDuration + 0.8,
+    });
+    assert.strictEqual(withinRelativeMargin.ok, true, JSON.stringify(withinRelativeMargin));
+
+    // ~23% short of expected: clearly outside both margins at this
+    // duration — must still fail.
+    const genuinelyTruncated = await verifyAssembledVideoBuffer(buffer, {
+      expectAudioStream: false,
+      minDurationSeconds: actualDuration + 3,
+    });
+    assert.strictEqual(genuinelyTruncated.ok, false, JSON.stringify(genuinelyTruncated));
+  });
+
+  await test('extractThumbnailFrame pulls a real, decodable PNG frame from an already-assembled video, matching its real resolution', async () => {
+    const clipPath = makeClip('thumbnail-source.mp4', 'green', 5);
+
+    const frameBuffer = await extractThumbnailFrame(clipPath);
+
+    assert.ok(Buffer.isBuffer(frameBuffer) && frameBuffer.length > 0);
+    const pngSignature = Buffer.from([0x89, 0x50, 0x4e, 0x47]);
+    assert.ok(frameBuffer.subarray(0, 4).equals(pngSignature), 'expected a real PNG file, not something fabricated');
+
+    const framePath = path.join(fixturesDir, 'extracted-frame.png');
+    fs.writeFileSync(framePath, frameBuffer);
+    assert.deepStrictEqual(probeResolution(framePath), { width: 320, height: 240 });
+  });
+
+  await test('extractThumbnailFrame clamps its seek offset for a clip shorter than the requested atSeconds, instead of failing', async () => {
+    const shortClipPath = makeClip('thumbnail-source-short.mp4', 'blue', 1);
+
+    const frameBuffer = await extractThumbnailFrame(shortClipPath, { atSeconds: 2 });
+
+    assert.ok(Buffer.isBuffer(frameBuffer) && frameBuffer.length > 0, 'a clip shorter than atSeconds must still yield a real frame, not throw');
   });
 
   fs.rmSync(fixturesDir, { recursive: true, force: true });

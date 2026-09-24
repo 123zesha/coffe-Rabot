@@ -119,13 +119,60 @@
   // one message still produces one complete video with no extra prompts.
   // onProgress, if given, is called with each intermediate step's reply as
   // it completes (the final reply is returned normally, not passed here).
+  // Chat-to-Video cost optimization: reads whatever the Create Video form's
+  // own settings selectors currently show (mode, output format,
+  // resolution, language, style, music) — the user can set these BEFORE
+  // switching to the chat box to paste a script, and the backend applies
+  // them directly to the new job (see sanitizeScriptPasteSettings in
+  // server.js) instead of leaving Claude to infer/ask about them from the
+  // pasted text. Only a select's non-empty value is included, the same
+  // "only mention if actually set" pattern the Create Video form's own
+  // generateBtn handler already uses below — an untouched field is left
+  // out entirely so the backend/Claude's existing defaults (e.g.
+  // simple-story for a plain narration script) still apply. videoMode is
+  // only included when it's 'simple-story': the select always shows a real
+  // value with no neutral "unspecified" option, so 'cinematic' can't be
+  // told apart from "never touched" — see server.js's own comment on this.
+  function collectScriptPasteFormSettings() {
+    const settings = {};
+    if (videoGenerationModeSelect.value === 'simple-story') {
+      settings.videoMode = 'simple-story';
+    }
+    if (videoOutputFormatSelect.value) {
+      settings.outputFormat = videoOutputFormatSelect.value;
+    }
+    if (videoResolutionSelect.value) {
+      settings.resolutionTier = videoResolutionSelect.value;
+    }
+    if (videoLanguageSelect.value) {
+      settings.language = videoLanguageSelect.selectedOptions[0].textContent;
+    }
+    if (videoStyleSelect.value) {
+      settings.storyStyle = videoStyleSelect.selectedOptions[0].textContent;
+    }
+    if (musicEnabledToggle.checked && videoMusicTrackSelect.value) {
+      settings.musicEnabled = true;
+      settings.musicTrack = videoMusicTrackSelect.value;
+    }
+    return settings;
+  }
+
   // isScriptPaste (Chat-to-Video), when true, tells the backend this exact
   // message is a complete, already-written script the user explicitly
   // flagged via the "Paste Script" toggle — never inferred from the
   // message's length or shape, so an ordinary long chat message is never
   // mistaken for one, and a short script is recognized just as reliably.
-  async function callAgent(message, onProgress, isScriptPaste) {
-    let data = await postAgentRequest({ message, conversationHistory, jobId, isScriptPaste: Boolean(isScriptPaste) });
+  // scriptPasteSettings (only meaningful alongside isScriptPaste) carries
+  // whatever Create Video form settings collectScriptPasteFormSettings
+  // found already selected.
+  async function callAgent(message, onProgress, isScriptPaste, scriptPasteSettings) {
+    let data = await postAgentRequest({
+      message,
+      conversationHistory,
+      jobId,
+      isScriptPaste: Boolean(isScriptPaste),
+      ...(isScriptPaste ? { scriptPasteSettings } : {}),
+    });
     applyAgentResponse(data);
 
     while (data.autoContinue) {
@@ -239,7 +286,7 @@
         typingBubble.remove();
         addMessage(progressReply, 'bot');
         typingBubble = showTypingIndicator();
-      }, isScriptPaste);
+      }, isScriptPaste, isScriptPaste ? collectScriptPasteFormSettings() : undefined);
       typingBubble.remove();
       addMessage(reply, 'bot');
     } catch (error) {
@@ -254,6 +301,7 @@
       refreshFinalVideoCard();
       refreshYoutubePackageCard();
       refreshSubtitlesCard();
+      maybeStartChatToVideoPipeline();
     }
   });
 
@@ -457,6 +505,7 @@
       refreshFinalVideoCard();
       refreshYoutubePackageCard();
       refreshSubtitlesCard();
+      maybeStartChatToVideoPipeline();
     }
   });
 
@@ -735,16 +784,27 @@
       return;
     }
 
+    // Captures the target job id NOW, at schedule time, rather than reading
+    // the outer `jobId` when the timer actually fires — Chat-to-Video can
+    // switch `jobId` to a brand-new job while this timer is still pending
+    // (e.g. the user pastes another script while an earlier job's render is
+    // still in progress), and without this a stale timer would wrongly poll
+    // the NEW job's assemble-video route instead of the one it was
+    // originally scheduled for.
+    const targetJobId = jobId;
+
     simpleStoryPollTimer = setTimeout(async () => {
       simpleStoryPollTimer = null;
       try {
-        await fetch(`/api/jobs/${jobId}/assemble-video`, { method: 'POST' });
+        await fetch(`/api/jobs/${targetJobId}/assemble-video`, { method: 'POST' });
       } catch (error) {
         // Ignored — the job's own real, persisted state (checked on the
         // next poll or the next page load) is the source of truth, not
         // this fire-and-forget continuation call.
       }
-      await refreshFinalVideoCard();
+      if (targetJobId === jobId) {
+        await refreshFinalVideoCard();
+      }
     }, SIMPLE_STORY_POLL_INTERVAL_MS);
   }
 
@@ -950,6 +1010,74 @@
     renderSubtitlesCard(await fetchCurrentJob());
   }
 
+  // --- Chat-to-Video: fully-automatic post-confirmation pipeline ---
+  // Once a job created by pasting a script (job.chatToVideoAutoPipeline)
+  // has been confirmed, this drives voice-over -> subtitles -> final video
+  // -> thumbnail/YouTube package forward with plain, separate HTTP calls
+  // on a timer — mirrors pollSimpleStoryRenderProgress's own reasoning:
+  // never loop the conversational agent purely to advance a mechanical
+  // sequence with nothing left to reason about, and never hold one HTTP
+  // request open for the whole thing. Renders each card directly from the
+  // response's own job data (never calling refreshFinalVideoCard, which
+  // would also kick off pollSimpleStoryRenderProgress and risk two
+  // independent timers both trying to advance the same Simple Story Video
+  // render at once) so this is the single driver of progress while it's
+  // running. Guarded by chatToVideoPollTimer so a chat-triggered
+  // confirmation and a page reload can never start two overlapping
+  // loops for the same job. Stops itself once the pipeline reports 'done',
+  // 'failed', or 'not_applicable' — nothing further to advance.
+  let chatToVideoPollTimer = null;
+  const CHAT_TO_VIDEO_POLL_INTERVAL_MS = 4000;
+
+  function renderAllCards(job) {
+    renderVoiceoverCard(job);
+    renderSubtitlesCard(job);
+    renderFinalVideoCard(job);
+    renderYoutubePackageCard(job);
+  }
+
+  function pollChatToVideoPipeline(job) {
+    if (!jobId || !job || !job.chatToVideoAutoPipeline || !job.confirmed || chatToVideoPollTimer) {
+      return;
+    }
+
+    // Captures the target job id now, at schedule time — see
+    // pollSimpleStoryRenderProgress's identical reasoning for why reading
+    // the outer, mutable `jobId` when the timer fires would be wrong if a
+    // new script paste switches to a different job in the meantime.
+    const targetJobId = jobId;
+
+    chatToVideoPollTimer = setTimeout(async () => {
+      chatToVideoPollTimer = null;
+      let result = null;
+      try {
+        const res = await fetch(`/api/jobs/${targetJobId}/continue-pipeline`, { method: 'POST' });
+        result = await res.json();
+      } catch (error) {
+        // Ignored — the job's own real, persisted state (checked on the
+        // next poll or the next page load) is the source of truth, not
+        // this fire-and-forget continuation call.
+      }
+
+      if (targetJobId !== jobId) {
+        return;
+      }
+
+      if (result && result.job) {
+        renderAllCards(result.job);
+      }
+
+      if (result && (result.status === 'in_progress' || result.status === 'waiting_for_confirmation')) {
+        pollChatToVideoPipeline(result.job);
+      }
+    }, CHAT_TO_VIDEO_POLL_INTERVAL_MS);
+  }
+
+  async function maybeStartChatToVideoPipeline() {
+    if (!jobId) return;
+    pollChatToVideoPipeline(await fetchCurrentJob());
+  }
+
   generateSubtitlesBtn.addEventListener('click', async () => {
     if (subtitlesGenerating || !jobId) {
       return;
@@ -1047,4 +1175,5 @@
   refreshFinalVideoCard();
   refreshYoutubePackageCard();
   refreshSubtitlesCard();
+  maybeStartChatToVideoPipeline();
 })();

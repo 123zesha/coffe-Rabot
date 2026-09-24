@@ -215,6 +215,96 @@ function getMediaDuration(filePath) {
   });
 }
 
+// Which stream types ffmpeg's own decode log reports for filePath — read
+// the same way getMediaDuration reads duration (ffmpeg's own stderr, never
+// trusted from a filename/container extension). Used only to verify an
+// assembled output actually contains what it should before reporting a
+// job "completed" — see verifyAssembledVideoBuffer below.
+function probeStreamTypes(filePath) {
+  return new Promise((resolve) => {
+    execFile(ffmpegPath, ['-i', filePath], { maxBuffer: 1024 * 1024 * 16 }, (error, stdout, stderr) => {
+      // `ffmpeg -i <file>` with no output always exits non-zero (nothing was
+      // asked to be produced), but it still prints the real stream list to
+      // stderr first — same reasoning as getMediaDuration ignoring `error`.
+      const log = (stderr || '').toString();
+      resolve({
+        hasVideoStream: /Stream #\d+:\d+.*: Video:/.test(log),
+        hasAudioStream: /Stream #\d+:\d+.*: Audio:/.test(log),
+      });
+    });
+  });
+}
+
+// Verifies a just-assembled final video's real bytes before the caller
+// reports finalVideo as 'completed' — ffmpeg's own encode/mux step exiting
+// without error is not, by itself, proof the output is a real, complete,
+// playable video (a truncated mux or a dropped stream can still exit 0).
+// Checks the actual decoded file for: non-empty bytes, a readable/
+// measurable duration, a video stream, an audio stream (only when the
+// caller says one should exist — a silent/no-voice-over video legitimately
+// has none), and — when the caller gives minDurationSeconds (the real
+// narration audio's own measured length) — that the output isn't
+// drastically shorter than the audio it was supposed to fully cover
+// (allows minor rounding/fade overlap, not a silently truncated render).
+// Returns { ok: true, durationSeconds } or { ok: false, reason }; never
+// throws — a verification failure is reported the same honest way as any
+// other assembly failure.
+//
+// The shortfall allowed is the LARGER of a relative 10% and this fixed
+// absolute floor (i.e. the effective threshold is the MIN of the two
+// thresholds this produces) — a pure 10% margin is too tight for short
+// clips: AAC encoder priming, sidechaincompress lookahead and the music
+// fade in prepareMusicTrack above all cost a roughly constant amount of
+// real time, which is a large fraction of a 1-3s test fixture but
+// negligible next to a real 30s-40min video. This is the same ±0.5s this
+// file's own duration assertions already use (see the sync tests above).
+const MIN_DURATION_ABSOLUTE_TOLERANCE_SECONDS = 0.5;
+
+async function verifyAssembledVideoBuffer(buffer, { expectAudioStream = false, minDurationSeconds } = {}) {
+  if (!buffer || buffer.length === 0) {
+    return { ok: false, reason: 'the assembled video file is empty' };
+  }
+
+  const workDir = fs.mkdtempSync(path.join(os.tmpdir(), 'verify-video-'));
+  const filePath = path.join(workDir, 'output.mp4');
+  try {
+    fs.writeFileSync(filePath, buffer);
+
+    let durationSeconds;
+    try {
+      durationSeconds = await getMediaDuration(filePath);
+    } catch (error) {
+      return { ok: false, reason: `the assembled video could not be read back (${error.message})` };
+    }
+
+    if (typeof minDurationSeconds === 'number' && minDurationSeconds > 0) {
+      const relativeThreshold = minDurationSeconds * 0.9;
+      const absoluteThreshold = Math.max(0, minDurationSeconds - MIN_DURATION_ABSOLUTE_TOLERANCE_SECONDS);
+      const threshold = Math.min(relativeThreshold, absoluteThreshold);
+      if (durationSeconds < threshold) {
+        return {
+          ok: false,
+          reason:
+            `the assembled video's real duration (${durationSeconds.toFixed(1)}s) is well short of the ` +
+            `narration audio it should cover (${minDurationSeconds.toFixed(1)}s)`,
+        };
+      }
+    }
+
+    const { hasVideoStream, hasAudioStream } = await probeStreamTypes(filePath);
+    if (!hasVideoStream) {
+      return { ok: false, reason: 'the assembled file has no readable video stream' };
+    }
+    if (expectAudioStream && !hasAudioStream) {
+      return { ok: false, reason: 'the assembled video is missing its expected audio track' };
+    }
+
+    return { ok: true, durationSeconds };
+  } finally {
+    fs.rmSync(workDir, { recursive: true, force: true });
+  }
+}
+
 // Resolves one clip/audio URL to real bytes on disk at destPath. Supports
 // every shape this app's job records actually use: a base64 data: URI
 // (voiceover.url), a real http(s) URL (a scene clip stored in Vercel Blob,
@@ -500,6 +590,23 @@ async function assembleFinalVideo({ clips, voiceover, burnInSubtitlesContent, ou
       throw new Error('ffmpeg produced an empty output file.');
     }
 
+    // Verify before reporting success — ffmpeg's own exit code is not, by
+    // itself, proof the output is a real, complete, playable video (a
+    // truncated mux or a dropped stream can still exit 0). expectAudioStream
+    // only when this specific assembly actually included one (hasVoiceover,
+    // or a solo music track) — a genuinely silent, voice-over-less,
+    // music-less video legitimately has no audio stream, and that must not
+    // be reported as a failure.
+    const verification = await verifyAssembledVideoBuffer(buffer, {
+      expectAudioStream: Boolean(audioForMuxPath),
+      minDurationSeconds: hasVoiceover ? totalAudioDuration : null,
+    });
+    if (!verification.ok) {
+      const message = `Assembly finished but failed verification: ${verification.reason}`;
+      console.error('Final video assembly error:', JSON.stringify({ message }, null, 2));
+      return { buffer: null, status: 'failed', error: message };
+    }
+
     return { buffer, status: 'completed', error: null };
   } catch (error) {
     const message = (error && error.message) || 'Unknown error assembling final video.';
@@ -510,9 +617,40 @@ async function assembleFinalVideo({ clips, voiceover, burnInSubtitlesContent, ou
   }
 }
 
+// Extracts one real frame from an ALREADY-assembled final video as a PNG —
+// the only thumbnail source a 'simple-story' job is allowed to use (see
+// server.js's runGenerateYoutubePackage): that mode never calls Runway or
+// any image-generation API, so its thumbnail comes from local ffmpeg
+// instead of a paid OpenAI image call, exactly like every other asset it
+// produces. atSeconds is clamped to the real decoded duration (via
+// getMediaDuration) so a clip shorter than the requested offset still
+// yields a real frame instead of ffmpeg seeking past the end and failing.
+// Throws with ffmpeg's own error on a missing/corrupt video — never
+// fabricates a frame.
+async function extractThumbnailFrame(videoUrl, { atSeconds = 2 } = {}) {
+  const workDir = fs.mkdtempSync(path.join(os.tmpdir(), 'thumbnail-frame-'));
+  const inputPath = path.join(workDir, 'input.mp4');
+  const outputPath = path.join(workDir, 'frame.png');
+  try {
+    await fetchToFile(videoUrl, inputPath);
+    const durationSeconds = await getMediaDuration(inputPath);
+    const seekSeconds = Math.max(0, Math.min(atSeconds, durationSeconds - 0.1));
+    await runFfmpeg(['-y', '-ss', seekSeconds.toFixed(3), '-i', inputPath, '-frames:v', '1', '-q:v', '2', outputPath]);
+    const buffer = fs.readFileSync(outputPath);
+    if (buffer.length === 0) {
+      throw new Error('ffmpeg produced an empty thumbnail frame.');
+    }
+    return buffer;
+  } finally {
+    fs.rmSync(workDir, { recursive: true, force: true });
+  }
+}
+
 module.exports = {
   assembleFinalVideo,
   getMediaDuration,
+  verifyAssembledVideoBuffer,
+  extractThumbnailFrame,
   ffmpegPath,
   OUTPUT_DIMENSIONS_BY_FORMAT,
   OUTPUT_DIMENSIONS_BY_FORMAT_AND_TIER,

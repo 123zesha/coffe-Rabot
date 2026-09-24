@@ -15,17 +15,21 @@
 //     unless the request explicitly flags it;
 //   - a SHORT script sent with the flag IS saved verbatim — short and long
 //     scripts are supported the same way, given clear intent;
-//   - a long, freshly-pasted+flagged message is saved verbatim to
-//     job.script BEFORE Claude is ever called, and the job summary Claude
-//     receives THIS SAME turn already reflects it;
+//   - a detected script paste ALWAYS creates a brand-new, independent job
+//     — even when an existing jobId is passed — and never touches that
+//     other job's script, confirmation, or any other state; the new job
+//     starts with an empty conversationHistory, never carrying over the
+//     previous job's messages;
+//   - the newly created job has chatToVideoAutoPipeline and
+//     generateYoutubePackage both turned on automatically;
+//   - a long, freshly-pasted+flagged message is saved verbatim to the NEW
+//     job's script BEFORE Claude is ever called, and the job summary
+//     Claude receives THIS SAME turn already reflects it;
 //   - even if the model still tries to set a `script` field on
 //     updateVideoJob during a paste turn, it is discarded;
 //   - every paid tool AND confirmVideoJob are hard-blocked on the SAME
 //     turn as a detected paste — the plan must always be shown and
 //     confirmed in a separate, later message first;
-//   - re-pasting the exact same script on an already-confirmed job is a
-//     no-op (confirmed stays true); pasting a genuinely different script
-//     resets confirmed to false so the new plan needs fresh confirmation;
 //   - a continuation request never triggers this at all.
 //
 // Uses a local mock Anthropic server (no real Claude calls). Run with:
@@ -131,7 +135,7 @@ async function main() {
 
   const server = require('./server');
   const jobStore = require('./job-store');
-  const { isScriptPasteRequest, PAID_OR_CONFIRM_TOOLS } = server;
+  const { isScriptPasteRequest, PAID_OR_CONFIRM_TOOLS, sanitizeScriptPasteSettings } = server;
 
   test('isScriptPasteRequest requires the explicit flag — length/shape alone is never enough', () => {
     assert.strictEqual(
@@ -176,6 +180,48 @@ async function main() {
     );
   });
 
+  test('sanitizeScriptPasteSettings forwards only videoMode "simple-story" — never "cinematic", which has no way to tell an explicit pick from an untouched default', () => {
+    assert.deepStrictEqual(sanitizeScriptPasteSettings({ videoMode: 'simple-story' }), { videoMode: 'simple-story' });
+    assert.deepStrictEqual(sanitizeScriptPasteSettings({ videoMode: 'cinematic' }), {});
+    assert.deepStrictEqual(sanitizeScriptPasteSettings({ videoMode: 'not-a-real-mode' }), {});
+  });
+
+  test('sanitizeScriptPasteSettings forwards outputFormat/resolutionTier only when they are real enum values', () => {
+    assert.deepStrictEqual(sanitizeScriptPasteSettings({ outputFormat: 'vertical' }), { outputFormat: 'vertical' });
+    assert.deepStrictEqual(sanitizeScriptPasteSettings({ outputFormat: 'square' }), { outputFormat: 'square' });
+    assert.deepStrictEqual(sanitizeScriptPasteSettings({ outputFormat: 'wide-screen-4k-ultra' }), {});
+    assert.deepStrictEqual(sanitizeScriptPasteSettings({ resolutionTier: '4k' }), { resolutionTier: '4k' });
+    assert.deepStrictEqual(sanitizeScriptPasteSettings({ resolutionTier: '8k' }), {});
+  });
+
+  test('sanitizeScriptPasteSettings forwards language/storyStyle as trimmed strings, rejecting empty or oversized input', () => {
+    assert.deepStrictEqual(sanitizeScriptPasteSettings({ language: '  Spanish  ' }), { language: 'Spanish' });
+    assert.deepStrictEqual(sanitizeScriptPasteSettings({ storyStyle: 'Documentary' }), { storyStyle: 'Documentary' });
+    assert.deepStrictEqual(sanitizeScriptPasteSettings({ language: '   ' }), {}, 'whitespace-only must not count as set');
+    assert.deepStrictEqual(sanitizeScriptPasteSettings({ language: 'x'.repeat(101) }), {}, 'must reject an unreasonably long value');
+    assert.deepStrictEqual(sanitizeScriptPasteSettings({ language: { toString: () => 'English' } }), {}, 'must reject a non-string, never coerce it');
+  });
+
+  test('sanitizeScriptPasteSettings only forwards musicTrack when it is a real, currently-available local track — never an arbitrary client-supplied value', () => {
+    // The test environment ships no real local music tracks (see
+    // data/music/), so MUSIC_TRACK_OPTIONS is empty and every musicTrack —
+    // including one that would otherwise look legitimate — must be
+    // rejected. This still proves the important thing: an attacker-chosen
+    // string is never trusted through untouched, exactly the kind of
+    // frontend input this app's own security rules require validating on
+    // the backend.
+    assert.deepStrictEqual(sanitizeScriptPasteSettings({ musicEnabled: true, musicTrack: 'ambient-1' }), {});
+    assert.deepStrictEqual(sanitizeScriptPasteSettings({ musicEnabled: true, musicTrack: '../../etc/passwd' }), {});
+    assert.deepStrictEqual(sanitizeScriptPasteSettings({ musicEnabled: true }), {}, 'musicEnabled alone with no valid track must never be forwarded');
+  });
+
+  test('sanitizeScriptPasteSettings ignores an absent/malformed payload entirely', () => {
+    assert.deepStrictEqual(sanitizeScriptPasteSettings(undefined), {});
+    assert.deepStrictEqual(sanitizeScriptPasteSettings(null), {});
+    assert.deepStrictEqual(sanitizeScriptPasteSettings('not an object'), {});
+    assert.deepStrictEqual(sanitizeScriptPasteSettings([]), {});
+  });
+
   const httpServer = server.listen(0);
   await new Promise((resolve) => httpServer.once('listening', resolve));
   const baseUrl = `http://localhost:${httpServer.address().port}`;
@@ -197,23 +243,169 @@ async function main() {
   });
 
   await test('a SHORT script sent with the flag is saved verbatim — short scripts are supported, not just long ones', async () => {
-    const job = await jobStore.createJob();
     claudeTurns = [{ text: 'Got it — a short story about a frog named Pip. What duration and language would you like?' }];
     claudeCallIndex = 0;
 
     const res = await fetch(`${baseUrl}/api/agent`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ message: SHORT_SCRIPT, conversationHistory: [], jobId: job.id, isScriptPaste: true }),
+      body: JSON.stringify({ message: SHORT_SCRIPT, conversationHistory: [], isScriptPaste: true }),
     });
+    const body = await res.json();
     assert.strictEqual(res.status, 200);
 
-    const persisted = await jobStore.getJob(job.id);
+    const persisted = await jobStore.getJob(body.jobId);
     assert.strictEqual(persisted.script, SHORT_SCRIPT);
   });
 
+  await test('a script paste ALWAYS creates a brand-new, independent job — even when an existing jobId is passed — and never touches the old job', async () => {
+    const existingJob = await jobStore.createJob();
+    await jobStore.updateJob(existingJob.id, {
+      script: 'The original job\'s own script, already in progress.',
+      topic: 'Original topic',
+      confirmed: true,
+    });
+    claudeTurns = [{ text: "Here's the new plan for this script." }];
+    claudeCallIndex = 0;
+
+    const res = await fetch(`${baseUrl}/api/agent`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        message: LONG_PASTED_SCRIPT,
+        conversationHistory: [{ role: 'user', content: 'some old unrelated message' }, { role: 'assistant', content: [{ type: 'text', text: 'some old reply' }] }],
+        jobId: existingJob.id,
+        isScriptPaste: true,
+      }),
+    });
+    const body = await res.json();
+    assert.strictEqual(res.status, 200, JSON.stringify(body));
+    assert.notStrictEqual(body.jobId, existingJob.id, 'a script paste must never reuse the previously active job');
+
+    const newJob = await jobStore.getJob(body.jobId);
+    assert.strictEqual(newJob.script, LONG_PASTED_SCRIPT);
+    assert.strictEqual(newJob.confirmed, false, 'a brand-new job must never start out already confirmed');
+
+    const oldJob = await jobStore.getJob(existingJob.id);
+    assert.strictEqual(oldJob.script, 'The original job\'s own script, already in progress.', "the previous job's script must be completely untouched");
+    assert.strictEqual(oldJob.topic, 'Original topic');
+    assert.strictEqual(oldJob.confirmed, true, "the previous job's confirmation must be completely untouched");
+  });
+
+  await test('a script paste starts a fresh conversation — the previous job\'s conversationHistory is never carried over', async () => {
+    capturedRequests.length = 0;
+    claudeTurns = [{ text: 'Got it.' }];
+    claudeCallIndex = 0;
+
+    await fetch(`${baseUrl}/api/agent`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        message: LONG_PASTED_SCRIPT,
+        conversationHistory: [
+          { role: 'user', content: 'This is an old message from a completely different job.' },
+          { role: 'assistant', content: [{ type: 'text', text: 'An old reply that must not leak into the new job.' }] },
+        ],
+        isScriptPaste: true,
+      }),
+    });
+
+    const sentMessages = capturedRequests[0].messages;
+    assert.strictEqual(sentMessages.length, 1, 'only the pasted message itself should be sent — no carried-over history');
+    assert.strictEqual(sentMessages[0].content, LONG_PASTED_SCRIPT);
+  });
+
+  await test('a job created from a script paste has chatToVideoAutoPipeline and generateYoutubePackage turned on automatically', async () => {
+    claudeTurns = [{ text: 'Got it.' }];
+    claudeCallIndex = 0;
+
+    const res = await fetch(`${baseUrl}/api/agent`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ message: LONG_PASTED_SCRIPT, conversationHistory: [], isScriptPaste: true }),
+    });
+    const body = await res.json();
+
+    const persisted = await jobStore.getJob(body.jobId);
+    assert.strictEqual(persisted.chatToVideoAutoPipeline, true);
+    assert.strictEqual(persisted.generateYoutubePackage, true);
+  });
+
+  await test('scriptPasteSettings (Create Video form settings selected before the paste) are applied directly, and already visible to Claude in the very first turn — without Claude ever having to set them itself', async () => {
+    capturedRequests.length = 0;
+    // Claude's own mocked reply deliberately never sets videoMode/
+    // outputFormat/resolutionTier/language/storyStyle via updateVideoJob —
+    // if the assertions below still pass, it proves these came from the
+    // form, not from an extra bit of Claude reasoning/tool-calling.
+    claudeTurns = [{ text: 'Got it — using the settings you already selected. Ready to confirm?' }];
+    claudeCallIndex = 0;
+
+    const res = await fetch(`${baseUrl}/api/agent`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        message: LONG_PASTED_SCRIPT,
+        conversationHistory: [],
+        isScriptPaste: true,
+        scriptPasteSettings: {
+          videoMode: 'simple-story',
+          outputFormat: 'vertical',
+          resolutionTier: '1080p',
+          language: 'Spanish',
+          storyStyle: 'Documentary',
+        },
+      }),
+    });
+    const body = await res.json();
+    assert.strictEqual(res.status, 200, JSON.stringify(body));
+
+    const firstRequestSystemText = capturedRequests[0].system[1].text;
+    const summaryJson = JSON.parse(firstRequestSystemText.slice(firstRequestSystemText.indexOf('{')));
+    assert.strictEqual(summaryJson.videoMode, 'simple-story', 'the form-selected mode must already be in the very first job summary Claude sees');
+    assert.strictEqual(summaryJson.outputFormat, 'vertical');
+    assert.strictEqual(summaryJson.resolutionTier, '1080p');
+    assert.strictEqual(summaryJson.language, 'Spanish');
+    assert.strictEqual(summaryJson.storyStyle, 'Documentary');
+
+    const persisted = await jobStore.getJob(body.jobId);
+    assert.strictEqual(persisted.videoMode, 'simple-story');
+    assert.strictEqual(persisted.outputFormat, 'vertical');
+    assert.strictEqual(persisted.resolutionTier, '1080p');
+    assert.strictEqual(persisted.language, 'Spanish');
+    assert.strictEqual(persisted.storyStyle, 'Documentary');
+  });
+
+  await test('an invalid/malicious scriptPasteSettings payload is safely ignored end-to-end, never crashing the request or corrupting the job', async () => {
+    claudeTurns = [{ text: 'Got it.' }];
+    claudeCallIndex = 0;
+
+    const res = await fetch(`${baseUrl}/api/agent`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        message: LONG_PASTED_SCRIPT,
+        conversationHistory: [],
+        isScriptPaste: true,
+        scriptPasteSettings: {
+          videoMode: 'cinematic',
+          outputFormat: 'DROP TABLE jobs;',
+          resolutionTier: '16k-fake',
+          musicEnabled: true,
+          musicTrack: '../../secrets',
+        },
+      }),
+    });
+    const body = await res.json();
+    assert.strictEqual(res.status, 200, JSON.stringify(body));
+
+    const persisted = await jobStore.getJob(body.jobId);
+    assert.strictEqual(persisted.videoMode, 'cinematic', 'must fall back to the job default, not crash or store the invalid value');
+    assert.strictEqual(persisted.outputFormat, 'horizontal', 'the default — the bogus value must never be stored');
+    assert.strictEqual(persisted.resolutionTier, '720p', 'the default — the bogus value must never be stored');
+    assert.strictEqual(persisted.musicEnabled, false, 'musicEnabled must never be set true without a real, valid track');
+  });
+
   await test('a long pasted+flagged script is saved verbatim BEFORE Claude is called, and other fields are extracted', async () => {
-    const job = await jobStore.createJob();
     capturedRequests.length = 0;
     claudeTurns = [
       {
@@ -241,7 +433,7 @@ async function main() {
     const res = await fetch(`${baseUrl}/api/agent`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ message: LONG_PASTED_SCRIPT, conversationHistory: [], jobId: job.id, isScriptPaste: true }),
+      body: JSON.stringify({ message: LONG_PASTED_SCRIPT, conversationHistory: [], isScriptPaste: true }),
     });
     const body = await res.json();
     assert.strictEqual(res.status, 200, JSON.stringify(body));
@@ -254,7 +446,7 @@ async function main() {
       'expected the very first request to Claude to already reflect the saved script'
     );
 
-    const persisted = await jobStore.getJob(job.id);
+    const persisted = await jobStore.getJob(body.jobId);
     assert.strictEqual(persisted.script, LONG_PASTED_SCRIPT);
     assert.strictEqual(persisted.duration, '3 minutes');
     assert.strictEqual(persisted.language, 'English');
@@ -263,7 +455,6 @@ async function main() {
   });
 
   await test('a script field on updateVideoJob during a paste turn is discarded — the original pasted text is never overwritten', async () => {
-    const job = await jobStore.createJob();
     claudeTurns = [
       {
         text: 'Saved.',
@@ -282,18 +473,17 @@ async function main() {
     const res = await fetch(`${baseUrl}/api/agent`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ message: LONG_PASTED_SCRIPT, conversationHistory: [], jobId: job.id, isScriptPaste: true }),
+      body: JSON.stringify({ message: LONG_PASTED_SCRIPT, conversationHistory: [], isScriptPaste: true }),
     });
+    const body = await res.json();
     assert.strictEqual(res.status, 200);
 
-    const persisted = await jobStore.getJob(job.id);
+    const persisted = await jobStore.getJob(body.jobId);
     assert.strictEqual(persisted.script, LONG_PASTED_SCRIPT, 'the original pasted script must survive even a conflicting tool call');
     assert.strictEqual(persisted.duration, '3 minutes', 'other fields in the same tool call must still apply normally');
   });
 
   await test('every paid tool is hard-blocked on the same turn as a pasted script — never actually executes', async () => {
-    const job = await jobStore.createJob();
-    await jobStore.updateJob(job.id, { voiceStyle: 'alloy' });
     claudeTurns = [
       {
         text: "Here's the plan — generating the voice-over now.",
@@ -306,18 +496,17 @@ async function main() {
     const res = await fetch(`${baseUrl}/api/agent`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ message: LONG_PASTED_SCRIPT, conversationHistory: [], jobId: job.id, isScriptPaste: true }),
+      body: JSON.stringify({ message: LONG_PASTED_SCRIPT, conversationHistory: [], isScriptPaste: true }),
     });
     const body = await res.json();
     assert.strictEqual(res.status, 200, JSON.stringify(body));
     assert.strictEqual(body.autoContinue, false, 'a blocked paid tool must never be deferred/continued either');
 
-    const persisted = await jobStore.getJob(job.id);
+    const persisted = await jobStore.getJob(body.jobId);
     assert.strictEqual(persisted.voiceover.status, 'pending', 'generateVoiceover must never actually run on a paste turn');
   });
 
   await test('confirmVideoJob is hard-blocked on the same turn as a pasted script', async () => {
-    const job = await jobStore.createJob();
     claudeTurns = [
       { text: 'Confirming now.', tools: [{ id: 't1', name: 'confirmVideoJob', input: {} }] },
       { text: 'Understood, let me know when ready.' },
@@ -327,47 +516,13 @@ async function main() {
     const res = await fetch(`${baseUrl}/api/agent`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ message: LONG_PASTED_SCRIPT, conversationHistory: [], jobId: job.id, isScriptPaste: true }),
+      body: JSON.stringify({ message: LONG_PASTED_SCRIPT, conversationHistory: [], isScriptPaste: true }),
     });
+    const body = await res.json();
     assert.strictEqual(res.status, 200);
 
-    const persisted = await jobStore.getJob(job.id);
+    const persisted = await jobStore.getJob(body.jobId);
     assert.strictEqual(persisted.confirmed, false, 'confirmVideoJob must never actually run on a paste turn');
-  });
-
-  await test('re-pasting the exact same script on an already-confirmed job is a no-op — confirmed stays true', async () => {
-    const job = await jobStore.createJob();
-    await jobStore.updateJob(job.id, { script: LONG_PASTED_SCRIPT, confirmed: true });
-    claudeTurns = [{ text: 'No changes detected.' }];
-    claudeCallIndex = 0;
-
-    const res = await fetch(`${baseUrl}/api/agent`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ message: LONG_PASTED_SCRIPT, conversationHistory: [], jobId: job.id, isScriptPaste: true }),
-    });
-    assert.strictEqual(res.status, 200);
-
-    const persisted = await jobStore.getJob(job.id);
-    assert.strictEqual(persisted.confirmed, true, 'the exact same script must never un-confirm the job');
-  });
-
-  await test('pasting a genuinely DIFFERENT script on an already-confirmed job resets confirmed to false', async () => {
-    const job = await jobStore.createJob();
-    await jobStore.updateJob(job.id, { script: 'The original, already-confirmed script.', confirmed: true });
-    claudeTurns = [{ text: "Here's the updated plan for your new script." }];
-    claudeCallIndex = 0;
-
-    const res = await fetch(`${baseUrl}/api/agent`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ message: LONG_PASTED_SCRIPT, conversationHistory: [], jobId: job.id, isScriptPaste: true }),
-    });
-    assert.strictEqual(res.status, 200);
-
-    const persisted = await jobStore.getJob(job.id);
-    assert.strictEqual(persisted.script, LONG_PASTED_SCRIPT);
-    assert.strictEqual(persisted.confirmed, false, 'a genuinely different pasted script must require fresh confirmation');
   });
 
   await test('a continuation request (no message) never triggers paste-detection even with the flag set', async () => {
