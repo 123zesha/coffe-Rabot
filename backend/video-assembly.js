@@ -249,6 +249,17 @@ function probeStreamTypes(filePath) {
 // Returns { ok: true, durationSeconds } or { ok: false, reason }; never
 // throws — a verification failure is reported the same honest way as any
 // other assembly failure.
+//
+// The shortfall allowed is the LARGER of a relative 10% and this fixed
+// absolute floor (i.e. the effective threshold is the MIN of the two
+// thresholds this produces) — a pure 10% margin is too tight for short
+// clips: AAC encoder priming, sidechaincompress lookahead and the music
+// fade in prepareMusicTrack above all cost a roughly constant amount of
+// real time, which is a large fraction of a 1-3s test fixture but
+// negligible next to a real 30s-40min video. This is the same ±0.5s this
+// file's own duration assertions already use (see the sync tests above).
+const MIN_DURATION_ABSOLUTE_TOLERANCE_SECONDS = 0.5;
+
 async function verifyAssembledVideoBuffer(buffer, { expectAudioStream = false, minDurationSeconds } = {}) {
   if (!buffer || buffer.length === 0) {
     return { ok: false, reason: 'the assembled video file is empty' };
@@ -266,13 +277,18 @@ async function verifyAssembledVideoBuffer(buffer, { expectAudioStream = false, m
       return { ok: false, reason: `the assembled video could not be read back (${error.message})` };
     }
 
-    if (typeof minDurationSeconds === 'number' && minDurationSeconds > 0 && durationSeconds < minDurationSeconds * 0.9) {
-      return {
-        ok: false,
-        reason:
-          `the assembled video's real duration (${durationSeconds.toFixed(1)}s) is well short of the ` +
-          `narration audio it should cover (${minDurationSeconds.toFixed(1)}s)`,
-      };
+    if (typeof minDurationSeconds === 'number' && minDurationSeconds > 0) {
+      const relativeThreshold = minDurationSeconds * 0.9;
+      const absoluteThreshold = Math.max(0, minDurationSeconds - MIN_DURATION_ABSOLUTE_TOLERANCE_SECONDS);
+      const threshold = Math.min(relativeThreshold, absoluteThreshold);
+      if (durationSeconds < threshold) {
+        return {
+          ok: false,
+          reason:
+            `the assembled video's real duration (${durationSeconds.toFixed(1)}s) is well short of the ` +
+            `narration audio it should cover (${minDurationSeconds.toFixed(1)}s)`,
+        };
+      }
     }
 
     const { hasVideoStream, hasAudioStream } = await probeStreamTypes(filePath);
