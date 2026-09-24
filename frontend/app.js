@@ -119,13 +119,60 @@
   // one message still produces one complete video with no extra prompts.
   // onProgress, if given, is called with each intermediate step's reply as
   // it completes (the final reply is returned normally, not passed here).
+  // Chat-to-Video cost optimization: reads whatever the Create Video form's
+  // own settings selectors currently show (mode, output format,
+  // resolution, language, style, music) — the user can set these BEFORE
+  // switching to the chat box to paste a script, and the backend applies
+  // them directly to the new job (see sanitizeScriptPasteSettings in
+  // server.js) instead of leaving Claude to infer/ask about them from the
+  // pasted text. Only a select's non-empty value is included, the same
+  // "only mention if actually set" pattern the Create Video form's own
+  // generateBtn handler already uses below — an untouched field is left
+  // out entirely so the backend/Claude's existing defaults (e.g.
+  // simple-story for a plain narration script) still apply. videoMode is
+  // only included when it's 'simple-story': the select always shows a real
+  // value with no neutral "unspecified" option, so 'cinematic' can't be
+  // told apart from "never touched" — see server.js's own comment on this.
+  function collectScriptPasteFormSettings() {
+    const settings = {};
+    if (videoGenerationModeSelect.value === 'simple-story') {
+      settings.videoMode = 'simple-story';
+    }
+    if (videoOutputFormatSelect.value) {
+      settings.outputFormat = videoOutputFormatSelect.value;
+    }
+    if (videoResolutionSelect.value) {
+      settings.resolutionTier = videoResolutionSelect.value;
+    }
+    if (videoLanguageSelect.value) {
+      settings.language = videoLanguageSelect.selectedOptions[0].textContent;
+    }
+    if (videoStyleSelect.value) {
+      settings.storyStyle = videoStyleSelect.selectedOptions[0].textContent;
+    }
+    if (musicEnabledToggle.checked && videoMusicTrackSelect.value) {
+      settings.musicEnabled = true;
+      settings.musicTrack = videoMusicTrackSelect.value;
+    }
+    return settings;
+  }
+
   // isScriptPaste (Chat-to-Video), when true, tells the backend this exact
   // message is a complete, already-written script the user explicitly
   // flagged via the "Paste Script" toggle — never inferred from the
   // message's length or shape, so an ordinary long chat message is never
   // mistaken for one, and a short script is recognized just as reliably.
-  async function callAgent(message, onProgress, isScriptPaste) {
-    let data = await postAgentRequest({ message, conversationHistory, jobId, isScriptPaste: Boolean(isScriptPaste) });
+  // scriptPasteSettings (only meaningful alongside isScriptPaste) carries
+  // whatever Create Video form settings collectScriptPasteFormSettings
+  // found already selected.
+  async function callAgent(message, onProgress, isScriptPaste, scriptPasteSettings) {
+    let data = await postAgentRequest({
+      message,
+      conversationHistory,
+      jobId,
+      isScriptPaste: Boolean(isScriptPaste),
+      ...(isScriptPaste ? { scriptPasteSettings } : {}),
+    });
     applyAgentResponse(data);
 
     while (data.autoContinue) {
@@ -239,7 +286,7 @@
         typingBubble.remove();
         addMessage(progressReply, 'bot');
         typingBubble = showTypingIndicator();
-      }, isScriptPaste);
+      }, isScriptPaste, isScriptPaste ? collectScriptPasteFormSettings() : undefined);
       typingBubble.remove();
       addMessage(reply, 'bot');
     } catch (error) {

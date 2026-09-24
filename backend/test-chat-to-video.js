@@ -135,7 +135,7 @@ async function main() {
 
   const server = require('./server');
   const jobStore = require('./job-store');
-  const { isScriptPasteRequest, PAID_OR_CONFIRM_TOOLS } = server;
+  const { isScriptPasteRequest, PAID_OR_CONFIRM_TOOLS, sanitizeScriptPasteSettings } = server;
 
   test('isScriptPasteRequest requires the explicit flag — length/shape alone is never enough', () => {
     assert.strictEqual(
@@ -178,6 +178,48 @@ async function main() {
         'generateYoutubePackage',
       ].sort()
     );
+  });
+
+  test('sanitizeScriptPasteSettings forwards only videoMode "simple-story" — never "cinematic", which has no way to tell an explicit pick from an untouched default', () => {
+    assert.deepStrictEqual(sanitizeScriptPasteSettings({ videoMode: 'simple-story' }), { videoMode: 'simple-story' });
+    assert.deepStrictEqual(sanitizeScriptPasteSettings({ videoMode: 'cinematic' }), {});
+    assert.deepStrictEqual(sanitizeScriptPasteSettings({ videoMode: 'not-a-real-mode' }), {});
+  });
+
+  test('sanitizeScriptPasteSettings forwards outputFormat/resolutionTier only when they are real enum values', () => {
+    assert.deepStrictEqual(sanitizeScriptPasteSettings({ outputFormat: 'vertical' }), { outputFormat: 'vertical' });
+    assert.deepStrictEqual(sanitizeScriptPasteSettings({ outputFormat: 'square' }), { outputFormat: 'square' });
+    assert.deepStrictEqual(sanitizeScriptPasteSettings({ outputFormat: 'wide-screen-4k-ultra' }), {});
+    assert.deepStrictEqual(sanitizeScriptPasteSettings({ resolutionTier: '4k' }), { resolutionTier: '4k' });
+    assert.deepStrictEqual(sanitizeScriptPasteSettings({ resolutionTier: '8k' }), {});
+  });
+
+  test('sanitizeScriptPasteSettings forwards language/storyStyle as trimmed strings, rejecting empty or oversized input', () => {
+    assert.deepStrictEqual(sanitizeScriptPasteSettings({ language: '  Spanish  ' }), { language: 'Spanish' });
+    assert.deepStrictEqual(sanitizeScriptPasteSettings({ storyStyle: 'Documentary' }), { storyStyle: 'Documentary' });
+    assert.deepStrictEqual(sanitizeScriptPasteSettings({ language: '   ' }), {}, 'whitespace-only must not count as set');
+    assert.deepStrictEqual(sanitizeScriptPasteSettings({ language: 'x'.repeat(101) }), {}, 'must reject an unreasonably long value');
+    assert.deepStrictEqual(sanitizeScriptPasteSettings({ language: { toString: () => 'English' } }), {}, 'must reject a non-string, never coerce it');
+  });
+
+  test('sanitizeScriptPasteSettings only forwards musicTrack when it is a real, currently-available local track — never an arbitrary client-supplied value', () => {
+    // The test environment ships no real local music tracks (see
+    // data/music/), so MUSIC_TRACK_OPTIONS is empty and every musicTrack —
+    // including one that would otherwise look legitimate — must be
+    // rejected. This still proves the important thing: an attacker-chosen
+    // string is never trusted through untouched, exactly the kind of
+    // frontend input this app's own security rules require validating on
+    // the backend.
+    assert.deepStrictEqual(sanitizeScriptPasteSettings({ musicEnabled: true, musicTrack: 'ambient-1' }), {});
+    assert.deepStrictEqual(sanitizeScriptPasteSettings({ musicEnabled: true, musicTrack: '../../etc/passwd' }), {});
+    assert.deepStrictEqual(sanitizeScriptPasteSettings({ musicEnabled: true }), {}, 'musicEnabled alone with no valid track must never be forwarded');
+  });
+
+  test('sanitizeScriptPasteSettings ignores an absent/malformed payload entirely', () => {
+    assert.deepStrictEqual(sanitizeScriptPasteSettings(undefined), {});
+    assert.deepStrictEqual(sanitizeScriptPasteSettings(null), {});
+    assert.deepStrictEqual(sanitizeScriptPasteSettings('not an object'), {});
+    assert.deepStrictEqual(sanitizeScriptPasteSettings([]), {});
   });
 
   const httpServer = server.listen(0);
@@ -287,6 +329,80 @@ async function main() {
     const persisted = await jobStore.getJob(body.jobId);
     assert.strictEqual(persisted.chatToVideoAutoPipeline, true);
     assert.strictEqual(persisted.generateYoutubePackage, true);
+  });
+
+  await test('scriptPasteSettings (Create Video form settings selected before the paste) are applied directly, and already visible to Claude in the very first turn — without Claude ever having to set them itself', async () => {
+    capturedRequests.length = 0;
+    // Claude's own mocked reply deliberately never sets videoMode/
+    // outputFormat/resolutionTier/language/storyStyle via updateVideoJob —
+    // if the assertions below still pass, it proves these came from the
+    // form, not from an extra bit of Claude reasoning/tool-calling.
+    claudeTurns = [{ text: 'Got it — using the settings you already selected. Ready to confirm?' }];
+    claudeCallIndex = 0;
+
+    const res = await fetch(`${baseUrl}/api/agent`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        message: LONG_PASTED_SCRIPT,
+        conversationHistory: [],
+        isScriptPaste: true,
+        scriptPasteSettings: {
+          videoMode: 'simple-story',
+          outputFormat: 'vertical',
+          resolutionTier: '1080p',
+          language: 'Spanish',
+          storyStyle: 'Documentary',
+        },
+      }),
+    });
+    const body = await res.json();
+    assert.strictEqual(res.status, 200, JSON.stringify(body));
+
+    const firstRequestSystemText = capturedRequests[0].system[1].text;
+    const summaryJson = JSON.parse(firstRequestSystemText.slice(firstRequestSystemText.indexOf('{')));
+    assert.strictEqual(summaryJson.videoMode, 'simple-story', 'the form-selected mode must already be in the very first job summary Claude sees');
+    assert.strictEqual(summaryJson.outputFormat, 'vertical');
+    assert.strictEqual(summaryJson.resolutionTier, '1080p');
+    assert.strictEqual(summaryJson.language, 'Spanish');
+    assert.strictEqual(summaryJson.storyStyle, 'Documentary');
+
+    const persisted = await jobStore.getJob(body.jobId);
+    assert.strictEqual(persisted.videoMode, 'simple-story');
+    assert.strictEqual(persisted.outputFormat, 'vertical');
+    assert.strictEqual(persisted.resolutionTier, '1080p');
+    assert.strictEqual(persisted.language, 'Spanish');
+    assert.strictEqual(persisted.storyStyle, 'Documentary');
+  });
+
+  await test('an invalid/malicious scriptPasteSettings payload is safely ignored end-to-end, never crashing the request or corrupting the job', async () => {
+    claudeTurns = [{ text: 'Got it.' }];
+    claudeCallIndex = 0;
+
+    const res = await fetch(`${baseUrl}/api/agent`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        message: LONG_PASTED_SCRIPT,
+        conversationHistory: [],
+        isScriptPaste: true,
+        scriptPasteSettings: {
+          videoMode: 'cinematic',
+          outputFormat: 'DROP TABLE jobs;',
+          resolutionTier: '16k-fake',
+          musicEnabled: true,
+          musicTrack: '../../secrets',
+        },
+      }),
+    });
+    const body = await res.json();
+    assert.strictEqual(res.status, 200, JSON.stringify(body));
+
+    const persisted = await jobStore.getJob(body.jobId);
+    assert.strictEqual(persisted.videoMode, 'cinematic', 'must fall back to the job default, not crash or store the invalid value');
+    assert.strictEqual(persisted.outputFormat, 'horizontal', 'the default — the bogus value must never be stored');
+    assert.strictEqual(persisted.resolutionTier, '720p', 'the default — the bogus value must never be stored');
+    assert.strictEqual(persisted.musicEnabled, false, 'musicEnabled must never be set true without a real, valid track');
   });
 
   await test('a long pasted+flagged script is saved verbatim BEFORE Claude is called, and other fields are extracted', async () => {

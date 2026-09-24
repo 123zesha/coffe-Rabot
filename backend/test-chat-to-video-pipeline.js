@@ -210,8 +210,17 @@ async function main() {
     const step4 = await continueChatToVideoPipeline(job.id);
     assert.strictEqual(step4.status, 'done');
     assert.strictEqual(step4.job.youtubePackage.status, 'completed');
-    assert.strictEqual(anthropicRequestCount, 1);
-    assert.strictEqual(imageRequestCount, 1);
+    assert.strictEqual(anthropicRequestCount, 1, 'the text half (titles/description/tags) is still a real Claude call');
+    // This job is 'simple-story' mode, which never calls Runway or any
+    // image-generation API (see server.js's runGenerateYoutubePackage) —
+    // its thumbnail is a real frame pulled from the just-assembled final
+    // video via local ffmpeg instead, so no OpenAI image call happens at
+    // all, and the thumbnail is still genuinely produced.
+    assert.strictEqual(imageRequestCount, 0, 'simple-story mode must never call the paid OpenAI image API for its thumbnail');
+    assert.ok(
+      step4.job.youtubePackage.thumbnailUrl && step4.job.youtubePackage.thumbnailUrl.startsWith('/generated/image-'),
+      `expected a real, locally-stored ffmpeg-extracted frame, got: ${step4.job.youtubePackage.thumbnailUrl}`
+    );
 
     // Idempotency: calling again after 'done' must never repeat any real,
     // already-successful paid call.

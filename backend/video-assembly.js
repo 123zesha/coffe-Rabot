@@ -617,10 +617,40 @@ async function assembleFinalVideo({ clips, voiceover, burnInSubtitlesContent, ou
   }
 }
 
+// Extracts one real frame from an ALREADY-assembled final video as a PNG —
+// the only thumbnail source a 'simple-story' job is allowed to use (see
+// server.js's runGenerateYoutubePackage): that mode never calls Runway or
+// any image-generation API, so its thumbnail comes from local ffmpeg
+// instead of a paid OpenAI image call, exactly like every other asset it
+// produces. atSeconds is clamped to the real decoded duration (via
+// getMediaDuration) so a clip shorter than the requested offset still
+// yields a real frame instead of ffmpeg seeking past the end and failing.
+// Throws with ffmpeg's own error on a missing/corrupt video — never
+// fabricates a frame.
+async function extractThumbnailFrame(videoUrl, { atSeconds = 2 } = {}) {
+  const workDir = fs.mkdtempSync(path.join(os.tmpdir(), 'thumbnail-frame-'));
+  const inputPath = path.join(workDir, 'input.mp4');
+  const outputPath = path.join(workDir, 'frame.png');
+  try {
+    await fetchToFile(videoUrl, inputPath);
+    const durationSeconds = await getMediaDuration(inputPath);
+    const seekSeconds = Math.max(0, Math.min(atSeconds, durationSeconds - 0.1));
+    await runFfmpeg(['-y', '-ss', seekSeconds.toFixed(3), '-i', inputPath, '-frames:v', '1', '-q:v', '2', outputPath]);
+    const buffer = fs.readFileSync(outputPath);
+    if (buffer.length === 0) {
+      throw new Error('ffmpeg produced an empty thumbnail frame.');
+    }
+    return buffer;
+  } finally {
+    fs.rmSync(workDir, { recursive: true, force: true });
+  }
+}
+
 module.exports = {
   assembleFinalVideo,
   getMediaDuration,
   verifyAssembledVideoBuffer,
+  extractThumbnailFrame,
   ffmpegPath,
   OUTPUT_DIMENSIONS_BY_FORMAT,
   OUTPUT_DIMENSIONS_BY_FORMAT_AND_TIER,

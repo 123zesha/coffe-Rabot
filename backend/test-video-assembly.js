@@ -26,6 +26,7 @@ const {
   assembleFinalVideo,
   getMediaDuration,
   verifyAssembledVideoBuffer,
+  extractThumbnailFrame,
   ffmpegPath,
   OUTPUT_DIMENSIONS_BY_FORMAT,
   OUTPUT_DIMENSIONS_BY_FORMAT_AND_TIER,
@@ -744,6 +745,28 @@ async function main() {
       minDurationSeconds: actualDuration + 3,
     });
     assert.strictEqual(genuinelyTruncated.ok, false, JSON.stringify(genuinelyTruncated));
+  });
+
+  await test('extractThumbnailFrame pulls a real, decodable PNG frame from an already-assembled video, matching its real resolution', async () => {
+    const clipPath = makeClip('thumbnail-source.mp4', 'green', 5);
+
+    const frameBuffer = await extractThumbnailFrame(clipPath);
+
+    assert.ok(Buffer.isBuffer(frameBuffer) && frameBuffer.length > 0);
+    const pngSignature = Buffer.from([0x89, 0x50, 0x4e, 0x47]);
+    assert.ok(frameBuffer.subarray(0, 4).equals(pngSignature), 'expected a real PNG file, not something fabricated');
+
+    const framePath = path.join(fixturesDir, 'extracted-frame.png');
+    fs.writeFileSync(framePath, frameBuffer);
+    assert.deepStrictEqual(probeResolution(framePath), { width: 320, height: 240 });
+  });
+
+  await test('extractThumbnailFrame clamps its seek offset for a clip shorter than the requested atSeconds, instead of failing', async () => {
+    const shortClipPath = makeClip('thumbnail-source-short.mp4', 'blue', 1);
+
+    const frameBuffer = await extractThumbnailFrame(shortClipPath, { atSeconds: 2 });
+
+    assert.ok(Buffer.isBuffer(frameBuffer) && frameBuffer.length > 0, 'a clip shorter than atSeconds must still yield a real frame, not throw');
   });
 
   fs.rmSync(fixturesDir, { recursive: true, force: true });

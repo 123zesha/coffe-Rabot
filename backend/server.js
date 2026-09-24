@@ -698,14 +698,31 @@ async function runGenerateYoutubePackage(job, jobId, { forceRegenerate } = {}) {
     return jobStore.updateJob(jobId, { youtubePackage: failedPackage });
   }
 
-  // The thumbnail IMAGE is best-effort: OpenAI may not be configured, or the
-  // real call may fail, but the rest of the package (titles/description/
-  // tags/thumbnail concept) still came from a real, successful Claude call
-  // and should still be reported as completed — never discarded just
-  // because the optional image step didn't work.
+  // The thumbnail IMAGE is best-effort: it may fail (or not be configured),
+  // but the rest of the package (titles/description/tags/thumbnail
+  // concept) still came from a real, successful Claude call and should
+  // still be reported as completed — never discarded just because the
+  // image half didn't work.
+  //
+  // 'simple-story' jobs NEVER call Runway or any image-generation API (see
+  // job-store.js's VIDEO_MODES and simple-story-video.js's own header
+  // comment) — their thumbnail is a real frame lifted straight from the
+  // already-assembled final video via local ffmpeg instead of a paid
+  // OpenAI image call. 'cinematic' jobs are completely unaffected.
   let thumbnailUrl = null;
   let thumbnailError = null;
-  if (process.env.OPENAI_API_KEY) {
+  if (job.videoMode === 'simple-story') {
+    if (job.finalVideo && job.finalVideo.status === 'completed' && job.finalVideo.url) {
+      try {
+        const frameBuffer = await videoAssembly.extractThumbnailFrame(job.finalVideo.url);
+        thumbnailUrl = await videoStorage.storeImageFile(frameBuffer, jobId);
+      } catch (error) {
+        thumbnailError = `Could not extract a thumbnail frame from the final video: ${error.message}`;
+      }
+    } else {
+      thumbnailError = 'A thumbnail can only be extracted once the final Simple Story video has been assembled.';
+    }
+  } else if (process.env.OPENAI_API_KEY) {
     const thumbnailResult = await imageGeneration.generateThumbnailImage({
       thumbnailConcept: textResult.thumbnailConcept,
       thumbnailText: textResult.thumbnailText,
@@ -2180,6 +2197,67 @@ function isScriptPasteRequest({ message, isScriptPaste, continueAutomatically })
   return !continueAutomatically && Boolean(isScriptPaste) && typeof message === 'string' && message.trim().length > 0;
 }
 
+// Chat-to-Video cost optimization: whitelists and validates the "Create
+// Video" form settings the frontend may send alongside a pasted script
+// (see frontend/app.js's collectScriptPasteFormSettings) so the new job can
+// use them directly — the same "validate all frontend input on the
+// backend" rule as everywhere else, since this is arbitrary client JSON,
+// not something already constrained by a <select>'s own option list by the
+// time it reaches here. Using these directly means Claude never has to
+// infer/ask about a setting the user already picked, which is real,
+// avoidable token cost on the one production-plan turn every paste makes.
+//
+// videoMode is deliberately only honored when it's explicitly
+// 'simple-story': the form's mode <select> has no neutral "unspecified"
+// option (it always carries a real value, defaulting to 'cinematic'), so
+// treating 'cinematic' as a deliberate choice here would silently override
+// the more useful existing default — a plain narration paste already
+// defaults to simple-story unless the text itself asks for the cinematic
+// pipeline (see prompts/system-prompt.md). An explicit simple-story pick
+// is always a real, meaningful signal worth honoring directly; duration is
+// deliberately never taken from the form — a pasted script's real duration
+// always follows from how long it actually narrates to, never a
+// pre-selected estimate.
+const MAX_FREE_TEXT_SETTING_LENGTH = 100;
+
+function sanitizeScriptPasteSettings(raw) {
+  if (!raw || typeof raw !== 'object') {
+    return {};
+  }
+
+  const settings = {};
+
+  if (raw.videoMode === 'simple-story') {
+    settings.videoMode = 'simple-story';
+  }
+  if (jobStore.OUTPUT_FORMATS.includes(raw.outputFormat)) {
+    settings.outputFormat = raw.outputFormat;
+  }
+  if (jobStore.RESOLUTION_TIERS.includes(raw.resolutionTier)) {
+    settings.resolutionTier = raw.resolutionTier;
+  }
+  if (
+    typeof raw.language === 'string' &&
+    raw.language.trim() &&
+    raw.language.trim().length <= MAX_FREE_TEXT_SETTING_LENGTH
+  ) {
+    settings.language = raw.language.trim();
+  }
+  if (
+    typeof raw.storyStyle === 'string' &&
+    raw.storyStyle.trim() &&
+    raw.storyStyle.trim().length <= MAX_FREE_TEXT_SETTING_LENGTH
+  ) {
+    settings.storyStyle = raw.storyStyle.trim();
+  }
+  if (raw.musicEnabled === true && MUSIC_TRACK_OPTIONS.includes(raw.musicTrack)) {
+    settings.musicEnabled = true;
+    settings.musicTrack = raw.musicTrack;
+  }
+
+  return settings;
+}
+
 app.post('/api/agent', async (req, res) => {
   const {
     message,
@@ -2187,6 +2265,7 @@ app.post('/api/agent', async (req, res) => {
     jobId: requestedJobId,
     continueAutomatically,
     isScriptPaste: isScriptPasteFlag,
+    scriptPasteSettings,
   } = req.body || {};
 
   if (!continueAutomatically && !message) {
@@ -2212,7 +2291,11 @@ app.post('/api/agent', async (req, res) => {
   // are turned on so that, once the user confirms the extracted plan, the
   // rest of production (voice-over, subtitles, the final video, and the
   // thumbnail/YouTube package) proceeds automatically — see
-  // continueChatToVideoPipeline below and prompts/system-prompt.md.
+  // continueChatToVideoPipeline below and prompts/system-prompt.md. Any
+  // Create Video form settings already selected before the paste (see
+  // sanitizeScriptPasteSettings above) are applied in this same call, so
+  // they're already on the job — and already visible to Claude in the job
+  // summary — before it ever reads the pasted script.
   let job;
   let jobId;
   let history;
@@ -2224,6 +2307,7 @@ app.post('/api/agent', async (req, res) => {
       script: message.trim(),
       chatToVideoAutoPipeline: true,
       generateYoutubePackage: true,
+      ...sanitizeScriptPasteSettings(scriptPasteSettings),
     });
   } else {
     const existingJob = requestedJobId ? await jobStore.getJob(requestedJobId) : null;
@@ -2808,3 +2892,4 @@ module.exports.TOOLS = TOOLS;
 module.exports.isScriptPasteRequest = isScriptPasteRequest;
 module.exports.PAID_OR_CONFIRM_TOOLS = PAID_OR_CONFIRM_TOOLS;
 module.exports.continueChatToVideoPipeline = continueChatToVideoPipeline;
+module.exports.sanitizeScriptPasteSettings = sanitizeScriptPasteSettings;
