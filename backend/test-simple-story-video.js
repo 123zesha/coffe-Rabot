@@ -78,6 +78,39 @@ function probeAudioDuration(filePath) {
   });
 }
 
+// Reports ffmpeg's own measured mean_volume (dB) for a real audio file,
+// optionally restricted to a [start, start+duration) window — used below to
+// prove musicVolumeDb genuinely changes the mixed-in music's real loudness,
+// never merely accepted and ignored. Same technique test-video-assembly.js's
+// own music tests use for the Runway pipeline. A window is needed because
+// this module's ducking (sidechaincompress) is deliberately aggressive
+// during actual narration, which compresses away most of a volume
+// difference applied BEFORE ducking — measuring during a real silent GAP
+// between cues (where music plays unducked) is what actually isolates
+// musicVolumeDb's own effect from ducking's.
+function measureMeanVolume(filePath, { start, duration } = {}) {
+  const args = ['-y'];
+  if (typeof start === 'number') {
+    args.push('-ss', String(start));
+  }
+  args.push('-i', filePath);
+  if (typeof duration === 'number') {
+    args.push('-t', String(duration));
+  }
+  args.push('-af', 'volumedetect', '-f', 'null', '-');
+  return new Promise((resolve, reject) => {
+    execFile(ssv.ffmpegPath, args, { maxBuffer: 1024 * 1024 * 16 }, (error, stdout, stderr) => {
+      const log = (stderr || '').toString();
+      const match = log.match(/mean_volume:\s*(-?\d+(?:\.\d+)?)\s*dB/);
+      if (!match) {
+        reject(new Error(`ffmpeg did not report mean_volume for ${filePath}: ${log.trim().slice(-500)}`));
+        return;
+      }
+      resolve(Number(match[1]));
+    });
+  });
+}
+
 // Reads one raw RGB pixel from a real decoded video frame at `atSeconds` —
 // used to prove a requested backgroundColor edit genuinely changed the
 // rendered pixels, not just that re-rendering happened. (x, y) should land
@@ -132,6 +165,39 @@ function makeMusicTone(dir, seconds, label) {
   );
 }
 
+// A narration fixture with a REAL silent gap in the actual audio signal
+// itself (tone, then true silence, then tone) — used only by the
+// musicVolumeDb test below. sidechaincompress ducks music based on the
+// narration audio's own real amplitude, never on subtitle cue timing, so a
+// fixture built from a continuous tone (makeToneAudio) is loud for its
+// entire duration and can never produce an unducked window no matter what
+// the .srt cues say — only real silence in the audio itself does.
+function makeGapAudio(dir, toneSeconds, silenceSeconds, label) {
+  const outPath = path.join(dir, `gap-audio-${label || ++toneAudioCounter}.mp3`);
+  return runFfmpeg([
+    '-y',
+    '-f',
+    'lavfi',
+    '-i',
+    `sine=frequency=220:duration=${toneSeconds}`,
+    '-f',
+    'lavfi',
+    '-i',
+    `anullsrc=r=44100:cl=mono:d=${silenceSeconds}`,
+    '-f',
+    'lavfi',
+    '-i',
+    `sine=frequency=220:duration=${toneSeconds}`,
+    '-filter_complex',
+    '[0:a][1:a][2:a]concat=n=3:v=0:a=1[out]',
+    '-map',
+    '[out]',
+    '-c:a',
+    'libmp3lame',
+    outPath,
+  ]).then(() => outPath);
+}
+
 // Builds a real, longer .srt fixture (real timestamps, real sequential
 // cues) to simulate a production-length story without ever generating a
 // real production-length video — used only for the end-to-end resumability
@@ -173,6 +239,22 @@ const FIXTURE_SRT = [
   '4',
   '00:00:07,000 --> 00:00:08,900',
   'It led her to a quiet, sunlit clearing.',
+  '',
+].join('\n');
+
+// A real, deliberate silent GAP between cue 1 (ends at 1.5s) and cue 2
+// (starts at 6.0s) — used only by the musicVolumeDb test below, which needs
+// a window where music plays UNDUCKED (sidechaincompress only ducks while
+// narration is actually speaking) to isolate musicVolumeDb's own effect
+// from ducking's.
+const GAP_SRT = [
+  '1',
+  '00:00:00,000 --> 00:00:01,500',
+  'Once upon a time.',
+  '',
+  '2',
+  '00:00:06,000 --> 00:00:07,500',
+  'The story continues.',
   '',
 ].join('\n');
 
@@ -776,6 +858,7 @@ async function main() {
         subtitleTimingOffsetMs: 0,
         voiceSpeed: 1,
         voiceVolumeDb: 0,
+        musicVolumeDb: 0,
       });
     }
   });
@@ -793,6 +876,7 @@ async function main() {
       subtitleTimingOffsetMs: 250,
       voiceSpeed: 1.25,
       voiceVolumeDb: 6,
+      musicVolumeDb: -6,
     });
     assert.deepStrictEqual(normalized, {
       backgroundColor: '1a2b3c',
@@ -806,6 +890,7 @@ async function main() {
       subtitleTimingOffsetMs: 250,
       voiceSpeed: 1.25,
       voiceVolumeDb: 6,
+      musicVolumeDb: -6,
     });
   });
 
@@ -819,6 +904,7 @@ async function main() {
       subtitleTimingOffsetMs: -999999,
       voiceSpeed: 10,
       voiceVolumeDb: -999,
+      musicVolumeDb: 999,
     });
     assert.strictEqual(normalized.backgroundColor, null);
     assert.strictEqual(normalized.storyPosition, null);
@@ -828,6 +914,7 @@ async function main() {
     assert.strictEqual(normalized.subtitleTimingOffsetMs, ssv.SUBTITLE_TIMING_OFFSET_MS_MIN);
     assert.strictEqual(normalized.voiceSpeed, ssv.VOICE_SPEED_MAX);
     assert.strictEqual(normalized.voiceVolumeDb, ssv.VOICE_VOLUME_DB_MIN);
+    assert.strictEqual(normalized.musicVolumeDb, ssv.VOICE_VOLUME_DB_MAX);
   });
 
   await test('normalizeVideoEditSettings accepts real backgroundPreset/textSize values and rejects invalid ones', () => {
@@ -1162,6 +1249,52 @@ async function main() {
     });
     assert.strictEqual(result.status, 'failed');
     assert.ok(result.error, 'a missing/corrupt music file must produce a real, non-empty error, never a silently music-less success');
+  });
+
+  await test('continueSimpleStoryVideoAssembly\'s editSettings.musicVolumeDb genuinely changes music\'s real loudness during an unducked gap', async () => {
+    // A real silent gap in the NARRATION AUDIO ITSELF (1.5s tone, 4.5s true
+    // silence, 2s tone) — sidechaincompress ducks based on the narration's
+    // own real amplitude, not on .srt cue timing, so GAP_SRT's cue gap alone
+    // (used only for the on-screen text/section timing here) would never be
+    // enough on its own to produce an unducked window.
+    const audioPath = await makeGapAudio(workDir, 1.5, 4.5, 'music-volume-narration');
+    const musicPath = await makeMusicTone(workDir, 8, 'music-volume-track');
+    // Sits entirely inside the real silent gap (1.5s-6.0s), away from its
+    // edges, so ducking is genuinely inactive there and any loudness
+    // difference reflects musicVolumeDb alone.
+    const GAP_WINDOW = { start: 2.5, duration: 2.5 };
+
+    const quiet = await ssv.continueSimpleStoryVideoAssembly({
+      voiceover: { status: 'completed', url: audioPath },
+      subtitlesContent: GAP_SRT,
+      existingRender: null,
+      jobId: 'test-job-music-volume-quiet',
+      musicUrl: musicPath,
+      editSettings: { musicVolumeDb: -20 },
+    });
+    assert.strictEqual(quiet.status, 'completed', quiet.error);
+    const quietPath = path.join(workDir, 'output-music-volume-quiet.mp4');
+    fs.writeFileSync(quietPath, quiet.buffer);
+
+    const loud = await ssv.continueSimpleStoryVideoAssembly({
+      voiceover: { status: 'completed', url: audioPath },
+      subtitlesContent: GAP_SRT,
+      existingRender: null,
+      jobId: 'test-job-music-volume-loud',
+      musicUrl: musicPath,
+      editSettings: { musicVolumeDb: 20 },
+    });
+    assert.strictEqual(loud.status, 'completed', loud.error);
+    const loudPath = path.join(workDir, 'output-music-volume-loud.mp4');
+    fs.writeFileSync(loudPath, loud.buffer);
+
+    const quietMeanVolume = await measureMeanVolume(quietPath, GAP_WINDOW);
+    const loudMeanVolume = await measureMeanVolume(loudPath, GAP_WINDOW);
+    assert.ok(
+      loudMeanVolume > quietMeanVolume + 30,
+      `expected +20dB musicVolumeDb to measurably raise music's real loudness over -20dB during an ` +
+        `unducked gap (a real 40dB difference applied), got quiet=${quietMeanVolume}dB loud=${loudMeanVolume}dB`
+    );
   });
 
   fs.rmSync(workDir, { recursive: true, force: true });

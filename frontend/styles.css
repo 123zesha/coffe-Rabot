@@ -18,6 +18,17 @@
   box-sizing: border-box;
 }
 
+/* The native [hidden] attribute only wins the cascade over a plain element
+   selector — any class below that sets its own `display` (`.form-field`,
+   `.create-form`, `.story-subgroup`, etc.) is author-origin CSS and beats
+   the browser's user-agent [hidden] rule regardless of specificity within
+   either origin, silently un-hiding anything using both `hidden` and one of
+   those classes. This single global override (found the hard way — see
+   git history) fixes every current and future instance of that at once. */
+[hidden] {
+  display: none !important;
+}
+
 html {
   scroll-behavior: smooth;
 }
@@ -221,10 +232,6 @@ a {
   gap: 24px;
 }
 
-.create-form[hidden] {
-  display: none;
-}
-
 .form-field {
   display: flex;
   flex-direction: column;
@@ -365,6 +372,13 @@ a {
 
 .radio-field input {
   width: auto;
+}
+
+.form-field input[type="range"] {
+  padding: 0;
+  border: none;
+  background: transparent;
+  accent-color: var(--color-primary);
 }
 
 .story-cost-review {

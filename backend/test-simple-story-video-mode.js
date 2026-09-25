@@ -586,6 +586,22 @@ async function main() {
     assert.strictEqual(persisted.videoEditSettings.voiceSpeed, 1.5);
   });
 
+  await test('updateVideoEditSettings accepts musicVolumeDb separately from voiceVolumeDb', async () => {
+    const job = await jobStore.createJob();
+    await jobStore.updateJob(job.id, { videoMode: 'simple-story' });
+
+    const result = JSON.parse(
+      await app.executeTool('updateVideoEditSettings', job.id, { voiceVolumeDb: 5, musicVolumeDb: -8 })
+    );
+    assert.strictEqual(result.error, undefined, JSON.stringify(result));
+    assert.strictEqual(result.videoEditSettings.voiceVolumeDb, 5);
+    assert.strictEqual(result.videoEditSettings.musicVolumeDb, -8);
+
+    const persisted = await jobStore.getJob(job.id);
+    assert.strictEqual(persisted.videoEditSettings.voiceVolumeDb, 5);
+    assert.strictEqual(persisted.videoEditSettings.musicVolumeDb, -8);
+  });
+
   await test('updateVideoEditSettings refuses an invalid hex color with a clear, actionable error and changes nothing', async () => {
     const job = await jobStore.createJob();
     await jobStore.updateJob(job.id, { videoMode: 'simple-story' });
@@ -719,6 +735,47 @@ async function main() {
 
     fs.rmSync(pathWithoutMusic, { force: true });
     fs.rmSync(pathWithMusic, { force: true });
+  });
+
+  // The test above never sets voiceSource — it defaults to 'ai' (see
+  // job-store.js) — so it already proves music mixing works for an AI-voice
+  // job. This test proves the same for an "Upload My Own Voice" job
+  // (voiceSource: 'upload'): music mixing only ever depends on a completed
+  // job.voiceover existing, never on how that voice-over was produced, so
+  // it must work identically either way.
+  await test('assembleFinalVideo mixes in real background music for an "Upload My Own Voice" job just as it does for an AI-voice job', async () => {
+    const job = await jobStore.createJob();
+    const voiceoverUrl = await makeFixtureVoiceoverDataUri(workDir);
+    const musicPath = path.join(workDir, 'music-upload-voice.mp3');
+    await runFfmpeg(['-y', '-f', 'lavfi', '-i', 'sine=frequency=330:duration=4', '-c:a', 'libmp3lame', musicPath]);
+
+    await jobStore.updateJob(job.id, {
+      videoMode: 'simple-story',
+      voiceSource: 'upload',
+      script: LONG_ENOUGH_SCRIPT + ' '.repeat(200),
+      voiceover: { url: voiceoverUrl, status: 'completed', voice: 'uploaded', voiceStyle: '', source: 'upload' },
+      subtitles: {
+        status: 'completed',
+        format: 'srt',
+        content: FIXTURE_SRT,
+        error: null,
+        generatedFromVoiceoverUrl: voiceoverUrl,
+      },
+      musicEnabled: true,
+      musicCustomUrl: musicPath,
+    });
+
+    const result = JSON.parse(await app.executeTool('assembleFinalVideo', job.id, {}));
+    assert.strictEqual(result.finalVideo.status, 'completed', JSON.stringify(result));
+    assert.strictEqual(result.finalVideo.hasMusic, true);
+
+    const persisted = await jobStore.getJob(job.id);
+    assert.deepStrictEqual(persisted.finalVideo.musicUsed, { enabled: true, track: null, customUrl: musicPath });
+    const realPath = path.join(require('./video-storage').GENERATED_DIR, persisted.finalVideo.url.slice('/generated/'.length));
+    const probed = await probe(realPath);
+    assert.strictEqual(probed.width, 1920);
+    assert.strictEqual(probed.height, 1080);
+    fs.rmSync(realPath, { force: true });
   });
 
   await test('assembleFinalVideo fails clearly for a "simple-story" job when musicTrack names a track that does not exist, without corrupting the job', async () => {

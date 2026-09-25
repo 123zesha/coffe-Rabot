@@ -504,6 +504,11 @@ function createDefaultJob(id) {
       subtitleTimingOffsetMs: 0,
       voiceSpeed: 1,
       voiceVolumeDb: 0,
+      // Adjusts background music's own baseline level relative to its
+      // built-in ducked-under-narration default (0 = unchanged) — has no
+      // effect at all unless musicEnabled is also on (see musicEnabled/
+      // musicTrack/musicCustomUrl below).
+      musicVolumeDb: 0,
     },
     // Optional "Reference Video / Inspiration Mode" input: a YouTube URL the
     // user wants used only as high-level storytelling inspiration (pacing,

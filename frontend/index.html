@@ -341,15 +341,56 @@
             <div class="form-field form-field-wide">
               <label class="checkbox-field">
                 <input type="checkbox" id="story-music-enabled-toggle">
-                Add background music — optional, off by default
+                Enable Background Music — optional, off by default
               </label>
               <p class="field-hint">
-                Mixed in quietly under the narration using only a local audio track — never downloaded or
-                generated. Requires a track in the local music library below.
+                Mixed in quietly under the narration and automatically lowered further while it's playing.
+                Never downloaded or generated — only a real audio file you upload or pick from the local
+                library. Works with both AI Voice and Upload My Own Voice.
               </p>
-              <select id="story-music-track" disabled>
-                <option value="">No local music tracks available</option>
-              </select>
+            </div>
+
+            <div id="story-music-options" class="form-field-wide story-subgroup" hidden>
+              <div class="form-field form-field-wide">
+                <label>Music source</label>
+                <div class="radio-row">
+                  <label class="radio-field">
+                    <input type="radio" name="story-music-source" id="music-source-upload" value="upload" checked>
+                    Upload My Own Music
+                  </label>
+                  <label class="radio-field">
+                    <input type="radio" name="story-music-source" id="music-source-library" value="library">
+                    Choose From Library
+                  </label>
+                </div>
+              </div>
+
+              <div id="music-upload-options" class="form-field form-field-wide">
+                <label for="story-music-upload">Upload music (MP3, WAV, or M4A)</label>
+                <input type="file" id="story-music-upload" accept=".mp3,.wav,.m4a,audio/mpeg,audio/wav,audio/x-wav,audio/wave,audio/mp4,audio/x-m4a">
+                <p id="story-music-upload-status" class="field-hint"></p>
+                <p class="field-hint">
+                  A shorter track loops smoothly with a fade-in/fade-out to cover your full video, however
+                  long it is — ideal for a 30-40 minute story.
+                </p>
+              </div>
+
+              <div id="music-library-options" class="form-field form-field-wide" hidden>
+                <select id="story-music-track" disabled>
+                  <option value="">No local music tracks available</option>
+                </select>
+              </div>
+
+              <div class="form-field">
+                <label for="story-music-volume">Music volume: <span id="story-music-volume-value">Default</span></label>
+                <input type="range" id="story-music-volume" min="-30" max="30" step="1" value="0">
+                <p class="field-hint">Automatically lowered further while narration is playing.</p>
+              </div>
+
+              <div class="form-field">
+                <label for="story-narration-volume">Narration volume: <span id="story-narration-volume-value">Default</span></label>
+                <input type="range" id="story-narration-volume" min="-30" max="30" step="1" value="0">
+              </div>
             </div>
 
             <div class="form-field form-field-wide">
@@ -370,6 +411,7 @@
 
           <div id="story-cost-review" class="story-cost-review" hidden>
             <h3>Production Plan &amp; Estimated Cost</h3>
+            <ul id="story-settings-summary-list" class="story-cost-breakdown-list"></ul>
             <ul id="story-cost-breakdown-list" class="story-cost-breakdown-list"></ul>
             <p id="story-cost-total" class="story-cost-total"></p>
             <p class="field-hint">

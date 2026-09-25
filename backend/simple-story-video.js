@@ -210,7 +210,23 @@ function normalizeVideoEditSettings(raw) {
     ),
     voiceSpeed: clampNumber(input.voiceSpeed, VOICE_SPEED_MIN, VOICE_SPEED_MAX, 1),
     voiceVolumeDb: clampNumber(input.voiceVolumeDb, VOICE_VOLUME_DB_MIN, VOICE_VOLUME_DB_MAX, 0),
+    // Adjusts background music's own baseline level (see musicUrl's comment
+    // on continueSimpleStoryVideoAssembly below) — 0 (the default) leaves
+    // MUSIC_VOLUME_WITH_VOICEOVER exactly as it was before this field
+    // existed. Ducking under the narration (sidechaincompress) still always
+    // applies on top of whatever level this sets, so turning music louder
+    // here never risks drowning out narration during actual speech.
+    musicVolumeDb: clampNumber(input.musicVolumeDb, VOICE_VOLUME_DB_MIN, VOICE_VOLUME_DB_MAX, 0),
   };
+}
+
+// Converts a dB adjustment to the equivalent linear multiplier ffmpeg's
+// volume filter expects (see prepareMusicTrack's own `volume` parameter) —
+// the same conversion audio engineers use everywhere: amplitude ratio =
+// 10^(dB/20). 0dB always yields exactly 1 (no change), matching
+// musicVolumeDb's own "0 is the untouched default" contract above.
+function dbToLinearVolume(db) {
+  return Math.pow(10, db / 20);
 }
 
 // Converts a plain 'RRGGBB' hex string into ASS's own `&HAABBGGRR` color
@@ -908,7 +924,8 @@ async function continueSimpleStoryVideoAssembly({
       const musicSourcePath = path.join(workDir, 'music-input');
       await fetchAudioToFile(musicUrl, musicSourcePath);
       const preparedMusicPath = path.join(workDir, 'music-prepared.m4a');
-      await prepareMusicTrack(musicSourcePath, audioDuration, MUSIC_VOLUME_WITH_VOICEOVER, preparedMusicPath);
+      const musicVolume = MUSIC_VOLUME_WITH_VOICEOVER * dbToLinearVolume(editSettings.musicVolumeDb);
+      await prepareMusicTrack(musicSourcePath, audioDuration, musicVolume, preparedMusicPath);
       const mixedAudioPath = path.join(workDir, 'audio-mixed.m4a');
       await duckAndMixMusicWithVoiceover(preparedMusicPath, effectiveAudioPath, mixedAudioPath);
       audioForMuxPath = mixedAudioPath;
@@ -1054,6 +1071,7 @@ module.exports = {
   applyCueTimingAdjustments,
   prepareEffectiveAudio,
   assColorFromHex,
+  dbToLinearVolume,
   VOICE_SPEED_MIN,
   VOICE_SPEED_MAX,
   VOICE_VOLUME_DB_MIN,

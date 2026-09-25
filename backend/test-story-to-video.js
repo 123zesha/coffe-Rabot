@@ -149,6 +149,26 @@ async function main() {
     assert.strictEqual(body.job.videoEditSettings.showCaptions, false);
   });
 
+  await test('POST /api/jobs/story-to-video accepts separate narration and music volume settings, both defaulting to 0', async () => {
+    const defaultRes = await fetch(`${baseUrl}/api/jobs/story-to-video`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ script: SHORT_SCRIPT }),
+    });
+    const defaultBody = await defaultRes.json();
+    assert.strictEqual(defaultBody.job.videoEditSettings.voiceVolumeDb, 0);
+    assert.strictEqual(defaultBody.job.videoEditSettings.musicVolumeDb, 0);
+
+    const customRes = await fetch(`${baseUrl}/api/jobs/story-to-video`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ script: SHORT_SCRIPT, voiceVolumeDb: 6, musicVolumeDb: -9 }),
+    });
+    const customBody = await customRes.json();
+    assert.strictEqual(customBody.job.videoEditSettings.voiceVolumeDb, 6);
+    assert.strictEqual(customBody.job.videoEditSettings.musicVolumeDb, -9);
+  });
+
   await test('POST /api/jobs/story-to-video creates a brand-new, isolated job every time — never reuses another job\'s script', async () => {
     const resA = await fetch(`${baseUrl}/api/jobs/story-to-video`, {
       method: 'POST',
@@ -289,6 +309,143 @@ async function main() {
     const body = await res.json();
     assert.strictEqual(body.job.subtitles.status, 'pending', 'a fresh upload must invalidate stale subtitles');
     assert.strictEqual(body.job.finalVideo.status, 'pending', 'a fresh upload must invalidate a stale final video');
+  });
+
+  // ---------------------------------------------------------------------
+  // POST /api/jobs/:id/upload-music
+  // ---------------------------------------------------------------------
+
+  await test('POST /api/jobs/:id/upload-music 404s for an unknown job', async () => {
+    const res = await fetch(`${baseUrl}/api/jobs/no-such-job/upload-music`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'audio/mpeg' },
+      body: shortAudioBuffer,
+    });
+    assert.strictEqual(res.status, 404);
+  });
+
+  await test('POST /api/jobs/:id/upload-music rejects an unsupported content type', async () => {
+    const createRes = await fetch(`${baseUrl}/api/jobs/story-to-video`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ script: SHORT_SCRIPT }),
+    });
+    const job = (await createRes.json()).job;
+
+    const res = await fetch(`${baseUrl}/api/jobs/${job.id}/upload-music`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'text/plain' },
+      body: 'not audio',
+    });
+    assert.strictEqual(res.status, 400);
+    const body = await res.json();
+    assert.ok(/Unsupported audio format/.test(body.error));
+  });
+
+  await test('POST /api/jobs/:id/upload-music rejects an empty body', async () => {
+    const createRes = await fetch(`${baseUrl}/api/jobs/story-to-video`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ script: SHORT_SCRIPT }),
+    });
+    const job = (await createRes.json()).job;
+
+    const res = await fetch(`${baseUrl}/api/jobs/${job.id}/upload-music`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'audio/mpeg' },
+      body: Buffer.alloc(0),
+    });
+    assert.strictEqual(res.status, 400);
+  });
+
+  await test('POST /api/jobs/:id/upload-music stores a real MP3, enables music, and clears any prior library track', async () => {
+    const createRes = await fetch(`${baseUrl}/api/jobs/story-to-video`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ script: SHORT_SCRIPT }),
+    });
+    const job = (await createRes.json()).job;
+    // Simulate a job that previously had a library track selected — the
+    // upload must take over as the one active music source, never leaving
+    // a stale musicTrack alongside the fresh musicCustomUrl.
+    await jobStore.updateJob(job.id, { musicEnabled: true, musicTrack: 'some-old-library-track' });
+
+    const res = await fetch(`${baseUrl}/api/jobs/${job.id}/upload-music`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'audio/mpeg' },
+      body: shortAudioBuffer,
+    });
+    assert.strictEqual(res.status, 200, JSON.stringify(await res.clone().json()));
+    const body = await res.json();
+
+    assert.strictEqual(body.job.musicEnabled, true);
+    assert.ok(body.job.musicCustomUrl, 'expected a real stored url for the uploaded music');
+    assert.strictEqual(body.job.musicTrack, null, 'an uploaded track must clear any previously selected library track');
+  });
+
+  await test('POST /api/jobs/:id/upload-music accepts a real WAV file too', async () => {
+    const createRes = await fetch(`${baseUrl}/api/jobs/story-to-video`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ script: SHORT_SCRIPT }),
+    });
+    const job = (await createRes.json()).job;
+
+    const res = await fetch(`${baseUrl}/api/jobs/${job.id}/upload-music`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'audio/wav' },
+      body: wavBuffer,
+    });
+    assert.strictEqual(res.status, 200, JSON.stringify(await res.clone().json()));
+    const body = await res.json();
+    assert.strictEqual(body.job.musicEnabled, true);
+    assert.ok(body.job.musicCustomUrl);
+  });
+
+  await test('POST /api/jobs/:id/upload-music rejects a corrupt/unreadable audio file', async () => {
+    const createRes = await fetch(`${baseUrl}/api/jobs/story-to-video`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ script: SHORT_SCRIPT }),
+    });
+    const job = (await createRes.json()).job;
+
+    const res = await fetch(`${baseUrl}/api/jobs/${job.id}/upload-music`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'audio/mpeg' },
+      body: Buffer.from('this is not a real mp3 file, just plain bytes that ffmpeg cannot decode as audio'),
+    });
+    assert.strictEqual(res.status, 400);
+    const body = await res.json();
+    assert.ok(/could not be read as a real audio file/.test(body.error));
+  });
+
+  await test('uploading music to one job never affects another job\'s music settings', async () => {
+    const createA = await fetch(`${baseUrl}/api/jobs/story-to-video`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ script: 'Music isolation job A.' }),
+    });
+    const jobA = (await createA.json()).job;
+
+    const createB = await fetch(`${baseUrl}/api/jobs/story-to-video`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ script: 'Music isolation job B.' }),
+    });
+    const jobB = (await createB.json()).job;
+
+    await fetch(`${baseUrl}/api/jobs/${jobA.id}/upload-music`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'audio/mpeg' },
+      body: shortAudioBuffer,
+    });
+
+    const refreshedA = await jobStore.getJob(jobA.id);
+    const refreshedB = await jobStore.getJob(jobB.id);
+    assert.strictEqual(refreshedA.musicEnabled, true);
+    assert.strictEqual(refreshedB.musicEnabled, false, "job B's music settings must be untouched by job A's upload");
+    assert.strictEqual(refreshedB.musicCustomUrl, '');
   });
 
   // ---------------------------------------------------------------------

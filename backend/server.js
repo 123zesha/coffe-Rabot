@@ -1663,7 +1663,8 @@ const TOOLS = [
       'job (this only applies to Simple Story Video mode\'s own rendering — see assembleFinalVideo). Pass ' +
       'the string "default" for backgroundColor/storyPosition/fontWeight/subtitleColor to reset that one ' +
       'field back to its original built-in look; numeric fields reset the same way by passing their own ' +
-      'default value (subtitleFontScale: 1, subtitleTimingOffsetMs: 0, voiceSpeed: 1, voiceVolumeDb: 0). ' +
+      'default value (subtitleFontScale: 1, subtitleTimingOffsetMs: 0, voiceSpeed: 1, voiceVolumeDb: 0, ' +
+      'musicVolumeDb: 0). ' +
       'backgroundColor: a single solid hex color (e.g. "1a2a4a" for navy — no "#") used for EVERY section, ' +
       'replacing the default rotating color palette. storyPosition: "top"/"center"(default)/"bottom" for ' +
       'the large on-screen story text only — the small caption line always stays at the bottom, standard ' +
@@ -1685,6 +1686,9 @@ const TOOLS = [
       'LOCALLY to the existing voice-over audio via ffmpeg — never a new text-to-speech call; on-screen ' +
       'text timing is automatically rescaled to stay in sync with the new speed. voiceVolumeDb: a decibel ' +
       'gain/cut (-30 to 30, e.g. 6 for noticeably louder, -6 for quieter) applied LOCALLY the same way. ' +
+      'musicVolumeDb: a decibel gain/cut (-30 to 30) on background music\'s own baseline level, on top of ' +
+      'its built-in automatic ducking under the narration — has no audible effect unless musicEnabled is ' +
+      'also on (see updateVideoJob). ' +
       'None of these fields ever require the user\'s confirmation before calling this — they are all free, ' +
       'local edits — but if the user instead asks for something this cannot do locally (a different VOICE ' +
       'or a re-written script, for example), tell them that requires generateVoiceover (a real, paid ' +
@@ -1704,6 +1708,7 @@ const TOOLS = [
         subtitleTimingOffsetMs: { type: 'integer', minimum: -10000, maximum: 10000 },
         voiceSpeed: { type: 'number', minimum: 0.5, maximum: 2.0 },
         voiceVolumeDb: { type: 'number', minimum: -30, maximum: 30 },
+        musicVolumeDb: { type: 'number', minimum: -30, maximum: 30 },
       },
       additionalProperties: false,
     },
@@ -2199,7 +2204,7 @@ async function executeTool(name, jobId, input) {
     if (typeof input?.showCaptions === 'boolean') {
       patch.showCaptions = input.showCaptions;
     }
-    for (const field of ['subtitleFontScale', 'subtitleTimingOffsetMs', 'voiceSpeed', 'voiceVolumeDb']) {
+    for (const field of ['subtitleFontScale', 'subtitleTimingOffsetMs', 'voiceSpeed', 'voiceVolumeDb', 'musicVolumeDb']) {
       if (typeof input?.[field] === 'number') {
         patch[field] = input[field];
       }
@@ -2828,16 +2833,17 @@ app.post('/api/jobs/:id/generate-voiceover', async (req, res) => {
   }
 });
 
-// "Upload My Own Voice" — the zero-TTS-cost alternative to generate-voiceover
-// above. Accepts the real audio file as a raw request body (never base64/
-// JSON — a 30-40 minute recording would push a JSON envelope well past any
-// reasonable size), validated by its real Content-Type against the three
-// formats this app supports. A per-route express.raw() limit is used
-// instead of raising the global express.json() limit (which stays a
-// deliberately small 1mb for every other route) — this is the one place in
-// the app that genuinely needs to accept a large upload.
-const VOICEOVER_UPLOAD_MAX_BYTES = 60 * 1024 * 1024; // comfortably covers a real 40-minute MP3/M4A recording
-const VOICEOVER_UPLOAD_CONTENT_TYPES = {
+// Shared by "Upload My Own Voice" (below) and "Upload My Own Music" (see
+// POST /:id/upload-music further down) — both accept the real audio file as
+// a raw request body (never base64/JSON — a 30-40 minute recording would
+// push a JSON envelope well past any reasonable size), validated by its
+// real Content-Type against the three formats this app supports. A
+// per-route express.raw() limit is used instead of raising the global
+// express.json() limit (which stays a deliberately small 1mb for every
+// other route) — these are the only places in the app that genuinely need
+// to accept a large upload.
+const AUDIO_UPLOAD_MAX_BYTES = 60 * 1024 * 1024; // comfortably covers a real 40-minute MP3/M4A recording
+const AUDIO_UPLOAD_CONTENT_TYPES = {
   'audio/mpeg': 'mp3',
   'audio/mp3': 'mp3',
   'audio/wav': 'wav',
@@ -2857,7 +2863,7 @@ function formatSecondsAsDuration(seconds) {
 
 app.post(
   '/api/jobs/:id/upload-voiceover',
-  express.raw({ type: Object.keys(VOICEOVER_UPLOAD_CONTENT_TYPES), limit: VOICEOVER_UPLOAD_MAX_BYTES }),
+  express.raw({ type: Object.keys(AUDIO_UPLOAD_CONTENT_TYPES), limit: AUDIO_UPLOAD_MAX_BYTES }),
   async (req, res) => {
     const job = await jobStore.getJob(req.params.id);
     if (!job) {
@@ -2865,7 +2871,7 @@ app.post(
     }
 
     const contentType = (req.headers['content-type'] || '').split(';')[0].trim().toLowerCase();
-    const extension = VOICEOVER_UPLOAD_CONTENT_TYPES[contentType];
+    const extension = AUDIO_UPLOAD_CONTENT_TYPES[contentType];
     if (!extension) {
       return res.status(400).json({
         error: `Unsupported audio format "${contentType || 'unknown'}" — upload an MP3, WAV, or M4A file.`,
@@ -2941,6 +2947,67 @@ app.post(
       voiceSource: updatedJob.voiceSource,
     });
     res.json({ job: updatedJob, costEstimate });
+  }
+);
+
+// "Upload My Own Music" — the alternative to picking a track from the
+// shared local library (data/music/ — see backend/music-library.js), which
+// ships empty by default and so has nothing to pick from until the user
+// adds files to it themselves. This lets any job enable real background
+// music (see simple-story-video.js's own mixing, reused unchanged here)
+// without depending on that shared library being pre-populated. Sets
+// musicCustomUrl (which resolveJobMusicUrl already prefers over musicTrack)
+// and turns musicEnabled on — never generates or downloads any audio, only
+// stores the real bytes the user sent. musicTrack is cleared so a job never
+// carries a stale, no-longer-intended library selection alongside a fresh
+// upload. No duration/sync check is needed here (unlike voice-over): the
+// real narration duration is what music gets looped/trimmed to fit — see
+// prepareMusicTrack — regardless of how long or short the uploaded track is.
+app.post(
+  '/api/jobs/:id/upload-music',
+  express.raw({ type: Object.keys(AUDIO_UPLOAD_CONTENT_TYPES), limit: AUDIO_UPLOAD_MAX_BYTES }),
+  async (req, res) => {
+    const job = await jobStore.getJob(req.params.id);
+    if (!job) {
+      return res.status(404).json({ error: 'job not found' });
+    }
+
+    const contentType = (req.headers['content-type'] || '').split(';')[0].trim().toLowerCase();
+    const extension = AUDIO_UPLOAD_CONTENT_TYPES[contentType];
+    if (!extension) {
+      return res.status(400).json({
+        error: `Unsupported audio format "${contentType || 'unknown'}" — upload an MP3, WAV, or M4A file.`,
+      });
+    }
+    if (!Buffer.isBuffer(req.body) || req.body.length === 0) {
+      return res.status(400).json({
+        error: 'No audio data was received — make sure the file is sent as the raw request body.',
+      });
+    }
+
+    let url;
+    try {
+      url = await videoStorage.storeUploadedMusicFile(req.body, job.id, { extension, contentType });
+      // Read-only validation that this is a real, decodable audio file —
+      // mirrors upload-voiceover's own corrupt-file check — never persisted
+      // (music's own duration doesn't matter; see the module comment above).
+      await videoAssembly.getUrlMediaDurationSeconds(url);
+    } catch (error) {
+      console.error(
+        'Uploaded music track could not be stored/read:',
+        JSON.stringify({ name: error?.name, message: error?.message }, null, 2)
+      );
+      return res.status(400).json({
+        error: 'That file could not be read as a real audio file — make sure it is a valid, uncorrupted MP3, WAV, or M4A.',
+      });
+    }
+
+    const updatedJob = await jobStore.updateJob(job.id, {
+      musicEnabled: true,
+      musicCustomUrl: url,
+      musicTrack: null,
+    });
+    res.json({ job: updatedJob });
   }
 );
 
@@ -3238,6 +3305,8 @@ app.post('/api/jobs/story-to-video', async (req, res) => {
     textSize,
     showCaptions: body.showCaptions,
     voiceSpeed: body.voiceSpeed,
+    voiceVolumeDb: body.voiceVolumeDb,
+    musicVolumeDb: body.musicVolumeDb,
   });
 
   const job = await jobStore.createJob();
