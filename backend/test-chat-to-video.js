@@ -41,6 +41,7 @@ const path = require('path');
 const fs = require('fs');
 const http = require('http');
 const assert = require('assert');
+const costEstimation = require('./cost-estimation');
 
 const JOBS_FILE = path.resolve(__dirname, '..', 'data', 'jobs.json');
 const originalJobsFile = fs.existsSync(JOBS_FILE) ? fs.readFileSync(JOBS_FILE, 'utf8') : null;
@@ -545,6 +546,62 @@ async function main() {
 
     const persisted = await jobStore.getJob(job.id);
     assert.strictEqual(persisted.script, 'The pre-existing script that must remain untouched.');
+  });
+
+  await test('confirmVideoJob snapshots the cost estimate the user actually saw into approvedCostEstimate', async () => {
+    // Turn 1: the paste itself, producing the plan (no confirmVideoJob call
+    // — the backend hard-blocks it on this turn regardless).
+    claudeTurns = [
+      {
+        text: "Here's the plan for this script, including the estimated cost — please confirm.",
+        tools: [{ id: 't1', name: 'updateVideoJob', input: { videoMode: 'simple-story' } }],
+      },
+      { text: 'Understood.' },
+    ];
+    claudeCallIndex = 0;
+
+    const pasteRes = await fetch(`${baseUrl}/api/agent`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ message: LONG_PASTED_SCRIPT, conversationHistory: [], isScriptPaste: true }),
+    });
+    const pasteBody = await pasteRes.json();
+    assert.strictEqual(pasteRes.status, 200, JSON.stringify(pasteBody));
+
+    const beforeConfirm = await jobStore.getJob(pasteBody.jobId);
+    assert.strictEqual(beforeConfirm.approvedCostEstimate, null, 'must not be set before the user actually confirms');
+
+    // Turn 2: a separate, later message where the user explicitly confirms
+    // — this is the only turn allowed to actually call confirmVideoJob.
+    // Two mock responses: the tool call itself, then a plain closing reply
+    // with no tool use, ending the tool-use loop (mirrors the "saved
+    // verbatim BEFORE Claude is called" test above) — a single tool-only
+    // response would make the mock keep re-issuing the same tool call
+    // forever, since it always replays its last entry once exhausted.
+    claudeTurns = [
+      { text: 'Starting production now.', tools: [{ id: 't2', name: 'confirmVideoJob', input: {} }] },
+      { text: 'Production has started.' },
+    ];
+    claudeCallIndex = 0;
+
+    const confirmRes = await fetch(`${baseUrl}/api/agent`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ message: 'Yes, confirmed.', conversationHistory: [], jobId: pasteBody.jobId }),
+    });
+    assert.strictEqual(confirmRes.status, 200);
+
+    const persisted = await jobStore.getJob(pasteBody.jobId);
+    assert.strictEqual(persisted.confirmed, true);
+    assert.strictEqual(persisted.videoMode, 'simple-story');
+
+    const expected = costEstimation.estimateProductionCost({
+      script: LONG_PASTED_SCRIPT,
+      videoMode: 'simple-story',
+      generateYoutubePackage: persisted.generateYoutubePackage,
+    });
+    assert.ok(persisted.approvedCostEstimate, 'approvedCostEstimate must be set once confirmed');
+    assert.deepStrictEqual(persisted.approvedCostEstimate, expected);
   });
 
   httpServer.close();

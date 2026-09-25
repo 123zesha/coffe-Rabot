@@ -1036,6 +1036,58 @@
     renderYoutubePackageCard(job);
   }
 
+  // Budget guard: server.js's continueChatToVideoPipeline pauses production
+  // (status 'awaiting_reconfirmation') rather than silently spending past
+  // what the user approved, whenever the real narration turns out to cost
+  // meaningfully more than the estimate they confirmed — see
+  // job.budgetGuard. This shows that pause as a chat message with a real
+  // "Continue anyway" button that calls POST /reconfirm-budget directly (no
+  // LLM call), then resumes polling — the same "plain REST action, not a
+  // new chat turn" design as the rest of this pipeline.
+  // lastShownBudgetGuardSignature avoids re-adding the identical message on
+  // every subsequent poll/page-load while still paused on the same guard.
+  let lastShownBudgetGuardSignature = null;
+
+  function renderBudgetGuardPrompt(job) {
+    if (!job || !job.budgetGuard) {
+      return;
+    }
+    const signature = `${job.id}:${job.budgetGuard.reason}`;
+    if (signature === lastShownBudgetGuardSignature) {
+      return;
+    }
+    lastShownBudgetGuardSignature = signature;
+
+    const bubble = addMessage(job.budgetGuard.reason, 'bot');
+    bubble.appendChild(document.createElement('br'));
+
+    const continueBtn = document.createElement('button');
+    continueBtn.type = 'button';
+    continueBtn.className = 'btn btn-primary';
+    continueBtn.textContent = 'Continue anyway';
+    continueBtn.addEventListener('click', async () => {
+      continueBtn.disabled = true;
+      continueBtn.textContent = 'Continuing…';
+      try {
+        const res = await fetch(`/api/jobs/${job.id}/reconfirm-budget`, { method: 'POST' });
+        if (!res.ok) {
+          continueBtn.disabled = false;
+          continueBtn.textContent = 'Continue anyway';
+          return;
+        }
+        const updatedJob = await res.json();
+        continueBtn.remove();
+        addMessage('Continuing production at the updated estimate.', 'bot');
+        renderAllCards(updatedJob);
+        pollChatToVideoPipeline(updatedJob);
+      } catch (error) {
+        continueBtn.disabled = false;
+        continueBtn.textContent = 'Continue anyway';
+      }
+    });
+    bubble.appendChild(continueBtn);
+  }
+
   function pollChatToVideoPipeline(job) {
     if (!jobId || !job || !job.chatToVideoAutoPipeline || !job.confirmed || chatToVideoPollTimer) {
       return;
@@ -1065,6 +1117,11 @@
 
       if (result && result.job) {
         renderAllCards(result.job);
+      }
+
+      if (result && result.status === 'awaiting_reconfirmation') {
+        renderBudgetGuardPrompt(result.job);
+        return;
       }
 
       if (result && (result.status === 'in_progress' || result.status === 'waiting_for_confirmation')) {

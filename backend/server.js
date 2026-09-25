@@ -15,6 +15,7 @@ const youtubePackage = require('./youtube-package');
 const subtitlesGeneration = require('./subtitles-generation');
 const musicLibrary = require('./music-library');
 const simpleStoryVideo = require('./simple-story-video');
+const costEstimation = require('./cost-estimation');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -603,6 +604,21 @@ async function runGenerateVoiceover(job, jobId) {
 
   const updates = { voiceover };
   if (voiceover.status === 'completed') {
+    // Best-effort, local-only (zero paid cost): measures the real audio
+    // duration now that it genuinely exists, so the cost estimate's
+    // subtitles/transcription figure (billed per real audio minute) can be
+    // sharpened from the rougher script-length guess used before this
+    // point — see cost-estimation.js and the budget-guard check in
+    // continueChatToVideoPipeline below. A measurement failure here must
+    // never undo an already-successful, already-paid voice-over.
+    try {
+      updates.voiceover = {
+        ...voiceover,
+        durationSeconds: await videoAssembly.getUrlMediaDurationSeconds(voiceover.url),
+      };
+    } catch (error) {
+      console.error('Could not measure real voice-over duration for cost estimation:', error.message);
+    }
     updates.finalVideo = {
       url: null,
       status: 'pending',
@@ -848,6 +864,14 @@ async function runGenerateSubtitles(job, jobId, { forceRegenerate } = {}) {
 // (or, for the final video, still accurate — see isFinalVideoStillAccurate)
 // is skipped without a real call, so a paid step is never repeated once it
 // has genuinely succeeded.
+// How far a real, updated cost estimate is allowed to run over the figure
+// the user actually approved (see confirmVideoJob) before the auto-pipeline
+// pauses for reconfirmation instead of silently continuing to spend past
+// it — 1.2 allows a real 20% overrun (the script-length duration guess is
+// never exact), anything beyond that is a genuine budget change the user
+// should see and approve, not one the pipeline decides for them.
+const BUDGET_OVERRUN_TOLERANCE = 1.2;
+
 async function continueChatToVideoPipeline(jobId) {
   const job = await jobStore.getJob(jobId);
   if (!job) {
@@ -858,6 +882,13 @@ async function continueChatToVideoPipeline(jobId) {
   }
   if (!job.confirmed) {
     return { status: 'waiting_for_confirmation', job };
+  }
+  // A previous call already found the updated cost estimate ran over what
+  // was approved and paused here — stay paused (never re-check on every
+  // poll; the figure doesn't change again until a new paid step runs)
+  // until POST /api/jobs/:id/reconfirm-budget explicitly clears it.
+  if (job.budgetGuard) {
+    return { status: 'awaiting_reconfirmation', step: job.budgetGuard.step, job };
   }
 
   if (job.voiceover.status !== 'completed') {
@@ -890,6 +921,36 @@ async function continueChatToVideoPipeline(jobId) {
     if (blocker) {
       return { status: 'failed', step: 'subtitles', error: blocker, job };
     }
+
+    // Budget guard: subtitles/transcription bills on the voice-over's REAL
+    // audio minutes, now genuinely known (see runGenerateVoiceover's
+    // duration measurement) — a real, more accurate total can only be
+    // computed from this point on. approvedCostEstimate is only ever set
+    // once, at confirmVideoJob, so job.script/videoMode/generateYoutubePackage
+    // haven't changed since then; only the duration basis has sharpened.
+    if (job.approvedCostEstimate && job.voiceover.durationSeconds) {
+      const updatedEstimate = costEstimation.estimateProductionCost({
+        script: job.script,
+        videoMode: job.videoMode,
+        generateYoutubePackage: job.generateYoutubePackage,
+        realVoiceoverDurationSeconds: job.voiceover.durationSeconds,
+      });
+      if (updatedEstimate.totalUsd > job.approvedCostEstimate.totalUsd * BUDGET_OVERRUN_TOLERANCE) {
+        const budgetGuard = {
+          step: 'subtitles',
+          approvedUsd: job.approvedCostEstimate.totalUsd,
+          updatedEstimate,
+          reason:
+            `The real narration ran longer than planned, so the updated cost estimate ` +
+            `($${updatedEstimate.totalUsd}) is more than ${Math.round((BUDGET_OVERRUN_TOLERANCE - 1) * 100)}% over ` +
+            `what you approved ($${job.approvedCostEstimate.totalUsd}). Confirm to continue with subtitles and the ` +
+            `rest of production at the new estimate.`,
+        };
+        const updatedJob = await jobStore.updateJob(jobId, { budgetGuard });
+        return { status: 'awaiting_reconfirmation', step: 'subtitles', job: updatedJob };
+      }
+    }
+
     if (!process.env.OPENAI_API_KEY) {
       return {
         status: 'failed',
@@ -1040,6 +1101,19 @@ function summarizeJobForAgent(job) {
   }
 
   const summarized = { ...job };
+
+  // Live estimate (see cost-estimation.js) — always reflects the job's
+  // CURRENT script/mode/settings, distinct from approvedCostEstimate (a
+  // fixed snapshot taken only once, at confirmVideoJob). Computed fresh
+  // here rather than stored, so it can never go stale and never needs a
+  // dedicated tool call just to see it — the agent reads it straight off
+  // the job summary already sent every turn.
+  summarized.costEstimate = costEstimation.estimateProductionCost({
+    script: job.script,
+    videoMode: job.videoMode,
+    generateYoutubePackage: job.generateYoutubePackage,
+    realVoiceoverDurationSeconds: job.voiceover && job.voiceover.durationSeconds,
+  });
 
   if (Array.isArray(job.images)) {
     summarized.images = job.images.map(({ prompt, status, error }) => ({
@@ -1760,7 +1834,21 @@ async function executeTool(name, jobId, input) {
   }
 
   if (name === 'confirmVideoJob') {
-    const job = await jobStore.updateJob(jobId, { confirmed: true });
+    const currentJob = await jobStore.getJob(jobId);
+    // Snapshots the estimate the user actually saw and confirmed against —
+    // see cost-estimation.js and job-store.js's approvedCostEstimate. This
+    // is what a later real cost re-estimate (e.g. once the voice-over's
+    // real duration is known) is compared against by the budget guard in
+    // continueChatToVideoPipeline, so "the approved budget" always means
+    // exactly what was shown at the moment of this confirmation.
+    const approvedCostEstimate = currentJob
+      ? costEstimation.estimateProductionCost({
+          script: currentJob.script,
+          videoMode: currentJob.videoMode,
+          generateYoutubePackage: currentJob.generateYoutubePackage,
+        })
+      : null;
+    const job = await jobStore.updateJob(jobId, { confirmed: true, approvedCostEstimate });
     return JSON.stringify(job ? summarizeJobForAgent(job) : { error: 'job not found' });
   }
 
@@ -2815,10 +2903,13 @@ app.post('/api/jobs/:id/assemble-video', async (req, res) => {
 // YouTube package after the user's one confirmation needs no long-held HTTP
 // request and no further Claude calls. Always 200 with a `status` field
 // ('waiting_for_confirmation' | 'in_progress' | 'done' | 'failed' |
-// 'not_applicable') plus the current job — never a 4xx/5xx for an expected
-// pipeline state, since a poller needs to keep reading job state either
-// way; only a genuinely unknown job id or an unexpected exception is a real
-// HTTP error.
+// 'awaiting_reconfirmation' | 'not_applicable') plus the current job —
+// never a 4xx/5xx for an expected pipeline state, since a poller needs to
+// keep reading job state either way; only a genuinely unknown job id or an
+// unexpected exception is a real HTTP error. 'awaiting_reconfirmation'
+// means the budget guard paused production (see job.budgetGuard) — the
+// frontend stops auto-polling and shows job.budgetGuard.reason until
+// POST /api/jobs/:id/reconfirm-budget below is called.
 app.post('/api/jobs/:id/continue-pipeline', async (req, res) => {
   try {
     const result = await continueChatToVideoPipeline(req.params.id);
@@ -2833,6 +2924,28 @@ app.post('/api/jobs/:id/continue-pipeline', async (req, res) => {
     );
     res.status(502).json({ error: 'Continuing production failed unexpectedly.' });
   }
+});
+
+// Clears a pending budget-guard pause (see continueChatToVideoPipeline
+// above) by accepting the updated cost estimate as the new approved
+// budget, so the very next /continue-pipeline poll resumes production —
+// a plain REST call, never an LLM call, matching the rest of this
+// pipeline's "no chat turns needed" design. Refuses with a clear reason,
+// not a fabricated success, when there is nothing to reconfirm.
+app.post('/api/jobs/:id/reconfirm-budget', async (req, res) => {
+  const job = await jobStore.getJob(req.params.id);
+  if (!job) {
+    return res.status(404).json({ error: 'job not found' });
+  }
+  if (!job.budgetGuard) {
+    return res.status(400).json({ error: 'This job has no pending budget confirmation.' });
+  }
+
+  const updatedJob = await jobStore.updateJob(job.id, {
+    approvedCostEstimate: job.budgetGuard.updatedEstimate,
+    budgetGuard: null,
+  });
+  res.json(updatedJob);
 });
 
 app.post('/api/jobs/:id/advance', async (req, res) => {
