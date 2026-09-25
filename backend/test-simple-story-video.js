@@ -219,16 +219,21 @@ async function main() {
     assert.strictEqual(lines.length, 1, 'text well under the budget should not be wrapped at all');
   });
 
-  await test('fitCueText picks a smaller font and more lines for a long cue, never truncating it', () => {
+  await test('fitCueText wraps a long cue to at most 2 lines at the given fixed font size, never truncating it', () => {
     const longCue =
-      'This is a much longer sentence than the others, written to force the layout to fall back ' +
-      'to a smaller font size and more lines while still keeping every single word of the real narration.';
-    const { fontSize, lines } = ssv.fitCueText(longCue);
-    assert.ok(fontSize <= 72);
+      'This is a much longer sentence than the others, written to force the layout to wrap across ' +
+      'more than one line while still keeping every single word of the real narration.';
+    const { lines } = ssv.fitCueText(longCue, 70);
+    assert.ok(lines.length <= 2, `expected at most 2 lines, got ${lines.length}`);
     const rejoined = lines.join(' ');
     for (const word of longCue.split(' ')) {
       assert.ok(rejoined.includes(word.replace(/[.,]$/, '')), `expected "${word}" to survive fitCueText`);
     }
+  });
+
+  await test('fitCueText never wraps a short cue beyond 1 line', () => {
+    const { lines } = ssv.fitCueText('A short line.', 70);
+    assert.strictEqual(lines.length, 1);
   });
 
   await test('buildAssScript holds each cue\'s story text until the NEXT cue begins (never blanks during a pause)', () => {
@@ -749,8 +754,11 @@ async function main() {
     for (const input of [undefined, null, {}, 'not an object']) {
       assert.deepStrictEqual(ssv.normalizeVideoEditSettings(input), {
         backgroundColor: null,
+        backgroundPreset: null,
         storyPosition: null,
         fontWeight: null,
+        textSize: null,
+        showCaptions: true,
         subtitleFontScale: 1,
         subtitleColor: null,
         subtitleTimingOffsetMs: 0,
@@ -763,8 +771,11 @@ async function main() {
   await test('normalizeVideoEditSettings accepts valid values and lowercases hex colors', () => {
     const normalized = ssv.normalizeVideoEditSettings({
       backgroundColor: '1A2B3C',
+      backgroundPreset: 'warm',
       storyPosition: 'top',
       fontWeight: 'bold',
+      textSize: 'xl',
+      showCaptions: false,
       subtitleFontScale: 1.5,
       subtitleColor: 'FF0000',
       subtitleTimingOffsetMs: 250,
@@ -773,8 +784,11 @@ async function main() {
     });
     assert.deepStrictEqual(normalized, {
       backgroundColor: '1a2b3c',
+      backgroundPreset: 'warm',
       storyPosition: 'top',
       fontWeight: 'bold',
+      textSize: 'xl',
+      showCaptions: false,
       subtitleFontScale: 1.5,
       subtitleColor: 'ff0000',
       subtitleTimingOffsetMs: 250,
@@ -802,6 +816,54 @@ async function main() {
     assert.strictEqual(normalized.subtitleTimingOffsetMs, ssv.SUBTITLE_TIMING_OFFSET_MS_MIN);
     assert.strictEqual(normalized.voiceSpeed, ssv.VOICE_SPEED_MAX);
     assert.strictEqual(normalized.voiceVolumeDb, ssv.VOICE_VOLUME_DB_MIN);
+  });
+
+  await test('normalizeVideoEditSettings accepts real backgroundPreset/textSize values and rejects invalid ones', () => {
+    for (const preset of ssv.VALID_BACKGROUND_PRESETS) {
+      assert.strictEqual(ssv.normalizeVideoEditSettings({ backgroundPreset: preset }).backgroundPreset, preset);
+    }
+    assert.strictEqual(ssv.normalizeVideoEditSettings({ backgroundPreset: 'custom' }).backgroundPreset, null);
+    assert.strictEqual(ssv.normalizeVideoEditSettings({ backgroundPreset: 'neon' }).backgroundPreset, null);
+
+    for (const size of ssv.VALID_TEXT_SIZES) {
+      assert.strictEqual(ssv.normalizeVideoEditSettings({ textSize: size }).textSize, size);
+    }
+    assert.strictEqual(ssv.normalizeVideoEditSettings({ textSize: 'huge' }).textSize, null);
+
+    assert.strictEqual(ssv.normalizeVideoEditSettings({ showCaptions: false }).showCaptions, false);
+    assert.strictEqual(ssv.normalizeVideoEditSettings({ showCaptions: 'no' }).showCaptions, true, 'a non-boolean must fall back to the default (true)');
+  });
+
+  await test('resolveBackgroundColor: a named preset takes priority over a raw backgroundColor; otherwise falls back to custom color or the rotating palette', () => {
+    const warm = ssv.normalizeVideoEditSettings({ backgroundPreset: 'warm' });
+    assert.strictEqual(ssv.resolveBackgroundColor(warm, 0), ssv.BACKGROUND_PRESET_COLORS.warm);
+    assert.strictEqual(ssv.BACKGROUND_PRESET_COLORS.warm, 'f5ebd7');
+
+    const presetOverCustom = ssv.normalizeVideoEditSettings({ backgroundPreset: 'dark', backgroundColor: 'ff00ff' });
+    assert.strictEqual(ssv.resolveBackgroundColor(presetOverCustom, 0), ssv.BACKGROUND_PRESET_COLORS.dark);
+
+    const customOnly = ssv.normalizeVideoEditSettings({ backgroundColor: 'ff00ff' });
+    assert.strictEqual(ssv.resolveBackgroundColor(customOnly, 0), 'ff00ff');
+
+    const neither = ssv.normalizeVideoEditSettings({});
+    assert.ok(
+      ssv.HEX_COLOR_RE.test(ssv.resolveBackgroundColor(neither, 2)),
+      'must still fall back to a real color from the rotating palette when neither preset nor custom color is set'
+    );
+  });
+
+  await test('buildAssScript sizes the large story text from textSize, and omits Caption events entirely when showCaptions is false', () => {
+    const cues = ssv.parseSrt(FIXTURE_SRT);
+    const xl = ssv.normalizeVideoEditSettings({ textSize: 'xl' });
+    const assXl = ssv.buildAssScript(cues, 9, xl);
+    assert.ok(assXl.includes(`Style: Story,DejaVu Sans,${ssv.TEXT_SIZE_PX.xl},`), 'expected the Story style to use the xl font size');
+
+    const noCaptions = ssv.normalizeVideoEditSettings({ showCaptions: false });
+    const assNoCaptions = ssv.buildAssScript(cues, 9, noCaptions);
+    assert.ok(!assNoCaptions.includes(',Caption,'), 'no Caption dialogue events must be emitted when showCaptions is false');
+
+    const withCaptions = ssv.buildAssScript(cues, 9, ssv.normalizeVideoEditSettings({}));
+    assert.ok(withCaptions.includes(',Caption,'), 'Caption dialogue events must still be emitted by default');
   });
 
   await test('normalizeVideoEditSettings is pure — the same input always JSON-serializes identically', () => {

@@ -26,6 +26,40 @@
   const musicEnabledToggle = document.getElementById('music-enabled-toggle');
   const videoMusicTrackSelect = document.getElementById('video-music-track');
 
+  // --- Story to Video ---
+  const modeIdeaBtn = document.getElementById('mode-idea-btn');
+  const modeStoryBtn = document.getElementById('mode-story-btn');
+  const ideaModePanel = document.getElementById('idea-mode-panel');
+  const storyModePanel = document.getElementById('story-mode-panel');
+  const storyFormFields = document.getElementById('story-form-fields');
+  const storyScriptInput = document.getElementById('story-script');
+  const storyScriptWordcount = document.getElementById('story-script-wordcount');
+  const voiceSourceAiRadio = document.getElementById('voice-source-ai');
+  const voiceSourceUploadRadio = document.getElementById('voice-source-upload');
+  const aiVoiceOptions = document.getElementById('ai-voice-options');
+  const uploadVoiceOptions = document.getElementById('upload-voice-options');
+  const storyVoiceStyleSelect = document.getElementById('story-voice-style');
+  const storyVoiceSpeedSelect = document.getElementById('story-voice-speed');
+  const storyVoiceSpeedCustomInput = document.getElementById('story-voice-speed-custom');
+  const storyVoiceUploadInput = document.getElementById('story-voice-upload');
+  const storyVoiceUploadStatus = document.getElementById('story-voice-upload-status');
+  const storyBackgroundSelect = document.getElementById('story-background');
+  const storyBackgroundCustomInput = document.getElementById('story-background-custom');
+  const storyTextSizeSelect = document.getElementById('story-text-size');
+  const storyShowCaptionsToggle = document.getElementById('story-show-captions');
+  const storyDurationSelect = document.getElementById('story-duration');
+  const storyDurationCustomInput = document.getElementById('story-duration-custom');
+  const storyLanguageSelect = document.getElementById('story-language');
+  const storyYoutubePackageToggle = document.getElementById('story-youtube-package-toggle');
+  const storyReviewCostBtn = document.getElementById('story-review-cost-btn');
+  const storyCostReview = document.getElementById('story-cost-review');
+  const storyCostBreakdownList = document.getElementById('story-cost-breakdown-list');
+  const storyCostTotal = document.getElementById('story-cost-total');
+  const storyMaxBudgetInput = document.getElementById('story-max-budget');
+  const storyApproveBtn = document.getElementById('story-approve-btn');
+  const storyCancelReviewBtn = document.getElementById('story-cancel-review-btn');
+  const storyCostStatus = document.getElementById('story-cost-status');
+
   const youtubeThumbnailPlaceholder = document.getElementById('youtube-thumbnail-placeholder');
   const youtubeThumbnailPanel = document.getElementById('youtube-thumbnail-panel');
   const youtubeThumbnailImage = document.getElementById('youtube-thumbnail-image');
@@ -506,6 +540,237 @@
       refreshYoutubePackageCard();
       refreshSubtitlesCard();
       maybeStartChatToVideoPipeline();
+    }
+  });
+
+  // --- Story to Video ---
+  // A separate, chat-free creation flow from the idea-based form above: the
+  // user pastes an already-written script and picks settings directly on
+  // this page, with no Claude call needed at all (every setting is already
+  // explicit form input — see server.js's POST /api/jobs/story-to-video).
+  // Reuses the SAME jobId/pollChatToVideoPipeline machinery the idea-based
+  // flow and chat-pasted scripts already use, so Progress/Final Review and
+  // resumable polling all work identically regardless of which flow
+  // created the job.
+
+  function setStoryMode(showStory) {
+    modeIdeaBtn.classList.toggle('active', !showStory);
+    modeIdeaBtn.setAttribute('aria-selected', String(!showStory));
+    modeStoryBtn.classList.toggle('active', showStory);
+    modeStoryBtn.setAttribute('aria-selected', String(showStory));
+    ideaModePanel.hidden = showStory;
+    storyModePanel.hidden = !showStory;
+  }
+
+  modeIdeaBtn.addEventListener('click', () => setStoryMode(false));
+  modeStoryBtn.addEventListener('click', () => setStoryMode(true));
+
+  storyScriptInput.addEventListener('input', () => {
+    const words = storyScriptInput.value.trim().split(/\s+/).filter(Boolean);
+    storyScriptWordcount.textContent = `${words.length} word${words.length === 1 ? '' : 's'}`;
+  });
+
+  function updateVoiceSourceVisibility() {
+    const useUpload = voiceSourceUploadRadio.checked;
+    aiVoiceOptions.hidden = useUpload;
+    uploadVoiceOptions.hidden = !useUpload;
+  }
+  voiceSourceAiRadio.addEventListener('change', updateVoiceSourceVisibility);
+  voiceSourceUploadRadio.addEventListener('change', updateVoiceSourceVisibility);
+
+  storyVoiceSpeedSelect.addEventListener('change', () => {
+    storyVoiceSpeedCustomInput.hidden = storyVoiceSpeedSelect.value !== 'custom';
+  });
+
+  storyBackgroundSelect.addEventListener('change', () => {
+    storyBackgroundCustomInput.hidden = storyBackgroundSelect.value !== 'custom';
+  });
+
+  storyDurationSelect.addEventListener('change', () => {
+    storyDurationCustomInput.hidden = storyDurationSelect.value !== 'custom';
+  });
+
+  let storyUploadedFile = null;
+  storyVoiceUploadInput.addEventListener('change', () => {
+    storyUploadedFile = storyVoiceUploadInput.files && storyVoiceUploadInput.files[0] ? storyVoiceUploadInput.files[0] : null;
+    storyVoiceUploadStatus.textContent = storyUploadedFile
+      ? `Selected: ${storyUploadedFile.name} (${(storyUploadedFile.size / (1024 * 1024)).toFixed(1)}MB)`
+      : '';
+  });
+
+  function resolveStoryVoiceSpeed() {
+    if (storyVoiceSpeedSelect.value === 'custom') {
+      const value = Number(storyVoiceSpeedCustomInput.value);
+      return Number.isFinite(value) ? value : 1;
+    }
+    return Number(storyVoiceSpeedSelect.value) || 1;
+  }
+
+  function resolveStoryDuration() {
+    if (storyDurationSelect.value === 'custom') {
+      return storyDurationCustomInput.value.trim();
+    }
+    return storyDurationSelect.value;
+  }
+
+  // Maps a MIME type the browser reports for the selected file to the
+  // Content-Type the upload-voiceover route validates against — File.type
+  // is usually already one of these, but a couple of common
+  // browser/OS-dependent spellings for m4a are normalized here so a real
+  // audio file is never rejected just because of which browser picked it.
+  function normalizeAudioContentType(file) {
+    if (file.type) return file.type;
+    const lower = file.name.toLowerCase();
+    if (lower.endsWith('.mp3')) return 'audio/mpeg';
+    if (lower.endsWith('.wav')) return 'audio/wav';
+    if (lower.endsWith('.m4a')) return 'audio/mp4';
+    return 'application/octet-stream';
+  }
+
+  function setStoryCostStatus(text, type) {
+    storyCostStatus.textContent = text;
+    storyCostStatus.className = 'generate-status' + (type ? ' ' + type : '');
+    storyCostStatus.hidden = false;
+  }
+
+  function renderCostBreakdown(costEstimate) {
+    storyCostBreakdownList.innerHTML = '';
+    const rows = [
+      ['Voice-over (text-to-speech)', costEstimate.breakdown.voiceover],
+      ['Subtitles (transcription)', costEstimate.breakdown.subtitles],
+      ['Thumbnail', costEstimate.breakdown.thumbnail],
+      ['YouTube package text', costEstimate.breakdown.youtubePackageText],
+    ];
+    for (const [label, amount] of rows) {
+      const li = document.createElement('li');
+      const labelSpan = document.createElement('span');
+      labelSpan.textContent = label;
+      const amountSpan = document.createElement('span');
+      amountSpan.textContent = `$${amount.toFixed(4)}`;
+      li.appendChild(labelSpan);
+      li.appendChild(amountSpan);
+      storyCostBreakdownList.appendChild(li);
+    }
+    storyCostTotal.textContent = `Estimated total: $${costEstimate.totalUsd.toFixed(4)}`;
+  }
+
+  let storyJobId = null;
+
+  storyReviewCostBtn.addEventListener('click', async () => {
+    const script = storyScriptInput.value.trim();
+    if (!script) {
+      setStoryCostStatus('Please paste your complete script first.', 'error');
+      storyCostReview.hidden = false;
+      storyCostBreakdownList.innerHTML = '';
+      storyCostTotal.textContent = '';
+      return;
+    }
+    const useUpload = voiceSourceUploadRadio.checked;
+    if (useUpload && !storyUploadedFile) {
+      setStoryCostStatus('Please choose an audio file to upload first.', 'error');
+      storyCostReview.hidden = false;
+      return;
+    }
+
+    storyReviewCostBtn.disabled = true;
+    setStoryCostStatus('Preparing your production plan…', 'loading');
+    storyCostReview.hidden = false;
+
+    try {
+      const backgroundPreset = storyBackgroundSelect.value !== 'custom' ? storyBackgroundSelect.value : undefined;
+      const backgroundColor =
+        storyBackgroundSelect.value === 'custom' ? storyBackgroundCustomInput.value.replace('#', '') : undefined;
+
+      const createRes = await fetch('/api/jobs/story-to-video', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          script,
+          voiceSource: useUpload ? 'upload' : 'ai',
+          voiceStyle: storyVoiceStyleSelect.value,
+          voiceSpeed: resolveStoryVoiceSpeed(),
+          backgroundPreset,
+          backgroundColor,
+          textSize: storyTextSizeSelect.value,
+          showCaptions: storyShowCaptionsToggle.checked,
+          duration: resolveStoryDuration(),
+          language: storyLanguageSelect.value,
+          generateYoutubePackage: storyYoutubePackageToggle.checked,
+        }),
+      });
+      const createBody = await createRes.json();
+      if (!createRes.ok) {
+        setStoryCostStatus(createBody.error || 'Could not start this video job.', 'error');
+        return;
+      }
+
+      storyJobId = createBody.job.id;
+      let costEstimate = createBody.costEstimate;
+
+      if (useUpload) {
+        setStoryCostStatus('Uploading your narration audio…', 'loading');
+        const contentType = normalizeAudioContentType(storyUploadedFile);
+        const uploadRes = await fetch(
+          `/api/jobs/${storyJobId}/upload-voiceover?filename=${encodeURIComponent(storyUploadedFile.name)}`,
+          { method: 'POST', headers: { 'Content-Type': contentType }, body: storyUploadedFile }
+        );
+        const uploadBody = await uploadRes.json();
+        if (!uploadRes.ok) {
+          setStoryCostStatus(uploadBody.error || 'Could not upload that audio file.', 'error');
+          return;
+        }
+        costEstimate = uploadBody.costEstimate;
+        if (uploadBody.job.voiceover && uploadBody.job.voiceover.syncWarning) {
+          setStoryCostStatus(uploadBody.job.voiceover.syncWarning, 'error');
+        } else {
+          storyCostStatus.hidden = true;
+        }
+      } else {
+        storyCostStatus.hidden = true;
+      }
+
+      renderCostBreakdown(costEstimate);
+      storyFormFields.hidden = true;
+    } catch (error) {
+      setStoryCostStatus('Something went wrong preparing your production plan. Please try again.', 'error');
+    } finally {
+      storyReviewCostBtn.disabled = false;
+    }
+  });
+
+  storyCancelReviewBtn.addEventListener('click', () => {
+    storyCostReview.hidden = true;
+    storyFormFields.hidden = false;
+  });
+
+  storyApproveBtn.addEventListener('click', async () => {
+    if (!storyJobId) return;
+    storyApproveBtn.disabled = true;
+    setStoryCostStatus('Starting production…', 'loading');
+
+    try {
+      const maxBudgetRaw = storyMaxBudgetInput.value.trim();
+      const body = maxBudgetRaw ? { maxBudgetUsd: Number(maxBudgetRaw) } : {};
+      const res = await fetch(`/api/jobs/${storyJobId}/approve-and-start`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        setStoryCostStatus(data.error || 'Could not approve this job.', 'error');
+        return;
+      }
+
+      jobId = storyJobId;
+      storeJobId(jobId);
+      setStoryCostStatus('Approved — production is now running automatically. Watch progress on the Progress/Final Review tabs.', 'success');
+      renderAllCards(data);
+      maybeStartChatToVideoPipeline();
+    } catch (error) {
+      setStoryCostStatus('Something went wrong starting production. Please try again.', 'error');
+    } finally {
+      storyApproveBtn.disabled = false;
     }
   });
 

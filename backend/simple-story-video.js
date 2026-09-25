@@ -107,6 +107,40 @@ function backgroundColorForSection(sectionIndex) {
   return SECTION_BACKGROUND_COLORS[sectionIndex % SECTION_BACKGROUND_COLORS.length];
 }
 
+// Named background presets for the "Story to Video" flow — a fixed solid
+// color for EVERY section (like a custom backgroundColor), just chosen from
+// a name instead of a raw hex. 'warm' (a warm cream, #F5EBD7) is that flow's
+// own default; 'custom' isn't listed here on purpose — picking "Custom" in
+// the UI means sending a raw backgroundColor instead of a preset name (see
+// resolveBackgroundColor below), reusing that existing mechanism rather
+// than inventing a second custom-color pathway.
+const BACKGROUND_PRESET_COLORS = { warm: 'f5ebd7', white: 'ffffff', dark: '1e293b' };
+const VALID_BACKGROUND_PRESETS = Object.keys(BACKGROUND_PRESET_COLORS);
+
+// A backgroundPreset name takes priority over a raw backgroundColor when
+// both are somehow set — the UI only ever sends one or the other (a preset
+// name for Warm/White/Dark, a raw hex for Custom), but a preset name is the
+// more explicit signal if a caller ever sent both. Falls through to the
+// existing custom-hex-or-rotating-palette behavior unchanged otherwise, so
+// a job that never touches either of these two fields renders exactly as
+// before this feature existed.
+function resolveBackgroundColor(editSettings, sectionIndex) {
+  if (editSettings.backgroundPreset && BACKGROUND_PRESET_COLORS[editSettings.backgroundPreset]) {
+    return BACKGROUND_PRESET_COLORS[editSettings.backgroundPreset];
+  }
+  return editSettings.backgroundColor || backgroundColorForSection(sectionIndex);
+}
+
+// Large on-screen story text size tiers, in real px at this mode's fixed
+// 1080p canvas — the 68-72px range the "Story to Video" flow asks for.
+// Only the large story text uses this; the small bottom caption line keeps
+// its own separate, unrelated base size (captionFontSize in buildAssScript)
+// regardless of textSize, since making tiny captions huge was never asked
+// for. subtitleFontScale (below) still multiplies whichever of these is
+// chosen, so the two controls compose rather than conflict.
+const TEXT_SIZE_PX = { medium: 68, large: 70, xl: 72 };
+const VALID_TEXT_SIZES = Object.keys(TEXT_SIZE_PX);
+
 // --- Selective, local-only video editing (videoEditSettings) ---
 //
 // Lets a user request ONE targeted visual/audio change after a video
@@ -153,8 +187,11 @@ function normalizeVideoEditSettings(raw) {
   const input = raw && typeof raw === 'object' ? raw : {};
   return {
     backgroundColor: HEX_COLOR_RE.test(input.backgroundColor || '') ? input.backgroundColor.toLowerCase() : null,
+    backgroundPreset: VALID_BACKGROUND_PRESETS.includes(input.backgroundPreset) ? input.backgroundPreset : null,
     storyPosition: VALID_STORY_POSITIONS.includes(input.storyPosition) ? input.storyPosition : null,
     fontWeight: VALID_FONT_WEIGHTS.includes(input.fontWeight) ? input.fontWeight : null,
+    textSize: VALID_TEXT_SIZES.includes(input.textSize) ? input.textSize : null,
+    showCaptions: typeof input.showCaptions === 'boolean' ? input.showCaptions : true,
     subtitleFontScale: clampNumber(input.subtitleFontScale, SUBTITLE_FONT_SCALE_MIN, SUBTITLE_FONT_SCALE_MAX, 1),
     subtitleColor: HEX_COLOR_RE.test(input.subtitleColor || '') ? input.subtitleColor.toLowerCase() : null,
     subtitleTimingOffsetMs: clampNumber(
@@ -425,29 +462,18 @@ function wrapText(text, maxCharsPerLine, maxLines) {
   return lines;
 }
 
-// Picks a font size (trying large first) that keeps a cue's wrapped text to
-// a readable number of lines, and returns the wrapped lines alongside it.
-// Never fails — an unusually long single cue just ends up at the smallest
-// size with its lines merged, same honesty-over-truncation rule as
-// wrapText itself.
-function fitCueText(text) {
-  const candidates = [
-    { fontSize: 72, maxLines: 3 },
-    { fontSize: 56, maxLines: 4 },
-    { fontSize: 44, maxLines: 5 },
-  ];
-
-  for (const { fontSize, maxLines } of candidates) {
-    const maxCharsPerLine = Math.floor((SIMPLE_STORY_WIDTH * 0.82) / (fontSize * 0.56));
-    const lines = wrapText(text, maxCharsPerLine, maxLines);
-    if (lines.length <= maxLines) {
-      return { fontSize, lines };
-    }
-  }
-
-  const smallest = candidates[candidates.length - 1];
-  const maxCharsPerLine = Math.floor((SIMPLE_STORY_WIDTH * 0.82) / (smallest.fontSize * 0.56));
-  return { fontSize: smallest.fontSize, lines: wrapText(text, maxCharsPerLine, smallest.maxLines) };
+// Wraps one cue's text to at most 2 short lines at the given (fixed,
+// user-chosen — see TEXT_SIZE_PX) font size — "show only the currently
+// spoken sentence or one to two short lines" is implemented literally: the
+// size is never shrunk to cram in more lines (that would make on-screen
+// text visibly change size cue to cue, which is worse for a fixed reading
+// size than the occasional long cue running a bit wide). An unusually long
+// single cue still never loses text — wrapText merges any overflow onto the
+// 2nd line rather than dropping it, same honesty-over-truncation rule as
+// wrapText itself always had.
+function fitCueText(text, fontSize) {
+  const maxCharsPerLine = Math.floor((SIMPLE_STORY_WIDTH * 0.82) / (fontSize * 0.56));
+  return { lines: wrapText(text, maxCharsPerLine, 2) };
 }
 
 function secondsToAssTimestamp(seconds) {
@@ -491,11 +517,12 @@ function buildAssScript(cues, audioDuration, editSettings = {}) {
   const subtitleFontScale = editSettings.subtitleFontScale > 0 ? editSettings.subtitleFontScale : 1;
   const textColorAss = assColorFromHex(editSettings.subtitleColor);
 
+  const showCaptions = editSettings.showCaptions !== false;
   const storyBold = fontWeight === 'regular' ? 0 : 1;
   const captionBold = fontWeight === 'bold' ? 1 : 0;
   const storyAlignment = storyPosition === 'top' ? 8 : storyPosition === 'bottom' ? 2 : 5;
   const storyMarginV = storyPosition === 'center' ? 0 : 60;
-  const storyFontSize = Math.round(64 * subtitleFontScale);
+  const storyFontSize = Math.round((TEXT_SIZE_PX[editSettings.textSize] || 64) * subtitleFontScale);
   const captionFontSize = Math.round(30 * subtitleFontScale);
 
   const header =
@@ -515,7 +542,10 @@ function buildAssScript(cues, audioDuration, editSettings = {}) {
     `Style: Story,${FONT_FAMILY},${storyFontSize},${textColorAss},${textColorAss},&H00000000,&H99000000,${storyBold},0,0,0,100,100,0,0,3,0,4,${storyAlignment},120,120,${storyMarginV},1\n` +
     // Caption: small, always bottom-center (Alignment 2), plain outline (no
     // box) — the familiar closed-caption look, mirroring what
-    // burnInSubtitles already produces elsewhere in this app.
+    // burnInSubtitles already produces elsewhere in this app. Still
+    // declared even when showCaptions is off (an unused ASS style is
+    // harmless) — only the per-cue Caption events below are skipped, so
+    // toggling this back on later needs no other change.
     `Style: Caption,${FONT_FAMILY},${captionFontSize},${textColorAss},${textColorAss},&H00000000,&H00000000,${captionBold},0,0,0,100,100,0,0,1,2,0,2,40,40,48,1\n\n` +
     '[Events]\n' +
     'Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n';
@@ -525,15 +555,17 @@ function buildAssScript(cues, audioDuration, editSettings = {}) {
     const cue = cues[i];
     const nextCue = cues[i + 1];
     const storyEnd = nextCue ? nextCue.start : audioDuration;
-    const { lines: wrapped } = fitCueText(cue.text);
+    const { lines: wrapped } = fitCueText(cue.text, storyFontSize);
     const storyText = wrapped.map(escapeAssText).join('\\N');
 
     lines.push(
       `Dialogue: 0,${secondsToAssTimestamp(cue.start)},${secondsToAssTimestamp(Math.max(storyEnd, cue.start + 0.1))},Story,,0,0,0,,${storyText}`
     );
-    lines.push(
-      `Dialogue: 0,${secondsToAssTimestamp(cue.start)},${secondsToAssTimestamp(cue.end)},Caption,,0,0,0,,${escapeAssText(cue.text)}`
-    );
+    if (showCaptions) {
+      lines.push(
+        `Dialogue: 0,${secondsToAssTimestamp(cue.start)},${secondsToAssTimestamp(cue.end)},Caption,,0,0,0,,${escapeAssText(cue.text)}`
+      );
+    }
   }
 
   return header + lines.join('\n') + '\n';
@@ -581,7 +613,7 @@ function cuesForSection(cues, section) {
 async function renderSection(section, sectionIndex, workDir, sectionCues, effectiveDuration, editSettings = {}) {
   const duration = Math.max(0.5, effectiveDuration);
   const outPath = path.join(workDir, `section-${sectionIndex}.mp4`);
-  const color = editSettings.backgroundColor || backgroundColorForSection(sectionIndex);
+  const color = resolveBackgroundColor(editSettings, sectionIndex);
   const zoomingIn = sectionIndex % 2 === 0;
   const zoomExpr = zoomingIn ? 'min(zoom+0.0006,1.15)' : 'if(eq(on,0),1.15,max(zoom-0.0006,1.0))';
 
@@ -990,4 +1022,9 @@ module.exports = {
   VALID_STORY_POSITIONS,
   VALID_FONT_WEIGHTS,
   HEX_COLOR_RE,
+  BACKGROUND_PRESET_COLORS,
+  VALID_BACKGROUND_PRESETS,
+  TEXT_SIZE_PX,
+  VALID_TEXT_SIZES,
+  resolveBackgroundColor,
 };

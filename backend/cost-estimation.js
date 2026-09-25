@@ -37,15 +37,27 @@ function estimateSpeechDurationSeconds(scriptLength) {
 // subtitles/transcription estimate, which bills on real audio minutes; the
 // voiceover estimate itself is always driven by the script's own character
 // count, since that's what text-to-speech actually bills on.
-function estimateProductionCost({ script, videoMode, generateYoutubePackage, realVoiceoverDurationSeconds } = {}) {
+// voiceSource: 'ai' (default) or 'upload' — "Upload My Own Voice" (see
+// server.js's POST /:id/upload-voiceover) skips paid TTS entirely, so its
+// voiceover cost is always zero; subtitles/transcription still costs real
+// money either way, since Whisper transcribes whichever real audio exists
+// (generated or uploaded) to produce synchronized subtitles.
+function estimateProductionCost({
+  script,
+  videoMode,
+  generateYoutubePackage,
+  realVoiceoverDurationSeconds,
+  voiceSource,
+} = {}) {
   const scriptLength = typeof script === 'string' ? script.trim().length : 0;
   const hasRealDuration = typeof realVoiceoverDurationSeconds === 'number' && realVoiceoverDurationSeconds > 0;
   const estimatedDurationSeconds = hasRealDuration ? realVoiceoverDurationSeconds : estimateSpeechDurationSeconds(scriptLength);
   const estimatedMinutes = estimatedDurationSeconds / 60;
+  const usesUploadedVoice = voiceSource === 'upload';
 
   const breakdown = {
-    voiceover: scriptLength > 0 ? round4((scriptLength / 1000) * TTS_ESTIMATED_USD_PER_1K_CHARACTERS) : 0,
-    subtitles: scriptLength > 0 ? round4(estimatedMinutes * TRANSCRIPTION_ESTIMATED_USD_PER_MINUTE) : 0,
+    voiceover: scriptLength > 0 && !usesUploadedVoice ? round4((scriptLength / 1000) * TTS_ESTIMATED_USD_PER_1K_CHARACTERS) : 0,
+    subtitles: scriptLength > 0 || hasRealDuration ? round4(estimatedMinutes * TRANSCRIPTION_ESTIMATED_USD_PER_MINUTE) : 0,
     thumbnail: generateYoutubePackage ? (videoMode === 'simple-story' ? 0 : THUMBNAIL_IMAGE_ESTIMATED_USD) : 0,
     youtubePackageText: generateYoutubePackage ? YOUTUBE_PACKAGE_TEXT_ESTIMATED_USD : 0,
   };

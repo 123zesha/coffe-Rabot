@@ -70,10 +70,20 @@
       <div class="container">
         <h2>Create Your Video</h2>
         <p class="section-intro">
-          Describe your video and set a few preferences. The agent will use these details
-          to generate your video from start to finish.
+          Describe your video and set a few preferences, or paste a complete script you've already
+          written and drive the whole thing straight from this page.
         </p>
 
+        <div class="create-mode-toggle" role="tablist" aria-label="Video creation method">
+          <button type="button" id="mode-idea-btn" class="mode-toggle-btn active" role="tab" aria-selected="true">
+            💡 Describe an Idea
+          </button>
+          <button type="button" id="mode-story-btn" class="mode-toggle-btn" role="tab" aria-selected="false">
+            📝 Story to Video
+          </button>
+        </div>
+
+        <div id="idea-mode-panel">
         <div class="create-form">
           <div class="form-field form-field-wide">
             <label for="video-idea">Video topic or story idea</label>
@@ -204,6 +214,165 @@
         </div>
 
         <div id="generate-status" class="generate-status" hidden aria-live="polite"></div>
+        </div>
+
+        <div id="story-mode-panel" hidden>
+          <div id="story-form-fields" class="create-form">
+            <div class="form-field form-field-wide">
+              <label for="story-script">Paste Your Script</label>
+              <textarea id="story-script" rows="14" placeholder="Paste your complete script here — a ChatGPT-written story or narration, from a short 30-second piece up to a full 30-40 minute video, is fully supported. Your script is saved exactly as pasted — it is never rewritten or shortened."></textarea>
+              <p id="story-script-wordcount" class="field-hint">0 words</p>
+            </div>
+
+            <div class="form-field form-field-wide">
+              <label>Voice-over source</label>
+              <div class="radio-row">
+                <label class="radio-field">
+                  <input type="radio" name="story-voice-source" id="voice-source-ai" value="ai" checked>
+                  Generate AI Voice
+                </label>
+                <label class="radio-field">
+                  <input type="radio" name="story-voice-source" id="voice-source-upload" value="upload">
+                  Upload My Own Voice
+                </label>
+              </div>
+            </div>
+
+            <div id="ai-voice-options" class="form-field-wide story-subgroup">
+              <div class="form-field">
+                <label for="story-voice-style">Voice</label>
+                <select id="story-voice-style">
+                  <option value="male-warm">Male – Warm</option>
+                  <option value="male-energetic">Male – Energetic</option>
+                  <option value="female-warm">Female – Warm</option>
+                  <option value="female-professional" selected>Female – Professional</option>
+                  <option value="neutral-narrator">Neutral – Narrator</option>
+                </select>
+              </div>
+              <div class="form-field">
+                <label for="story-voice-speed">Speaking speed</label>
+                <select id="story-voice-speed">
+                  <option value="0.85">Slow</option>
+                  <option value="1" selected>Normal</option>
+                  <option value="1.15">Fast</option>
+                  <option value="custom">Custom…</option>
+                </select>
+                <input type="number" id="story-voice-speed-custom" min="0.5" max="2" step="0.05" value="1" hidden>
+              </div>
+              <p class="field-hint">
+                Natural, warm storytelling delivery. Generating this voice-over is a real, paid OpenAI
+                text-to-speech call — see the estimated cost before you approve production below.
+              </p>
+            </div>
+
+            <div id="upload-voice-options" class="form-field-wide story-subgroup" hidden>
+              <div class="form-field form-field-wide">
+                <label for="story-voice-upload">Upload narration audio (MP3, WAV, or M4A — up to about 40 minutes)</label>
+                <input type="file" id="story-voice-upload" accept=".mp3,.wav,.m4a,audio/mpeg,audio/wav,audio/x-wav,audio/wave,audio/mp4,audio/x-m4a">
+                <p id="story-voice-upload-status" class="field-hint"></p>
+              </div>
+              <p class="field-hint">
+                Skips paid text-to-speech entirely — your narration's real duration is measured, and
+                synchronized subtitles are generated directly from your own audio.
+              </p>
+            </div>
+
+            <div class="form-field">
+              <label for="story-background">Background</label>
+              <select id="story-background">
+                <option value="warm" selected>Warm Cream</option>
+                <option value="white">White</option>
+                <option value="dark">Dark</option>
+                <option value="custom">Custom Color…</option>
+              </select>
+              <input type="color" id="story-background-custom" value="#f5ebd7" hidden>
+            </div>
+
+            <div class="form-field">
+              <label for="story-text-size">On-screen text size</label>
+              <select id="story-text-size">
+                <option value="medium">Medium</option>
+                <option value="large" selected>Large</option>
+                <option value="xl">Extra Large</option>
+              </select>
+            </div>
+
+            <div class="form-field form-field-wide">
+              <label class="checkbox-field">
+                <input type="checkbox" id="story-show-captions" checked>
+                Also show subtle bottom captions alongside the large on-screen text
+              </label>
+              <p class="field-hint">Unchecking this shows the large story text only.</p>
+            </div>
+
+            <div class="form-field">
+              <label for="story-duration">Target duration</label>
+              <select id="story-duration">
+                <option value="">Auto (follows your script's real length)</option>
+                <option value="5-10">5 – 10 minutes</option>
+                <option value="10-15">10 – 15 minutes</option>
+                <option value="15-20">15 – 20 minutes</option>
+                <option value="20-30">20 – 30 minutes</option>
+                <option value="30-40">30 – 40 minutes</option>
+                <option value="custom">Custom…</option>
+              </select>
+              <input type="text" id="story-duration-custom" placeholder="e.g. 12 minutes" hidden>
+              <p class="field-hint">
+                For planning only — the real video length always follows your script's actual narration
+                length. Content is never repeated or the audio stretched just to hit a target.
+              </p>
+            </div>
+
+            <div class="form-field">
+              <label for="story-language">Language</label>
+              <select id="story-language">
+                <option value="">Select language</option>
+                <option value="English">English</option>
+                <option value="Spanish">Spanish</option>
+                <option value="French">French</option>
+                <option value="German">German</option>
+                <option value="Hindi">Hindi</option>
+                <option value="Arabic">Arabic</option>
+                <option value="Chinese">Chinese</option>
+                <option value="Japanese">Japanese</option>
+              </select>
+            </div>
+
+            <div class="form-field form-field-wide">
+              <label class="checkbox-field">
+                <input type="checkbox" id="story-youtube-package-toggle">
+                Generate YouTube Package (title, description, tags &amp; thumbnail) — optional
+              </label>
+              <p class="field-hint">
+                The thumbnail is created specifically for this video using a real local frame from your
+                finished video — Simple Story Video mode never calls a paid image-generation API for it.
+              </p>
+            </div>
+
+            <div class="form-field form-field-action">
+              <button type="button" id="story-review-cost-btn" class="btn btn-primary btn-generate">Review Cost</button>
+            </div>
+          </div>
+
+          <div id="story-cost-review" class="story-cost-review" hidden>
+            <h3>Production Plan &amp; Estimated Cost</h3>
+            <ul id="story-cost-breakdown-list" class="story-cost-breakdown-list"></ul>
+            <p id="story-cost-total" class="story-cost-total"></p>
+            <p class="field-hint">
+              This is an estimate using approximate provider rates — your real bill may differ slightly.
+              Uploaded narration always has zero AI voice-over cost.
+            </p>
+            <div class="form-field">
+              <label for="story-max-budget">Maximum budget in USD (optional)</label>
+              <input type="number" id="story-max-budget" min="0" step="0.01" placeholder="e.g. 1.00">
+            </div>
+            <div class="story-cost-actions">
+              <button type="button" id="story-approve-btn" class="btn btn-primary btn-generate">Approve &amp; Generate Video</button>
+              <button type="button" id="story-cancel-review-btn" class="btn">Back to Edit</button>
+            </div>
+            <p id="story-cost-status" class="generate-status" hidden aria-live="polite"></p>
+          </div>
+        </div>
       </div>
     </section>
 
