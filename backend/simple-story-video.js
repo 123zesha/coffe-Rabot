@@ -51,7 +51,14 @@ const os = require('os');
 const path = require('path');
 const { execFile } = require('child_process');
 
-const { ffmpegPath, getMediaDuration, verifyAssembledVideoBuffer } = require('./video-assembly');
+const {
+  ffmpegPath,
+  getMediaDuration,
+  verifyAssembledVideoBuffer,
+  prepareMusicTrack,
+  duckAndMixMusicWithVoiceover,
+  MUSIC_VOLUME_WITH_VOICEOVER,
+} = require('./video-assembly');
 const videoStorage = require('./video-storage');
 
 const FONTS_DIR = path.resolve(__dirname, '..', 'assets', 'fonts');
@@ -696,7 +703,22 @@ function freshRenderProgress(voiceoverUrl, subtitlesContent, editSettingsSnapsho
 // timeBudgetMs: optional override of RENDER_TIME_BUDGET_MS — exposed so
 // this module's own tests can force an early "still in progress" return
 // without needing a slow, multi-minute fixture.
+// musicUrl: optional, resolved by the caller (server.js, via
+// backend/music-library.js's resolveJobMusicUrl) from the job's
+// musicEnabled/musicTrack/musicCustomUrl settings — same shape/meaning as
+// video-assembly.js's own musicUrl parameter. Omitted/null (the default —
+// music is off unless a job explicitly enables it) leaves every existing
+// code path byte-for-byte unchanged. When given, it is mixed in using the
+// SAME local-ffmpeg helpers (prepareMusicTrack/duckAndMixMusicWithVoiceover)
+// video-assembly.js's own Runway pipeline uses, applied once at the very
+// end (after concatenation, before the final audio mux) — never per
+// section, since music has no effect on any individual section's own
+// rendered pixels and re-mixing it on every resumed call would be wasted
+// work. A voice-over always exists here (required above), so this always
+// ducks music under it — never the solo/no-voiceover branch
+// video-assembly.js has for its own optional narration.
 //
+
 // Returns one of:
 //   { status: 'completed', buffer, render } — the whole video is done.
 //     buffer is the raw assembled MP4 bytes (see video-assembly.js's own
@@ -719,6 +741,7 @@ async function continueSimpleStoryVideoAssembly({
   sectionTargetSeconds,
   timeBudgetMs,
   editSettings: rawEditSettings,
+  musicUrl,
 }) {
   if (!voiceover || voiceover.status !== 'completed' || !voiceover.url) {
     return { status: 'failed', error: 'A completed voice-over is required for Simple Story Video mode.', render: existingRender || null };
@@ -873,10 +896,30 @@ async function continueSimpleStoryVideoAssembly({
     await runFfmpeg(['-y', '-f', 'concat', '-safe', '0', '-i', listPath, '-c', 'copy', concatenatedPath]);
     log('sections concatenated');
 
+    // Optional background music (off by default — see musicUrl's own
+    // comment above) is mixed in HERE, once, after every section is done —
+    // never per section, since it has no effect on any section's own
+    // rendered pixels. Looped/trimmed to the real narration duration,
+    // faded in/out, and ducked under the voice-over via sidechaincompress —
+    // the exact same local-ffmpeg helpers video-assembly.js's own Runway
+    // pipeline uses, reused rather than reimplemented.
+    let audioForMuxPath = effectiveAudioPath;
+    if (musicUrl) {
+      const musicSourcePath = path.join(workDir, 'music-input');
+      await fetchAudioToFile(musicUrl, musicSourcePath);
+      const preparedMusicPath = path.join(workDir, 'music-prepared.m4a');
+      await prepareMusicTrack(musicSourcePath, audioDuration, MUSIC_VOLUME_WITH_VOICEOVER, preparedMusicPath);
+      const mixedAudioPath = path.join(workDir, 'audio-mixed.m4a');
+      await duckAndMixMusicWithVoiceover(preparedMusicPath, effectiveAudioPath, mixedAudioPath);
+      audioForMuxPath = mixedAudioPath;
+      log('background music mixed in');
+    }
+
     // Every section already has its own text burned in and already covers
     // the real audio duration (see above), so all that's left is muxing in
-    // the real narration audio — a plain stream copy of the already-final
-    // video (-c:v copy), never a re-encode.
+    // the real narration audio (or, when music is enabled, the mixed
+    // narration+music track above) — a plain stream copy of the
+    // already-final video (-c:v copy), never a re-encode.
     const finalPath = path.join(workDir, 'final.mp4');
 
     await runFfmpeg([
@@ -884,7 +927,7 @@ async function continueSimpleStoryVideoAssembly({
       '-i',
       concatenatedPath,
       '-i',
-      effectiveAudioPath,
+      audioForMuxPath,
       '-map',
       '0:v',
       '-map',

@@ -120,6 +120,18 @@ function makeToneAudio(dir, seconds, label) {
   );
 }
 
+// A locally SYNTHESIZED tone at a different, distinguishable frequency from
+// makeToneAudio's own "narration" tone — never downloaded or real
+// copyrighted music — standing in for a background-music input, the exact
+// same convention test-video-assembly.js's own makeMusic uses for the
+// Runway pipeline's music tests.
+function makeMusicTone(dir, seconds, label) {
+  const outPath = path.join(dir, `music-${seconds}-${label || ++toneAudioCounter}.mp3`);
+  return runFfmpeg(['-y', '-f', 'lavfi', '-i', `sine=frequency=330:duration=${seconds}`, '-c:a', 'libmp3lame', outPath]).then(
+    () => outPath
+  );
+}
+
 // Builds a real, longer .srt fixture (real timestamps, real sequential
 // cues) to simulate a production-length story without ever generating a
 // real production-length video — used only for the end-to-end resumability
@@ -1070,6 +1082,86 @@ async function main() {
       first.render.sections.map((s) => s.url),
       'identical editSettings must never trigger a wasted re-render'
     );
+  });
+
+  // --- Background music (optional musicUrl parameter) ---
+  // Every OTHER test in this file omits musicUrl entirely and still passes,
+  // proving music-off (the default) is byte-for-byte unaffected. The actual
+  // audio DSP (looping/trimming, fade in/out, ducking under narration) is
+  // NOT re-verified here — prepareMusicTrack/duckAndMixMusicWithVoiceover
+  // are the exact same functions test-video-assembly.js already exhaustively
+  // tests for the Runway pipeline, reused rather than reimplemented. These
+  // tests only prove the WIRING into this module: a real mixed track is
+  // produced, resumed sections are never wastefully re-rendered just to add
+  // music, and a bad music source fails clearly rather than silently.
+
+  await test('continueSimpleStoryVideoAssembly mixes in real background music when musicUrl is given, matching the real narration duration', async () => {
+    const audioPath = await makeToneAudio(workDir, 4, 'music-basic-narration');
+    const musicPath = await makeMusicTone(workDir, 4, 'music-basic-track');
+
+    const result = await ssv.continueSimpleStoryVideoAssembly({
+      voiceover: { status: 'completed', url: audioPath },
+      subtitlesContent: FIXTURE_SRT,
+      existingRender: null,
+      jobId: 'test-job-music-basic',
+      musicUrl: musicPath,
+    });
+    assert.strictEqual(result.status, 'completed', result.error);
+
+    const outPath = path.join(workDir, 'output-music-basic.mp4');
+    fs.writeFileSync(outPath, result.buffer);
+    const probed = await probe(outPath);
+    assert.ok(
+      Math.abs(probed.duration - 4) < 0.5,
+      `expected the video to still match the real ~4s narration duration with music mixed in, got ${probed.duration}`
+    );
+  });
+
+  await test('continueSimpleStoryVideoAssembly reuses already-completed sections instead of re-rendering when music is added on a later call', async () => {
+    const audioPath = await makeToneAudio(workDir, 4, 'music-resume-narration');
+    const musicPath = await makeMusicTone(workDir, 4, 'music-resume-track');
+
+    const withoutMusic = await ssv.continueSimpleStoryVideoAssembly({
+      voiceover: { status: 'completed', url: audioPath },
+      subtitlesContent: FIXTURE_SRT,
+      existingRender: null,
+      jobId: 'test-job-music-resume',
+    });
+    assert.strictEqual(withoutMusic.status, 'completed', withoutMusic.error);
+    const urlsWithoutMusic = withoutMusic.render.sections.map((s) => s.url);
+
+    // Same exact voice-over/subtitles/editSettings — only musicUrl newly
+    // added, exactly like a job whose finalVideo is invalidated purely by
+    // turning musicEnabled on (see server.js's isFinalVideoStillAccurate).
+    // Music has no effect on any section's own rendered pixels, so this
+    // must reuse every section unchanged rather than paying to re-render
+    // them all just to add an audio-only change.
+    const withMusic = await ssv.continueSimpleStoryVideoAssembly({
+      voiceover: { status: 'completed', url: audioPath },
+      subtitlesContent: FIXTURE_SRT,
+      existingRender: withoutMusic.render,
+      jobId: 'test-job-music-resume',
+      musicUrl: musicPath,
+    });
+    assert.strictEqual(withMusic.status, 'completed', withMusic.error);
+    const urlsWithMusic = withMusic.render.sections.map((s) => s.url);
+
+    assert.deepStrictEqual(urlsWithMusic, urlsWithoutMusic, 'adding music must never trigger a wasted section re-render');
+  });
+
+  await test('continueSimpleStoryVideoAssembly fails clearly, never silently, when musicUrl points at a missing/corrupt file', async () => {
+    const audioPath = await makeToneAudio(workDir, 4, 'music-bad-source-narration');
+    const missingMusicPath = path.join(workDir, 'no-such-music-file.mp3');
+
+    const result = await ssv.continueSimpleStoryVideoAssembly({
+      voiceover: { status: 'completed', url: audioPath },
+      subtitlesContent: FIXTURE_SRT,
+      existingRender: null,
+      jobId: 'test-job-music-bad-source',
+      musicUrl: missingMusicPath,
+    });
+    assert.strictEqual(result.status, 'failed');
+    assert.ok(result.error, 'a missing/corrupt music file must produce a real, non-empty error, never a silently music-less success');
   });
 
   fs.rmSync(workDir, { recursive: true, force: true });

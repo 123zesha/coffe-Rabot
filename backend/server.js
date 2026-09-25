@@ -247,11 +247,14 @@ async function assembleAndStoreFinalVideo(
 ) {
   // Simple Story Video mode: an entirely separate, local-ffmpeg-only
   // pipeline (backend/simple-story-video.js) — no scene clips, no Runway
-  // healing, no music/resolution tier (that pipeline is always fixed
-  // 1080p/16:9 with no music, per its own module comment). subtitlesUsed
-  // still records the real subtitles content actually burned in — the same
-  // "was this reassembled since a real change" bookkeeping role it has for
-  // the Runway pipeline below.
+  // healing, and always fixed 1080p/16:9 (resolutionTier never applies to
+  // it). Background music, however, IS supported here, mixed in by that
+  // module itself using the same local-ffmpeg helpers the Runway pipeline
+  // below uses — resolved the same way (musicLibrary.resolveJobMusicUrl)
+  // and gated behind the same musicEnabled setting, off by default.
+  // subtitlesUsed still records the real subtitles content actually burned
+  // in — the same "was this reassembled since a real change" bookkeeping
+  // role it has for the Runway pipeline below.
   //
   // A real 15-20 minute story's full render (16+ real sections) can take
   // longer than one serverless function invocation safely allows — see
@@ -266,12 +269,37 @@ async function assembleAndStoreFinalVideo(
   // agent purely to advance a mechanical render with nothing left to
   // reason about.
   if (desiredVideoModeUsed === 'simple-story') {
+    // Resolving a job's music settings to a real local file can fail (an
+    // unknown musicTrack, or a library file the user removed after
+    // selecting it) — caught here, exactly like the Runway pipeline below,
+    // so it reads as a clear assembly failure with an actionable message,
+    // never an unhandled exception or a silently music-less video.
+    let musicUrl;
+    try {
+      musicUrl = musicLibrary.resolveJobMusicUrl(job);
+    } catch (error) {
+      return {
+        finalVideo: {
+          url: null,
+          status: 'failed',
+          subtitlesUsed: null,
+          musicUsed: null,
+          resolutionUsed: null,
+          videoModeUsed: null,
+          editSettingsUsed: null,
+          error: error.message,
+        },
+        simpleStoryRender: job.simpleStoryRender,
+      };
+    }
+
     const assembly = await simpleStoryVideo.continueSimpleStoryVideoAssembly({
       voiceover: job.voiceover,
       subtitlesContent: job.subtitles && job.subtitles.status === 'completed' ? job.subtitles.content : null,
       existingRender: job.simpleStoryRender,
       jobId,
       editSettings: job.videoEditSettings,
+      musicUrl,
     });
 
     if (assembly.status === 'in_progress') {
@@ -313,7 +341,7 @@ async function assembleAndStoreFinalVideo(
           url,
           status: 'completed',
           subtitlesUsed: job.subtitles.content,
-          musicUsed: null,
+          musicUsed: desiredMusicUsed,
           resolutionUsed: null,
           videoModeUsed: 'simple-story',
           editSettingsUsed: simpleStoryVideo.normalizeVideoEditSettings(job.videoEditSettings),
@@ -503,13 +531,18 @@ function isFinalVideoStillAccurate(job) {
   if (desiredVideoModeUsed === 'simple-story') {
     // Simple Story Video mode always uses subtitles as its on-screen text
     // source (not conditional on burnInSubtitles — see findFinalVideoBlocker)
-    // and never applies music/resolutionTier (that pipeline is always fixed
-    // 1080p/16:9 with no music — see simple-story-video.js). Checking those
-    // here would force a pointless reassembly on every check, since this
-    // pipeline never sets musicUsed/resolutionUsed to anything but null.
+    // and never applies resolutionTier (that pipeline is always fixed
+    // 1080p/16:9 — see simple-story-video.js). Background music DOES apply
+    // here (see assembleAndStoreFinalVideo above), so — unlike
+    // resolutionUsed below — musicUsed must still be checked, exactly like
+    // the Runway pipeline's own check further down.
     const desiredSubtitlesContent =
       job.subtitles && job.subtitles.status === 'completed' ? job.subtitles.content : null;
     if ((job.finalVideo.subtitlesUsed || null) !== desiredSubtitlesContent) {
+      return false;
+    }
+    const desiredMusicUsed = computeDesiredMusicUsed(job);
+    if (JSON.stringify(job.finalVideo.musicUsed || null) !== JSON.stringify(desiredMusicUsed)) {
       return false;
     }
     // A real videoEditSettings change (background color, subtitle

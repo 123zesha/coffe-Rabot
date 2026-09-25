@@ -340,6 +340,20 @@
 
             <div class="form-field form-field-wide">
               <label class="checkbox-field">
+                <input type="checkbox" id="story-music-enabled-toggle">
+                Add background music — optional, off by default
+              </label>
+              <p class="field-hint">
+                Mixed in quietly under the narration using only a local audio track — never downloaded or
+                generated. Requires a track in the local music library below.
+              </p>
+              <select id="story-music-track" disabled>
+                <option value="">No local music tracks available</option>
+              </select>
+            </div>
+
+            <div class="form-field form-field-wide">
+              <label class="checkbox-field">
                 <input type="checkbox" id="story-youtube-package-toggle">
                 Generate YouTube Package (title, description, tags &amp; thumbnail) — optional
               </label>

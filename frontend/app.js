@@ -50,6 +50,8 @@
   const storyDurationSelect = document.getElementById('story-duration');
   const storyDurationCustomInput = document.getElementById('story-duration-custom');
   const storyLanguageSelect = document.getElementById('story-language');
+  const storyMusicEnabledToggle = document.getElementById('story-music-enabled-toggle');
+  const storyMusicTrackSelect = document.getElementById('story-music-track');
   const storyYoutubePackageToggle = document.getElementById('story-youtube-package-toggle');
   const storyReviewCostBtn = document.getElementById('story-review-cost-btn');
   const storyCostReview = document.getElementById('story-cost-review');
@@ -353,18 +355,24 @@
       const tracks = Array.isArray(options.musicTrackOptions) ? options.musicTrackOptions : [];
 
       if (tracks.length > 0) {
-        videoMusicTrackSelect.innerHTML = '';
-        for (const track of tracks) {
-          const optionEl = document.createElement('option');
-          optionEl.value = track.value;
-          optionEl.textContent = track.label;
-          videoMusicTrackSelect.appendChild(optionEl);
+        for (const select of [videoMusicTrackSelect, storyMusicTrackSelect]) {
+          select.innerHTML = '';
+          for (const track of tracks) {
+            const optionEl = document.createElement('option');
+            optionEl.value = track.value;
+            optionEl.textContent = track.label;
+            select.appendChild(optionEl);
+          }
         }
         videoMusicTrackSelect.disabled = !musicEnabledToggle.checked;
         musicEnabledToggle.disabled = false;
+        storyMusicTrackSelect.disabled = !storyMusicEnabledToggle.checked;
+        storyMusicEnabledToggle.disabled = false;
       } else {
         musicEnabledToggle.disabled = true;
         musicEnabledToggle.checked = false;
+        storyMusicEnabledToggle.disabled = true;
+        storyMusicEnabledToggle.checked = false;
       }
     } catch (error) {
       // No local video-options available (offline dev, etc.) — leave the
@@ -374,6 +382,10 @@
 
   musicEnabledToggle.addEventListener('change', () => {
     videoMusicTrackSelect.disabled = !musicEnabledToggle.checked;
+  });
+
+  storyMusicEnabledToggle.addEventListener('change', () => {
+    storyMusicTrackSelect.disabled = !storyMusicEnabledToggle.checked;
   });
 
   function setGenerateStatus(text, type) {
@@ -695,6 +707,8 @@
           showCaptions: storyShowCaptionsToggle.checked,
           duration: resolveStoryDuration(),
           language: storyLanguageSelect.value,
+          musicEnabled: storyMusicEnabledToggle.checked && Boolean(storyMusicTrackSelect.value),
+          musicTrack: storyMusicTrackSelect.value || undefined,
           generateYoutubePackage: storyYoutubePackageToggle.checked,
         }),
       });
