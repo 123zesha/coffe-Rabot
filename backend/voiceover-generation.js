@@ -11,8 +11,13 @@
 // selected `voice`) and the chunking/concatenation pipeline are unaffected;
 // only the OpenAI TTS `instructions`/`speed` parameters change.
 
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
+const { execFile } = require('child_process');
 const OpenAI = require('openai');
 const videoStorage = require('./video-storage');
+const { ffmpegPath } = require('./video-assembly');
 
 // gpt-4o-mini-tts is OpenAI's current general-purpose TTS model (verified
 // against the OpenAI API docs/SDK type definitions at integration time).
@@ -162,6 +167,72 @@ function resolveVoiceDirection({ storyStyle, videoMode, topic }) {
   return { instructions: parts.join(' '), speed };
 }
 
+function runFfmpeg(args) {
+  return new Promise((resolve, reject) => {
+    execFile(ffmpegPath, args, { maxBuffer: 1024 * 1024 * 64 }, (error, stdout, stderr) => {
+      if (error) {
+        const detail = (stderr || '').toString().trim().slice(-2000);
+        reject(new Error(detail || error.message));
+        return;
+      }
+      resolve();
+    });
+  });
+}
+
+// OpenAI's TTS API returns each chunk as its own COMPLETE, independent MP3
+// file (its own header and, per the MP3 format's own encoder-priming
+// convention, a small amount of silence at the very start/end). Gluing
+// those independent files together with a raw byte concatenation (what
+// this function replaces) leaves every later chunk's own file header sitting
+// mid-stream as if it were audio data, and the player/decoder has to guess
+// frame boundaries across each seam — this is exactly the "invalid
+// concatenated file" shape ffmpeg itself flags, and in practice it can
+// produce short garbled/dropout artifacts right at each chunk boundary
+// (audible as an unnatural warble or "hollow" moment every ~30-60s in a
+// long narration, i.e. every time the script crossed a 4096-character
+// chunk boundary). Decoding each chunk to real audio samples first, then
+// joining those samples and encoding the result ONCE, produces one genuine,
+// gapless audio stream with no embedded headers in the middle — never a new
+// TTS call, purely local ffmpeg processing on audio OpenAI already
+// generated and this app already paid for.
+async function concatenateAudioChunks(buffers) {
+  if (buffers.length === 1) {
+    return buffers[0];
+  }
+
+  const workDir = fs.mkdtempSync(path.join(os.tmpdir(), 'voiceover-concat-'));
+  try {
+    const wavPaths = [];
+    for (let i = 0; i < buffers.length; i++) {
+      const chunkPath = path.join(workDir, `chunk-${i}.mp3`);
+      const wavPath = path.join(workDir, `chunk-${i}.wav`);
+      fs.writeFileSync(chunkPath, buffers[i]);
+      await runFfmpeg(['-y', '-i', chunkPath, wavPath]);
+      wavPaths.push(wavPath);
+    }
+
+    const outPath = path.join(workDir, 'concatenated.mp3');
+    const inputArgs = wavPaths.flatMap((wavPath) => ['-i', wavPath]);
+    const filterInputs = wavPaths.map((_, i) => `[${i}:a]`).join('');
+    await runFfmpeg([
+      '-y',
+      ...inputArgs,
+      '-filter_complex',
+      `${filterInputs}concat=n=${wavPaths.length}:v=0:a=1[out]`,
+      '-map',
+      '[out]',
+      '-c:a',
+      'libmp3lame',
+      outPath,
+    ]);
+
+    return fs.readFileSync(outPath);
+  } finally {
+    fs.rmSync(workDir, { recursive: true, force: true });
+  }
+}
+
 let cachedClient = null;
 
 function getClient() {
@@ -256,7 +327,7 @@ async function generateVoiceover({ script, voiceStyle, jobId, storyStyle, videoM
       })
     );
 
-    const audioBuffer = Buffer.concat(buffers);
+    const audioBuffer = await concatenateAudioChunks(buffers);
     if (audioBuffer.length === 0) {
       throw new Error('OpenAI did not return audio data.');
     }
@@ -275,4 +346,4 @@ async function generateVoiceover({ script, voiceStyle, jobId, storyStyle, videoM
   }
 }
 
-module.exports = { generateVoiceover, resolveVoiceDirection, TTS_MODEL };
+module.exports = { generateVoiceover, resolveVoiceDirection, concatenateAudioChunks, TTS_MODEL };
