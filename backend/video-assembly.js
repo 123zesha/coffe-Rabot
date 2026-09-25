@@ -674,6 +674,14 @@ module.exports = {
   getUrlMediaDurationSeconds,
   verifyAssembledVideoBuffer,
   extractThumbnailFrame,
+  // Exported so backend/simple-story-video.js's own final assembly step can
+  // mix in background music using the EXACT same local-ffmpeg logic as this
+  // module's own Runway pipeline (loop/trim/fade, then duck under the
+  // voice-over) — one real implementation of "mix music under narration",
+  // never a second copy of the same ffmpeg filter chain.
+  prepareMusicTrack,
+  duckAndMixMusicWithVoiceover,
+  MUSIC_VOLUME_WITH_VOICEOVER,
   ffmpegPath,
   OUTPUT_DIMENSIONS_BY_FORMAT,
   OUTPUT_DIMENSIONS_BY_FORMAT_AND_TIER,

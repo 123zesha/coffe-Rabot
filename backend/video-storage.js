@@ -116,6 +116,26 @@ async function storeAudioFile(buffer, jobId, options) {
   return storeMediaFile(buffer, `voiceover-${jobId}`, { ...options, extension: 'mp3', contentType: 'audio/mpeg' });
 }
 
+// Stores a user-UPLOADED narration recording's real bytes for one job (the
+// "Upload My Own Voice" path — see server.js's POST /:id/upload-voiceover).
+// Unlike storeAudioFile above (always OpenAI TTS's own mp3 output), the
+// real uploaded format varies (mp3/wav/m4a), so extension/contentType are
+// passed through as given rather than hardcoded — the caller has already
+// validated them against the real Content-Type the browser sent.
+async function storeUploadedVoiceoverFile(buffer, jobId, { extension, contentType }) {
+  return storeMediaFile(buffer, `uploaded-voiceover-${jobId}`, { extension, contentType });
+}
+
+// Stores a user-UPLOADED background-music track's real bytes for one job
+// (see server.js's POST /:id/upload-music) — the same "extension/contentType
+// passed through, not hardcoded" reasoning as storeUploadedVoiceoverFile
+// above, since a real uploaded music file's format also varies (mp3/wav/
+// m4a). The resulting url is stored on job.musicCustomUrl, resolved by
+// backend/music-library.js exactly like any other musicCustomUrl.
+async function storeUploadedMusicFile(buffer, jobId, { extension, contentType }) {
+  return storeMediaFile(buffer, `uploaded-music-${jobId}`, { extension, contentType });
+}
+
 // Stores one generated scene/thumbnail image's real PNG bytes for one job.
 // See this module's own top comment for why job.images[].url can no longer
 // safely embed images directly as data: URIs once enough scenes (or one
@@ -131,6 +151,8 @@ module.exports = {
   storeSceneClip,
   storeSimpleStorySectionClip,
   storeAudioFile,
+  storeUploadedVoiceoverFile,
+  storeUploadedMusicFile,
   storeImageFile,
   hasBlobToken,
   GENERATED_DIR,

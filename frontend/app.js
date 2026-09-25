@@ -26,6 +26,54 @@
   const musicEnabledToggle = document.getElementById('music-enabled-toggle');
   const videoMusicTrackSelect = document.getElementById('video-music-track');
 
+  // --- Story to Video ---
+  const modeIdeaBtn = document.getElementById('mode-idea-btn');
+  const modeStoryBtn = document.getElementById('mode-story-btn');
+  const ideaModePanel = document.getElementById('idea-mode-panel');
+  const storyModePanel = document.getElementById('story-mode-panel');
+  const storyFormFields = document.getElementById('story-form-fields');
+  const storyScriptInput = document.getElementById('story-script');
+  const storyScriptWordcount = document.getElementById('story-script-wordcount');
+  const voiceSourceAiRadio = document.getElementById('voice-source-ai');
+  const voiceSourceUploadRadio = document.getElementById('voice-source-upload');
+  const aiVoiceOptions = document.getElementById('ai-voice-options');
+  const uploadVoiceOptions = document.getElementById('upload-voice-options');
+  const storyVoiceStyleSelect = document.getElementById('story-voice-style');
+  const storyVoiceSpeedSelect = document.getElementById('story-voice-speed');
+  const storyVoiceSpeedCustomInput = document.getElementById('story-voice-speed-custom');
+  const storyVoiceUploadInput = document.getElementById('story-voice-upload');
+  const storyVoiceUploadStatus = document.getElementById('story-voice-upload-status');
+  const storyBackgroundSelect = document.getElementById('story-background');
+  const storyBackgroundCustomInput = document.getElementById('story-background-custom');
+  const storyTextSizeSelect = document.getElementById('story-text-size');
+  const storyShowCaptionsToggle = document.getElementById('story-show-captions');
+  const storyDurationSelect = document.getElementById('story-duration');
+  const storyDurationCustomInput = document.getElementById('story-duration-custom');
+  const storyLanguageSelect = document.getElementById('story-language');
+  const storyMusicEnabledToggle = document.getElementById('story-music-enabled-toggle');
+  const storyMusicOptions = document.getElementById('story-music-options');
+  const musicSourceUploadRadio = document.getElementById('music-source-upload');
+  const musicSourceLibraryRadio = document.getElementById('music-source-library');
+  const musicUploadOptions = document.getElementById('music-upload-options');
+  const musicLibraryOptions = document.getElementById('music-library-options');
+  const storyMusicUploadInput = document.getElementById('story-music-upload');
+  const storyMusicUploadStatus = document.getElementById('story-music-upload-status');
+  const storyMusicTrackSelect = document.getElementById('story-music-track');
+  const storyMusicVolumeInput = document.getElementById('story-music-volume');
+  const storyMusicVolumeValue = document.getElementById('story-music-volume-value');
+  const storyNarrationVolumeInput = document.getElementById('story-narration-volume');
+  const storyNarrationVolumeValue = document.getElementById('story-narration-volume-value');
+  const storyYoutubePackageToggle = document.getElementById('story-youtube-package-toggle');
+  const storyReviewCostBtn = document.getElementById('story-review-cost-btn');
+  const storyCostReview = document.getElementById('story-cost-review');
+  const storySettingsSummaryList = document.getElementById('story-settings-summary-list');
+  const storyCostBreakdownList = document.getElementById('story-cost-breakdown-list');
+  const storyCostTotal = document.getElementById('story-cost-total');
+  const storyMaxBudgetInput = document.getElementById('story-max-budget');
+  const storyApproveBtn = document.getElementById('story-approve-btn');
+  const storyCancelReviewBtn = document.getElementById('story-cancel-review-btn');
+  const storyCostStatus = document.getElementById('story-cost-status');
+
   const youtubeThumbnailPlaceholder = document.getElementById('youtube-thumbnail-placeholder');
   const youtubeThumbnailPanel = document.getElementById('youtube-thumbnail-panel');
   const youtubeThumbnailImage = document.getElementById('youtube-thumbnail-image');
@@ -308,29 +356,41 @@
   // Populates the local music-track picker from the same user-maintained
   // library (data/music/manifest.json, via GET /api/video-options) the
   // Agent's getVideoOptions tool uses — this app never bundles, downloads,
-  // or generates music, so the list is often empty; the select/checkbox
-  // stay disabled/off in that case rather than offering a track that
-  // doesn't exist.
+  // or generates music, so the list is often empty. The idea-mode (Create
+  // Video) music toggle only offers this library, so it stays disabled/off
+  // when the library is empty, exactly as before. The Story-to-Video music
+  // section ALSO offers uploading a real music file directly (see
+  // storyMusicUploadInput below), which never depends on this shared
+  // library being populated — so ONLY its "Choose From Library" radio/
+  // select is disabled here when the library is empty; the Enable
+  // Background Music checkbox itself is never disabled.
+  let hasLibraryTracks = false;
   (async () => {
     try {
       const res = await fetch('/api/video-options');
       if (!res.ok) return;
       const options = await res.json();
       const tracks = Array.isArray(options.musicTrackOptions) ? options.musicTrackOptions : [];
+      hasLibraryTracks = tracks.length > 0;
 
-      if (tracks.length > 0) {
-        videoMusicTrackSelect.innerHTML = '';
-        for (const track of tracks) {
-          const optionEl = document.createElement('option');
-          optionEl.value = track.value;
-          optionEl.textContent = track.label;
-          videoMusicTrackSelect.appendChild(optionEl);
+      if (hasLibraryTracks) {
+        for (const select of [videoMusicTrackSelect, storyMusicTrackSelect]) {
+          select.innerHTML = '';
+          for (const track of tracks) {
+            const optionEl = document.createElement('option');
+            optionEl.value = track.value;
+            optionEl.textContent = track.label;
+            select.appendChild(optionEl);
+          }
         }
         videoMusicTrackSelect.disabled = !musicEnabledToggle.checked;
         musicEnabledToggle.disabled = false;
+        storyMusicTrackSelect.disabled = !musicSourceLibraryRadio.checked;
+        musicSourceLibraryRadio.disabled = false;
       } else {
         musicEnabledToggle.disabled = true;
         musicEnabledToggle.checked = false;
+        musicSourceLibraryRadio.disabled = true;
       }
     } catch (error) {
       // No local video-options available (offline dev, etc.) — leave the
@@ -340,6 +400,39 @@
 
   musicEnabledToggle.addEventListener('change', () => {
     videoMusicTrackSelect.disabled = !musicEnabledToggle.checked;
+  });
+
+  storyMusicEnabledToggle.addEventListener('change', () => {
+    storyMusicOptions.hidden = !storyMusicEnabledToggle.checked;
+  });
+
+  function updateMusicSourceVisibility() {
+    const useLibrary = musicSourceLibraryRadio.checked;
+    musicUploadOptions.hidden = useLibrary;
+    musicLibraryOptions.hidden = !useLibrary;
+    storyMusicTrackSelect.disabled = !useLibrary || !hasLibraryTracks;
+  }
+  musicSourceUploadRadio.addEventListener('change', updateMusicSourceVisibility);
+  musicSourceLibraryRadio.addEventListener('change', updateMusicSourceVisibility);
+
+  let storyMusicFile = null;
+  storyMusicUploadInput.addEventListener('change', () => {
+    storyMusicFile = storyMusicUploadInput.files && storyMusicUploadInput.files[0] ? storyMusicUploadInput.files[0] : null;
+    storyMusicUploadStatus.textContent = storyMusicFile
+      ? `Selected: ${storyMusicFile.name} (${(storyMusicFile.size / (1024 * 1024)).toFixed(1)}MB)`
+      : '';
+  });
+
+  function formatVolumeDb(value) {
+    const num = Number(value);
+    if (num === 0) return 'Default';
+    return num > 0 ? `+${num} dB` : `${num} dB`;
+  }
+  storyMusicVolumeInput.addEventListener('input', () => {
+    storyMusicVolumeValue.textContent = formatVolumeDb(storyMusicVolumeInput.value);
+  });
+  storyNarrationVolumeInput.addEventListener('input', () => {
+    storyNarrationVolumeValue.textContent = formatVolumeDb(storyNarrationVolumeInput.value);
   });
 
   function setGenerateStatus(text, type) {
@@ -506,6 +599,305 @@
       refreshYoutubePackageCard();
       refreshSubtitlesCard();
       maybeStartChatToVideoPipeline();
+    }
+  });
+
+  // --- Story to Video ---
+  // A separate, chat-free creation flow from the idea-based form above: the
+  // user pastes an already-written script and picks settings directly on
+  // this page, with no Claude call needed at all (every setting is already
+  // explicit form input — see server.js's POST /api/jobs/story-to-video).
+  // Reuses the SAME jobId/pollChatToVideoPipeline machinery the idea-based
+  // flow and chat-pasted scripts already use, so Progress/Final Review and
+  // resumable polling all work identically regardless of which flow
+  // created the job.
+
+  function setStoryMode(showStory) {
+    modeIdeaBtn.classList.toggle('active', !showStory);
+    modeIdeaBtn.setAttribute('aria-selected', String(!showStory));
+    modeStoryBtn.classList.toggle('active', showStory);
+    modeStoryBtn.setAttribute('aria-selected', String(showStory));
+    ideaModePanel.hidden = showStory;
+    storyModePanel.hidden = !showStory;
+  }
+
+  modeIdeaBtn.addEventListener('click', () => setStoryMode(false));
+  modeStoryBtn.addEventListener('click', () => setStoryMode(true));
+
+  storyScriptInput.addEventListener('input', () => {
+    const words = storyScriptInput.value.trim().split(/\s+/).filter(Boolean);
+    storyScriptWordcount.textContent = `${words.length} word${words.length === 1 ? '' : 's'}`;
+  });
+
+  function updateVoiceSourceVisibility() {
+    const useUpload = voiceSourceUploadRadio.checked;
+    aiVoiceOptions.hidden = useUpload;
+    uploadVoiceOptions.hidden = !useUpload;
+  }
+  voiceSourceAiRadio.addEventListener('change', updateVoiceSourceVisibility);
+  voiceSourceUploadRadio.addEventListener('change', updateVoiceSourceVisibility);
+
+  storyVoiceSpeedSelect.addEventListener('change', () => {
+    storyVoiceSpeedCustomInput.hidden = storyVoiceSpeedSelect.value !== 'custom';
+  });
+
+  storyBackgroundSelect.addEventListener('change', () => {
+    storyBackgroundCustomInput.hidden = storyBackgroundSelect.value !== 'custom';
+  });
+
+  storyDurationSelect.addEventListener('change', () => {
+    storyDurationCustomInput.hidden = storyDurationSelect.value !== 'custom';
+  });
+
+  let storyUploadedFile = null;
+  storyVoiceUploadInput.addEventListener('change', () => {
+    storyUploadedFile = storyVoiceUploadInput.files && storyVoiceUploadInput.files[0] ? storyVoiceUploadInput.files[0] : null;
+    storyVoiceUploadStatus.textContent = storyUploadedFile
+      ? `Selected: ${storyUploadedFile.name} (${(storyUploadedFile.size / (1024 * 1024)).toFixed(1)}MB)`
+      : '';
+  });
+
+  function resolveStoryVoiceSpeed() {
+    if (storyVoiceSpeedSelect.value === 'custom') {
+      const value = Number(storyVoiceSpeedCustomInput.value);
+      return Number.isFinite(value) ? value : 1;
+    }
+    return Number(storyVoiceSpeedSelect.value) || 1;
+  }
+
+  function resolveStoryDuration() {
+    if (storyDurationSelect.value === 'custom') {
+      return storyDurationCustomInput.value.trim();
+    }
+    return storyDurationSelect.value;
+  }
+
+  // Maps a MIME type the browser reports for the selected file to the
+  // Content-Type the upload-voiceover route validates against — File.type
+  // is usually already one of these, but a couple of common
+  // browser/OS-dependent spellings for m4a are normalized here so a real
+  // audio file is never rejected just because of which browser picked it.
+  function normalizeAudioContentType(file) {
+    if (file.type) return file.type;
+    const lower = file.name.toLowerCase();
+    if (lower.endsWith('.mp3')) return 'audio/mpeg';
+    if (lower.endsWith('.wav')) return 'audio/wav';
+    if (lower.endsWith('.m4a')) return 'audio/mp4';
+    return 'application/octet-stream';
+  }
+
+  function setStoryCostStatus(text, type) {
+    storyCostStatus.textContent = text;
+    storyCostStatus.className = 'generate-status' + (type ? ' ' + type : '');
+    storyCostStatus.hidden = false;
+  }
+
+  function renderCostBreakdown(costEstimate) {
+    storyCostBreakdownList.innerHTML = '';
+    const rows = [
+      ['Voice-over (text-to-speech)', costEstimate.breakdown.voiceover],
+      ['Subtitles (transcription)', costEstimate.breakdown.subtitles],
+      ['Thumbnail', costEstimate.breakdown.thumbnail],
+      ['YouTube package text', costEstimate.breakdown.youtubePackageText],
+    ];
+    for (const [label, amount] of rows) {
+      const li = document.createElement('li');
+      const labelSpan = document.createElement('span');
+      labelSpan.textContent = label;
+      const amountSpan = document.createElement('span');
+      amountSpan.textContent = `$${amount.toFixed(4)}`;
+      li.appendChild(labelSpan);
+      li.appendChild(amountSpan);
+      storyCostBreakdownList.appendChild(li);
+    }
+    storyCostTotal.textContent = `Estimated total: $${costEstimate.totalUsd.toFixed(4)}`;
+  }
+
+  // Shows exactly what was selected — never a cost line, since background
+  // music is always free (a local file, never a paid API) — so the user can
+  // confirm their choice before approving production. Reads the just-
+  // uploaded/selected values still held client-side rather than round-
+  // tripping the job record for them.
+  function addSummaryRow(label, value) {
+    const li = document.createElement('li');
+    const labelSpan = document.createElement('span');
+    labelSpan.textContent = label;
+    const valueSpan = document.createElement('span');
+    valueSpan.textContent = value;
+    li.appendChild(labelSpan);
+    li.appendChild(valueSpan);
+    storySettingsSummaryList.appendChild(li);
+  }
+
+  function renderMusicSummary() {
+    storySettingsSummaryList.innerHTML = '';
+    if (!storyMusicEnabledToggle.checked) {
+      addSummaryRow('Background music', 'Off');
+      return;
+    }
+    const usingLibrary = musicSourceLibraryRadio.checked;
+    const source = usingLibrary
+      ? `Library — ${storyMusicTrackSelect.selectedOptions[0] ? storyMusicTrackSelect.selectedOptions[0].textContent : 'none selected'}`
+      : `Uploaded — ${storyMusicFile ? storyMusicFile.name : 'none selected'}`;
+    addSummaryRow('Background music', 'On');
+    addSummaryRow('Music source', source);
+    addSummaryRow('Music volume', formatVolumeDb(storyMusicVolumeInput.value));
+    addSummaryRow('Narration volume', formatVolumeDb(storyNarrationVolumeInput.value));
+  }
+
+  let storyJobId = null;
+
+  storyReviewCostBtn.addEventListener('click', async () => {
+    const script = storyScriptInput.value.trim();
+    if (!script) {
+      setStoryCostStatus('Please paste your complete script first.', 'error');
+      storyCostReview.hidden = false;
+      storyCostBreakdownList.innerHTML = '';
+      storyCostTotal.textContent = '';
+      return;
+    }
+    const useUpload = voiceSourceUploadRadio.checked;
+    if (useUpload && !storyUploadedFile) {
+      setStoryCostStatus('Please choose an audio file to upload first.', 'error');
+      storyCostReview.hidden = false;
+      return;
+    }
+    const musicEnabled = storyMusicEnabledToggle.checked;
+    const useMusicUpload = musicEnabled && musicSourceUploadRadio.checked;
+    const useMusicLibrary = musicEnabled && musicSourceLibraryRadio.checked;
+    if (useMusicUpload && !storyMusicFile) {
+      setStoryCostStatus('Please choose a music file to upload first.', 'error');
+      storyCostReview.hidden = false;
+      return;
+    }
+    if (useMusicLibrary && !storyMusicTrackSelect.value) {
+      setStoryCostStatus('Please choose a music track from the library, or switch to uploading your own file.', 'error');
+      storyCostReview.hidden = false;
+      return;
+    }
+
+    storyReviewCostBtn.disabled = true;
+    setStoryCostStatus('Preparing your production plan…', 'loading');
+    storyCostReview.hidden = false;
+
+    try {
+      const backgroundPreset = storyBackgroundSelect.value !== 'custom' ? storyBackgroundSelect.value : undefined;
+      const backgroundColor =
+        storyBackgroundSelect.value === 'custom' ? storyBackgroundCustomInput.value.replace('#', '') : undefined;
+
+      const createRes = await fetch('/api/jobs/story-to-video', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          script,
+          voiceSource: useUpload ? 'upload' : 'ai',
+          voiceStyle: storyVoiceStyleSelect.value,
+          voiceSpeed: resolveStoryVoiceSpeed(),
+          backgroundPreset,
+          backgroundColor,
+          textSize: storyTextSizeSelect.value,
+          showCaptions: storyShowCaptionsToggle.checked,
+          duration: resolveStoryDuration(),
+          language: storyLanguageSelect.value,
+          voiceVolumeDb: Number(storyNarrationVolumeInput.value) || 0,
+          musicVolumeDb: Number(storyMusicVolumeInput.value) || 0,
+          musicEnabled,
+          musicTrack: useMusicLibrary ? storyMusicTrackSelect.value : undefined,
+          generateYoutubePackage: storyYoutubePackageToggle.checked,
+        }),
+      });
+      const createBody = await createRes.json();
+      if (!createRes.ok) {
+        setStoryCostStatus(createBody.error || 'Could not start this video job.', 'error');
+        return;
+      }
+
+      storyJobId = createBody.job.id;
+      let costEstimate = createBody.costEstimate;
+      let warning = null;
+
+      if (useUpload) {
+        setStoryCostStatus('Uploading your narration audio…', 'loading');
+        const contentType = normalizeAudioContentType(storyUploadedFile);
+        const uploadRes = await fetch(
+          `/api/jobs/${storyJobId}/upload-voiceover?filename=${encodeURIComponent(storyUploadedFile.name)}`,
+          { method: 'POST', headers: { 'Content-Type': contentType }, body: storyUploadedFile }
+        );
+        const uploadBody = await uploadRes.json();
+        if (!uploadRes.ok) {
+          setStoryCostStatus(uploadBody.error || 'Could not upload that audio file.', 'error');
+          return;
+        }
+        costEstimate = uploadBody.costEstimate;
+        if (uploadBody.job.voiceover && uploadBody.job.voiceover.syncWarning) {
+          warning = uploadBody.job.voiceover.syncWarning;
+        }
+      }
+
+      if (useMusicUpload) {
+        setStoryCostStatus('Uploading your background music…', 'loading');
+        const musicContentType = normalizeAudioContentType(storyMusicFile);
+        const musicUploadRes = await fetch(`/api/jobs/${storyJobId}/upload-music`, {
+          method: 'POST',
+          headers: { 'Content-Type': musicContentType },
+          body: storyMusicFile,
+        });
+        const musicUploadBody = await musicUploadRes.json();
+        if (!musicUploadRes.ok) {
+          setStoryCostStatus(musicUploadBody.error || 'Could not upload that music file.', 'error');
+          return;
+        }
+      }
+
+      if (warning) {
+        setStoryCostStatus(warning, 'error');
+      } else {
+        storyCostStatus.hidden = true;
+      }
+
+      renderCostBreakdown(costEstimate);
+      renderMusicSummary();
+      storyFormFields.hidden = true;
+    } catch (error) {
+      setStoryCostStatus('Something went wrong preparing your production plan. Please try again.', 'error');
+    } finally {
+      storyReviewCostBtn.disabled = false;
+    }
+  });
+
+  storyCancelReviewBtn.addEventListener('click', () => {
+    storyCostReview.hidden = true;
+    storyFormFields.hidden = false;
+  });
+
+  storyApproveBtn.addEventListener('click', async () => {
+    if (!storyJobId) return;
+    storyApproveBtn.disabled = true;
+    setStoryCostStatus('Starting production…', 'loading');
+
+    try {
+      const maxBudgetRaw = storyMaxBudgetInput.value.trim();
+      const body = maxBudgetRaw ? { maxBudgetUsd: Number(maxBudgetRaw) } : {};
+      const res = await fetch(`/api/jobs/${storyJobId}/approve-and-start`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        setStoryCostStatus(data.error || 'Could not approve this job.', 'error');
+        return;
+      }
+
+      jobId = storyJobId;
+      storeJobId(jobId);
+      setStoryCostStatus('Approved — production is now running automatically. Watch progress on the Progress/Final Review tabs.', 'success');
+      renderAllCards(data);
+      maybeStartChatToVideoPipeline();
+    } catch (error) {
+      setStoryCostStatus('Something went wrong starting production. Please try again.', 'error');
+    } finally {
+      storyApproveBtn.disabled = false;
     }
   });
 

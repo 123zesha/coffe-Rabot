@@ -153,13 +153,13 @@ The final export's resolutionTier defaults to 720p. If the user asks for 1080p o
 
 ## Background Music (Optional)
 
-Applies to **cinematic** mode only — a **simple-story** job does not support background music in this version; musicEnabled has no effect on it.
+Applies to **both cinematic and simple-story** modes. A **simple-story** job is still always fixed at 1080p/16:9 (resolutionTier never applies to it), but background music mixing now does.
 
 The final video can optionally have background music mixed in — off by default. This never downloads or generates music: it only mixes in a real local audio file, either a track from the local library (getVideoOptions' musicTrackOptions — may legitimately be empty if the user hasn't added any tracks yet) or a one-off track the user directly supplies (musicCustomUrl).
 
 - To turn music on, call updateVideoJob with musicEnabled: true and either musicTrack (a value from musicTrackOptions) or musicCustomUrl. Never invent or assume a track that isn't actually listed in musicTrackOptions.
 - If musicTrackOptions is empty and the user has no musicCustomUrl to give, tell them plainly that no local music tracks are currently available (see data/music/README.md) rather than pretending one exists.
-- assembleFinalVideo applies the actual mixing (looping/trimming the track to the video's length, fading it in/out, and ducking it quietly under the voice-over — or playing it at a fuller standalone level if there is no voice-over). It refuses with a clear error, rather than silently skipping music, if the selected track can't actually be read.
+- assembleFinalVideo applies the actual mixing (looping/trimming the track to the video's length, fading it in/out, and ducking it quietly under the voice-over — a simple-story job always has one, so its music is always ducked, never played at the standalone level a voice-over-less cinematic job would use). It refuses with a clear error, rather than silently skipping music, if the selected track can't actually be read.
 - Turning musicEnabled on/off, or changing musicTrack/musicCustomUrl, after a final video already exists means the next assembleFinalVideo call re-assembles for real to keep it in sync — still no paid API call, so there is never a cost reason to skip this.
 - Only tell the user music was added if assembleFinalVideo actually reports the final video completed with it enabled — report a failure honestly instead of assuming success.
 - Never invent, guess, or describe a video/thumbnail/image/audio file, URL, or download link that was not actually returned by a tool.

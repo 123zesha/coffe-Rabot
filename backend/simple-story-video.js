@@ -51,7 +51,14 @@ const os = require('os');
 const path = require('path');
 const { execFile } = require('child_process');
 
-const { ffmpegPath, getMediaDuration, verifyAssembledVideoBuffer } = require('./video-assembly');
+const {
+  ffmpegPath,
+  getMediaDuration,
+  verifyAssembledVideoBuffer,
+  prepareMusicTrack,
+  duckAndMixMusicWithVoiceover,
+  MUSIC_VOLUME_WITH_VOICEOVER,
+} = require('./video-assembly');
 const videoStorage = require('./video-storage');
 
 const FONTS_DIR = path.resolve(__dirname, '..', 'assets', 'fonts');
@@ -107,6 +114,40 @@ function backgroundColorForSection(sectionIndex) {
   return SECTION_BACKGROUND_COLORS[sectionIndex % SECTION_BACKGROUND_COLORS.length];
 }
 
+// Named background presets for the "Story to Video" flow — a fixed solid
+// color for EVERY section (like a custom backgroundColor), just chosen from
+// a name instead of a raw hex. 'warm' (a warm cream, #F5EBD7) is that flow's
+// own default; 'custom' isn't listed here on purpose — picking "Custom" in
+// the UI means sending a raw backgroundColor instead of a preset name (see
+// resolveBackgroundColor below), reusing that existing mechanism rather
+// than inventing a second custom-color pathway.
+const BACKGROUND_PRESET_COLORS = { warm: 'f5ebd7', white: 'ffffff', dark: '1e293b' };
+const VALID_BACKGROUND_PRESETS = Object.keys(BACKGROUND_PRESET_COLORS);
+
+// A backgroundPreset name takes priority over a raw backgroundColor when
+// both are somehow set — the UI only ever sends one or the other (a preset
+// name for Warm/White/Dark, a raw hex for Custom), but a preset name is the
+// more explicit signal if a caller ever sent both. Falls through to the
+// existing custom-hex-or-rotating-palette behavior unchanged otherwise, so
+// a job that never touches either of these two fields renders exactly as
+// before this feature existed.
+function resolveBackgroundColor(editSettings, sectionIndex) {
+  if (editSettings.backgroundPreset && BACKGROUND_PRESET_COLORS[editSettings.backgroundPreset]) {
+    return BACKGROUND_PRESET_COLORS[editSettings.backgroundPreset];
+  }
+  return editSettings.backgroundColor || backgroundColorForSection(sectionIndex);
+}
+
+// Large on-screen story text size tiers, in real px at this mode's fixed
+// 1080p canvas — the 68-72px range the "Story to Video" flow asks for.
+// Only the large story text uses this; the small bottom caption line keeps
+// its own separate, unrelated base size (captionFontSize in buildAssScript)
+// regardless of textSize, since making tiny captions huge was never asked
+// for. subtitleFontScale (below) still multiplies whichever of these is
+// chosen, so the two controls compose rather than conflict.
+const TEXT_SIZE_PX = { medium: 68, large: 70, xl: 72 };
+const VALID_TEXT_SIZES = Object.keys(TEXT_SIZE_PX);
+
 // --- Selective, local-only video editing (videoEditSettings) ---
 //
 // Lets a user request ONE targeted visual/audio change after a video
@@ -153,8 +194,11 @@ function normalizeVideoEditSettings(raw) {
   const input = raw && typeof raw === 'object' ? raw : {};
   return {
     backgroundColor: HEX_COLOR_RE.test(input.backgroundColor || '') ? input.backgroundColor.toLowerCase() : null,
+    backgroundPreset: VALID_BACKGROUND_PRESETS.includes(input.backgroundPreset) ? input.backgroundPreset : null,
     storyPosition: VALID_STORY_POSITIONS.includes(input.storyPosition) ? input.storyPosition : null,
     fontWeight: VALID_FONT_WEIGHTS.includes(input.fontWeight) ? input.fontWeight : null,
+    textSize: VALID_TEXT_SIZES.includes(input.textSize) ? input.textSize : null,
+    showCaptions: typeof input.showCaptions === 'boolean' ? input.showCaptions : true,
     subtitleFontScale: clampNumber(input.subtitleFontScale, SUBTITLE_FONT_SCALE_MIN, SUBTITLE_FONT_SCALE_MAX, 1),
     subtitleColor: HEX_COLOR_RE.test(input.subtitleColor || '') ? input.subtitleColor.toLowerCase() : null,
     subtitleTimingOffsetMs: clampNumber(
@@ -166,7 +210,23 @@ function normalizeVideoEditSettings(raw) {
     ),
     voiceSpeed: clampNumber(input.voiceSpeed, VOICE_SPEED_MIN, VOICE_SPEED_MAX, 1),
     voiceVolumeDb: clampNumber(input.voiceVolumeDb, VOICE_VOLUME_DB_MIN, VOICE_VOLUME_DB_MAX, 0),
+    // Adjusts background music's own baseline level (see musicUrl's comment
+    // on continueSimpleStoryVideoAssembly below) — 0 (the default) leaves
+    // MUSIC_VOLUME_WITH_VOICEOVER exactly as it was before this field
+    // existed. Ducking under the narration (sidechaincompress) still always
+    // applies on top of whatever level this sets, so turning music louder
+    // here never risks drowning out narration during actual speech.
+    musicVolumeDb: clampNumber(input.musicVolumeDb, VOICE_VOLUME_DB_MIN, VOICE_VOLUME_DB_MAX, 0),
   };
+}
+
+// Converts a dB adjustment to the equivalent linear multiplier ffmpeg's
+// volume filter expects (see prepareMusicTrack's own `volume` parameter) —
+// the same conversion audio engineers use everywhere: amplitude ratio =
+// 10^(dB/20). 0dB always yields exactly 1 (no change), matching
+// musicVolumeDb's own "0 is the untouched default" contract above.
+function dbToLinearVolume(db) {
+  return Math.pow(10, db / 20);
 }
 
 // Converts a plain 'RRGGBB' hex string into ASS's own `&HAABBGGRR` color
@@ -425,29 +485,18 @@ function wrapText(text, maxCharsPerLine, maxLines) {
   return lines;
 }
 
-// Picks a font size (trying large first) that keeps a cue's wrapped text to
-// a readable number of lines, and returns the wrapped lines alongside it.
-// Never fails — an unusually long single cue just ends up at the smallest
-// size with its lines merged, same honesty-over-truncation rule as
-// wrapText itself.
-function fitCueText(text) {
-  const candidates = [
-    { fontSize: 72, maxLines: 3 },
-    { fontSize: 56, maxLines: 4 },
-    { fontSize: 44, maxLines: 5 },
-  ];
-
-  for (const { fontSize, maxLines } of candidates) {
-    const maxCharsPerLine = Math.floor((SIMPLE_STORY_WIDTH * 0.82) / (fontSize * 0.56));
-    const lines = wrapText(text, maxCharsPerLine, maxLines);
-    if (lines.length <= maxLines) {
-      return { fontSize, lines };
-    }
-  }
-
-  const smallest = candidates[candidates.length - 1];
-  const maxCharsPerLine = Math.floor((SIMPLE_STORY_WIDTH * 0.82) / (smallest.fontSize * 0.56));
-  return { fontSize: smallest.fontSize, lines: wrapText(text, maxCharsPerLine, smallest.maxLines) };
+// Wraps one cue's text to at most 2 short lines at the given (fixed,
+// user-chosen — see TEXT_SIZE_PX) font size — "show only the currently
+// spoken sentence or one to two short lines" is implemented literally: the
+// size is never shrunk to cram in more lines (that would make on-screen
+// text visibly change size cue to cue, which is worse for a fixed reading
+// size than the occasional long cue running a bit wide). An unusually long
+// single cue still never loses text — wrapText merges any overflow onto the
+// 2nd line rather than dropping it, same honesty-over-truncation rule as
+// wrapText itself always had.
+function fitCueText(text, fontSize) {
+  const maxCharsPerLine = Math.floor((SIMPLE_STORY_WIDTH * 0.82) / (fontSize * 0.56));
+  return { lines: wrapText(text, maxCharsPerLine, 2) };
 }
 
 function secondsToAssTimestamp(seconds) {
@@ -491,11 +540,12 @@ function buildAssScript(cues, audioDuration, editSettings = {}) {
   const subtitleFontScale = editSettings.subtitleFontScale > 0 ? editSettings.subtitleFontScale : 1;
   const textColorAss = assColorFromHex(editSettings.subtitleColor);
 
+  const showCaptions = editSettings.showCaptions !== false;
   const storyBold = fontWeight === 'regular' ? 0 : 1;
   const captionBold = fontWeight === 'bold' ? 1 : 0;
   const storyAlignment = storyPosition === 'top' ? 8 : storyPosition === 'bottom' ? 2 : 5;
   const storyMarginV = storyPosition === 'center' ? 0 : 60;
-  const storyFontSize = Math.round(64 * subtitleFontScale);
+  const storyFontSize = Math.round((TEXT_SIZE_PX[editSettings.textSize] || 64) * subtitleFontScale);
   const captionFontSize = Math.round(30 * subtitleFontScale);
 
   const header =
@@ -515,7 +565,10 @@ function buildAssScript(cues, audioDuration, editSettings = {}) {
     `Style: Story,${FONT_FAMILY},${storyFontSize},${textColorAss},${textColorAss},&H00000000,&H99000000,${storyBold},0,0,0,100,100,0,0,3,0,4,${storyAlignment},120,120,${storyMarginV},1\n` +
     // Caption: small, always bottom-center (Alignment 2), plain outline (no
     // box) — the familiar closed-caption look, mirroring what
-    // burnInSubtitles already produces elsewhere in this app.
+    // burnInSubtitles already produces elsewhere in this app. Still
+    // declared even when showCaptions is off (an unused ASS style is
+    // harmless) — only the per-cue Caption events below are skipped, so
+    // toggling this back on later needs no other change.
     `Style: Caption,${FONT_FAMILY},${captionFontSize},${textColorAss},${textColorAss},&H00000000,&H00000000,${captionBold},0,0,0,100,100,0,0,1,2,0,2,40,40,48,1\n\n` +
     '[Events]\n' +
     'Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n';
@@ -525,15 +578,17 @@ function buildAssScript(cues, audioDuration, editSettings = {}) {
     const cue = cues[i];
     const nextCue = cues[i + 1];
     const storyEnd = nextCue ? nextCue.start : audioDuration;
-    const { lines: wrapped } = fitCueText(cue.text);
+    const { lines: wrapped } = fitCueText(cue.text, storyFontSize);
     const storyText = wrapped.map(escapeAssText).join('\\N');
 
     lines.push(
       `Dialogue: 0,${secondsToAssTimestamp(cue.start)},${secondsToAssTimestamp(Math.max(storyEnd, cue.start + 0.1))},Story,,0,0,0,,${storyText}`
     );
-    lines.push(
-      `Dialogue: 0,${secondsToAssTimestamp(cue.start)},${secondsToAssTimestamp(cue.end)},Caption,,0,0,0,,${escapeAssText(cue.text)}`
-    );
+    if (showCaptions) {
+      lines.push(
+        `Dialogue: 0,${secondsToAssTimestamp(cue.start)},${secondsToAssTimestamp(cue.end)},Caption,,0,0,0,,${escapeAssText(cue.text)}`
+      );
+    }
   }
 
   return header + lines.join('\n') + '\n';
@@ -581,7 +636,7 @@ function cuesForSection(cues, section) {
 async function renderSection(section, sectionIndex, workDir, sectionCues, effectiveDuration, editSettings = {}) {
   const duration = Math.max(0.5, effectiveDuration);
   const outPath = path.join(workDir, `section-${sectionIndex}.mp4`);
-  const color = editSettings.backgroundColor || backgroundColorForSection(sectionIndex);
+  const color = resolveBackgroundColor(editSettings, sectionIndex);
   const zoomingIn = sectionIndex % 2 === 0;
   const zoomExpr = zoomingIn ? 'min(zoom+0.0006,1.15)' : 'if(eq(on,0),1.15,max(zoom-0.0006,1.0))';
 
@@ -664,7 +719,22 @@ function freshRenderProgress(voiceoverUrl, subtitlesContent, editSettingsSnapsho
 // timeBudgetMs: optional override of RENDER_TIME_BUDGET_MS — exposed so
 // this module's own tests can force an early "still in progress" return
 // without needing a slow, multi-minute fixture.
+// musicUrl: optional, resolved by the caller (server.js, via
+// backend/music-library.js's resolveJobMusicUrl) from the job's
+// musicEnabled/musicTrack/musicCustomUrl settings — same shape/meaning as
+// video-assembly.js's own musicUrl parameter. Omitted/null (the default —
+// music is off unless a job explicitly enables it) leaves every existing
+// code path byte-for-byte unchanged. When given, it is mixed in using the
+// SAME local-ffmpeg helpers (prepareMusicTrack/duckAndMixMusicWithVoiceover)
+// video-assembly.js's own Runway pipeline uses, applied once at the very
+// end (after concatenation, before the final audio mux) — never per
+// section, since music has no effect on any individual section's own
+// rendered pixels and re-mixing it on every resumed call would be wasted
+// work. A voice-over always exists here (required above), so this always
+// ducks music under it — never the solo/no-voiceover branch
+// video-assembly.js has for its own optional narration.
 //
+
 // Returns one of:
 //   { status: 'completed', buffer, render } — the whole video is done.
 //     buffer is the raw assembled MP4 bytes (see video-assembly.js's own
@@ -687,6 +757,7 @@ async function continueSimpleStoryVideoAssembly({
   sectionTargetSeconds,
   timeBudgetMs,
   editSettings: rawEditSettings,
+  musicUrl,
 }) {
   if (!voiceover || voiceover.status !== 'completed' || !voiceover.url) {
     return { status: 'failed', error: 'A completed voice-over is required for Simple Story Video mode.', render: existingRender || null };
@@ -841,10 +912,31 @@ async function continueSimpleStoryVideoAssembly({
     await runFfmpeg(['-y', '-f', 'concat', '-safe', '0', '-i', listPath, '-c', 'copy', concatenatedPath]);
     log('sections concatenated');
 
+    // Optional background music (off by default — see musicUrl's own
+    // comment above) is mixed in HERE, once, after every section is done —
+    // never per section, since it has no effect on any section's own
+    // rendered pixels. Looped/trimmed to the real narration duration,
+    // faded in/out, and ducked under the voice-over via sidechaincompress —
+    // the exact same local-ffmpeg helpers video-assembly.js's own Runway
+    // pipeline uses, reused rather than reimplemented.
+    let audioForMuxPath = effectiveAudioPath;
+    if (musicUrl) {
+      const musicSourcePath = path.join(workDir, 'music-input');
+      await fetchAudioToFile(musicUrl, musicSourcePath);
+      const preparedMusicPath = path.join(workDir, 'music-prepared.m4a');
+      const musicVolume = MUSIC_VOLUME_WITH_VOICEOVER * dbToLinearVolume(editSettings.musicVolumeDb);
+      await prepareMusicTrack(musicSourcePath, audioDuration, musicVolume, preparedMusicPath);
+      const mixedAudioPath = path.join(workDir, 'audio-mixed.m4a');
+      await duckAndMixMusicWithVoiceover(preparedMusicPath, effectiveAudioPath, mixedAudioPath);
+      audioForMuxPath = mixedAudioPath;
+      log('background music mixed in');
+    }
+
     // Every section already has its own text burned in and already covers
     // the real audio duration (see above), so all that's left is muxing in
-    // the real narration audio — a plain stream copy of the already-final
-    // video (-c:v copy), never a re-encode.
+    // the real narration audio (or, when music is enabled, the mixed
+    // narration+music track above) — a plain stream copy of the
+    // already-final video (-c:v copy), never a re-encode.
     const finalPath = path.join(workDir, 'final.mp4');
 
     await runFfmpeg([
@@ -852,7 +944,7 @@ async function continueSimpleStoryVideoAssembly({
       '-i',
       concatenatedPath,
       '-i',
-      effectiveAudioPath,
+      audioForMuxPath,
       '-map',
       '0:v',
       '-map',
@@ -979,6 +1071,7 @@ module.exports = {
   applyCueTimingAdjustments,
   prepareEffectiveAudio,
   assColorFromHex,
+  dbToLinearVolume,
   VOICE_SPEED_MIN,
   VOICE_SPEED_MAX,
   VOICE_VOLUME_DB_MIN,
@@ -990,4 +1083,9 @@ module.exports = {
   VALID_STORY_POSITIONS,
   VALID_FONT_WEIGHTS,
   HEX_COLOR_RE,
+  BACKGROUND_PRESET_COLORS,
+  VALID_BACKGROUND_PRESETS,
+  TEXT_SIZE_PX,
+  VALID_TEXT_SIZES,
+  resolveBackgroundColor,
 };

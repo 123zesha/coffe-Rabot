@@ -586,6 +586,22 @@ async function main() {
     assert.strictEqual(persisted.videoEditSettings.voiceSpeed, 1.5);
   });
 
+  await test('updateVideoEditSettings accepts musicVolumeDb separately from voiceVolumeDb', async () => {
+    const job = await jobStore.createJob();
+    await jobStore.updateJob(job.id, { videoMode: 'simple-story' });
+
+    const result = JSON.parse(
+      await app.executeTool('updateVideoEditSettings', job.id, { voiceVolumeDb: 5, musicVolumeDb: -8 })
+    );
+    assert.strictEqual(result.error, undefined, JSON.stringify(result));
+    assert.strictEqual(result.videoEditSettings.voiceVolumeDb, 5);
+    assert.strictEqual(result.videoEditSettings.musicVolumeDb, -8);
+
+    const persisted = await jobStore.getJob(job.id);
+    assert.strictEqual(persisted.videoEditSettings.voiceVolumeDb, 5);
+    assert.strictEqual(persisted.videoEditSettings.musicVolumeDb, -8);
+  });
+
   await test('updateVideoEditSettings refuses an invalid hex color with a clear, actionable error and changes nothing', async () => {
     const job = await jobStore.createJob();
     await jobStore.updateJob(job.id, { videoMode: 'simple-story' });
@@ -659,6 +675,134 @@ async function main() {
     const secondPath = path.join(require('./video-storage').GENERATED_DIR, secondUrl.slice('/generated/'.length));
     fs.rmSync(firstPath, { force: true });
     fs.rmSync(secondPath, { force: true });
+  });
+
+  await test('assembleFinalVideo mixes in real background music for a "simple-story" job when musicEnabled is set, off by default otherwise', async () => {
+    const job = await jobStore.createJob();
+    const voiceoverUrl = await makeFixtureVoiceoverDataUri(workDir);
+    const musicPath = path.join(workDir, 'music-simple-story.mp3');
+    await runFfmpeg(['-y', '-f', 'lavfi', '-i', 'sine=frequency=330:duration=4', '-c:a', 'libmp3lame', musicPath]);
+
+    await jobStore.updateJob(job.id, {
+      videoMode: 'simple-story',
+      script: LONG_ENOUGH_SCRIPT + ' '.repeat(200),
+      voiceover: { url: voiceoverUrl, status: 'completed', voice: 'alloy', voiceStyle: 'neutral-narrator' },
+      subtitles: {
+        status: 'completed',
+        format: 'srt',
+        content: FIXTURE_SRT,
+        error: null,
+        generatedFromVoiceoverUrl: voiceoverUrl,
+      },
+    });
+
+    // Music off (the default) — assembles exactly like every other test
+    // above, with musicUsed left null. executeTool returns
+    // summarizeJobForAgent's shape (hasMusic, not the raw musicUsed record —
+    // see summarizeJobForAgent), so the raw persisted record is checked via
+    // jobStore.getJob instead, exactly like finalVideo.url everywhere else
+    // in this file.
+    const withoutMusic = JSON.parse(await app.executeTool('assembleFinalVideo', job.id, {}));
+    assert.strictEqual(withoutMusic.finalVideo.status, 'completed', JSON.stringify(withoutMusic));
+    assert.strictEqual(withoutMusic.finalVideo.hasMusic, false);
+    const jobWithoutMusic = await jobStore.getJob(job.id);
+    assert.strictEqual(jobWithoutMusic.finalVideo.musicUsed, null);
+    const urlWithoutMusic = jobWithoutMusic.finalVideo.url;
+    const pathWithoutMusic = path.join(require('./video-storage').GENERATED_DIR, urlWithoutMusic.slice('/generated/'.length));
+
+    // Turning musicEnabled on (musicCustomUrl — a one-off track, bypassing
+    // the shared data/music/ library so this test needs no real manifest
+    // entry) must force a real reassembly, exactly like an edit-settings
+    // change does, and the new video must genuinely have real, mixed-in
+    // audio (a real 4s narration+music track, not just the narration alone).
+    await jobStore.updateJob(job.id, { musicEnabled: true, musicCustomUrl: musicPath });
+    const withMusic = JSON.parse(await app.executeTool('assembleFinalVideo', job.id, {}));
+    assert.strictEqual(withMusic.finalVideo.status, 'completed', JSON.stringify(withMusic));
+    assert.strictEqual(withMusic.finalVideo.hasMusic, true);
+    assert.deepStrictEqual((await jobStore.getJob(job.id)).finalVideo.musicUsed, { enabled: true, track: null, customUrl: musicPath });
+
+    const afterMusic = await jobStore.getJob(job.id);
+    assert.notStrictEqual(afterMusic.finalVideo.url, urlWithoutMusic, 'turning music on must force a real reassembly');
+    const pathWithMusic = path.join(require('./video-storage').GENERATED_DIR, afterMusic.finalVideo.url.slice('/generated/'.length));
+    const probedWithMusic = await probe(pathWithMusic);
+    assert.strictEqual(probedWithMusic.width, 1920);
+    assert.strictEqual(probedWithMusic.height, 1080);
+
+    // Calling again unchanged must be a safe no-op (same idempotency
+    // guarantee as every other edit-settings/music check for this mode).
+    const again = JSON.parse(await app.executeTool('assembleFinalVideo', job.id, {}));
+    assert.strictEqual((await jobStore.getJob(job.id)).finalVideo.url, afterMusic.finalVideo.url, 'unchanged music settings must not reassemble again');
+
+    fs.rmSync(pathWithoutMusic, { force: true });
+    fs.rmSync(pathWithMusic, { force: true });
+  });
+
+  // The test above never sets voiceSource — it defaults to 'ai' (see
+  // job-store.js) — so it already proves music mixing works for an AI-voice
+  // job. This test proves the same for an "Upload My Own Voice" job
+  // (voiceSource: 'upload'): music mixing only ever depends on a completed
+  // job.voiceover existing, never on how that voice-over was produced, so
+  // it must work identically either way.
+  await test('assembleFinalVideo mixes in real background music for an "Upload My Own Voice" job just as it does for an AI-voice job', async () => {
+    const job = await jobStore.createJob();
+    const voiceoverUrl = await makeFixtureVoiceoverDataUri(workDir);
+    const musicPath = path.join(workDir, 'music-upload-voice.mp3');
+    await runFfmpeg(['-y', '-f', 'lavfi', '-i', 'sine=frequency=330:duration=4', '-c:a', 'libmp3lame', musicPath]);
+
+    await jobStore.updateJob(job.id, {
+      videoMode: 'simple-story',
+      voiceSource: 'upload',
+      script: LONG_ENOUGH_SCRIPT + ' '.repeat(200),
+      voiceover: { url: voiceoverUrl, status: 'completed', voice: 'uploaded', voiceStyle: '', source: 'upload' },
+      subtitles: {
+        status: 'completed',
+        format: 'srt',
+        content: FIXTURE_SRT,
+        error: null,
+        generatedFromVoiceoverUrl: voiceoverUrl,
+      },
+      musicEnabled: true,
+      musicCustomUrl: musicPath,
+    });
+
+    const result = JSON.parse(await app.executeTool('assembleFinalVideo', job.id, {}));
+    assert.strictEqual(result.finalVideo.status, 'completed', JSON.stringify(result));
+    assert.strictEqual(result.finalVideo.hasMusic, true);
+
+    const persisted = await jobStore.getJob(job.id);
+    assert.deepStrictEqual(persisted.finalVideo.musicUsed, { enabled: true, track: null, customUrl: musicPath });
+    const realPath = path.join(require('./video-storage').GENERATED_DIR, persisted.finalVideo.url.slice('/generated/'.length));
+    const probed = await probe(realPath);
+    assert.strictEqual(probed.width, 1920);
+    assert.strictEqual(probed.height, 1080);
+    fs.rmSync(realPath, { force: true });
+  });
+
+  await test('assembleFinalVideo fails clearly for a "simple-story" job when musicTrack names a track that does not exist, without corrupting the job', async () => {
+    const job = await jobStore.createJob();
+    const voiceoverUrl = await makeFixtureVoiceoverDataUri(workDir);
+
+    await jobStore.updateJob(job.id, {
+      videoMode: 'simple-story',
+      script: LONG_ENOUGH_SCRIPT + ' '.repeat(200),
+      voiceover: { url: voiceoverUrl, status: 'completed', voice: 'alloy', voiceStyle: 'neutral-narrator' },
+      subtitles: {
+        status: 'completed',
+        format: 'srt',
+        content: FIXTURE_SRT,
+        error: null,
+        generatedFromVoiceoverUrl: voiceoverUrl,
+      },
+      musicEnabled: true,
+      musicTrack: 'no-such-track-in-the-manifest',
+    });
+
+    const result = JSON.parse(await app.executeTool('assembleFinalVideo', job.id, {}));
+    assert.strictEqual(result.finalVideo.status, 'failed');
+    assert.ok(result.finalVideo.error, 'an unknown musicTrack must fail with a real, actionable error');
+
+    const persisted = await jobStore.getJob(job.id);
+    assert.strictEqual(persisted.finalVideo.url, null, 'a failed music resolution must never leave a stale/fabricated finalVideo url');
   });
 
   await test('a fresh voice-over preserves videoEditSettings (unlike simpleStoryRender/finalVideo, which reset)', async () => {

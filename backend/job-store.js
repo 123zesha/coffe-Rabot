@@ -112,6 +112,7 @@ const JOB_FIELDS = [
   'chatToVideoAutoPipeline',
   'approvedCostEstimate',
   'budgetGuard',
+  'voiceSource',
 ];
 
 // The only real, supported output-format values — 'horizontal' (16:9),
@@ -478,15 +479,36 @@ function createDefaultJob(id) {
     // clamped to safe ranges there rather than accepted as arbitrary input.
     // A general capability of Simple Story Video mode, not tied to any one
     // job: every job gets this same field with these same defaults.
+    // - backgroundPreset: 'warm' | 'white' | 'dark', or null (default) —
+    //   a named solid-color preset for EVERY section (see
+    //   simple-story-video.js's BACKGROUND_PRESET_COLORS), taking priority
+    //   over backgroundColor when both are set. "Custom" in the UI means
+    //   sending backgroundColor directly instead of a preset name — there
+    //   is no separate 'custom' preset value.
+    // - textSize: 'medium' | 'large' | 'xl', or null (default, the
+    //   original 64px) — the large on-screen story text's font size in real
+    //   px at this mode's fixed 1080p canvas (see simple-story-video.js's
+    //   TEXT_SIZE_PX); the small bottom caption line is unaffected.
+    // - showCaptions: whether the small bottom caption line renders
+    //   alongside the large story text (default true, the original
+    //   always-on behavior). false renders the large story text only.
     videoEditSettings: {
       backgroundColor: null,
+      backgroundPreset: null,
       storyPosition: null,
       fontWeight: null,
+      textSize: null,
+      showCaptions: true,
       subtitleFontScale: 1,
       subtitleColor: null,
       subtitleTimingOffsetMs: 0,
       voiceSpeed: 1,
       voiceVolumeDb: 0,
+      // Adjusts background music's own baseline level relative to its
+      // built-in ducked-under-narration default (0 = unchanged) — has no
+      // effect at all unless musicEnabled is also on (see musicEnabled/
+      // musicTrack/musicCustomUrl below).
+      musicVolumeDb: 0,
     },
     // Optional "Reference Video / Inspiration Mode" input: a YouTube URL the
     // user wants used only as high-level storytelling inspiration (pacing,
@@ -631,6 +653,15 @@ function createDefaultJob(id) {
     // POST /api/jobs/:id/reconfirm-budget once the user accepts the new
     // figure. Backend-only.
     budgetGuard: null,
+    // 'ai' (default, OpenAI TTS — see generateVoiceover) or 'upload' — set
+    // once at job creation by POST /api/jobs/story-to-video's "Upload My
+    // Own Voice" option and never changed afterward. When 'upload',
+    // continueChatToVideoPipeline never attempts a paid TTS call even if
+    // job.voiceover isn't completed yet — it waits for
+    // POST /api/jobs/:id/upload-voiceover instead, guaranteeing zero AI
+    // voice-over cost for this job no matter what. Backend-only, like
+    // chatToVideoAutoPipeline above.
+    voiceSource: 'ai',
   };
 }
 

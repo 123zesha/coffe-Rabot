@@ -78,6 +78,39 @@ function probeAudioDuration(filePath) {
   });
 }
 
+// Reports ffmpeg's own measured mean_volume (dB) for a real audio file,
+// optionally restricted to a [start, start+duration) window — used below to
+// prove musicVolumeDb genuinely changes the mixed-in music's real loudness,
+// never merely accepted and ignored. Same technique test-video-assembly.js's
+// own music tests use for the Runway pipeline. A window is needed because
+// this module's ducking (sidechaincompress) is deliberately aggressive
+// during actual narration, which compresses away most of a volume
+// difference applied BEFORE ducking — measuring during a real silent GAP
+// between cues (where music plays unducked) is what actually isolates
+// musicVolumeDb's own effect from ducking's.
+function measureMeanVolume(filePath, { start, duration } = {}) {
+  const args = ['-y'];
+  if (typeof start === 'number') {
+    args.push('-ss', String(start));
+  }
+  args.push('-i', filePath);
+  if (typeof duration === 'number') {
+    args.push('-t', String(duration));
+  }
+  args.push('-af', 'volumedetect', '-f', 'null', '-');
+  return new Promise((resolve, reject) => {
+    execFile(ssv.ffmpegPath, args, { maxBuffer: 1024 * 1024 * 16 }, (error, stdout, stderr) => {
+      const log = (stderr || '').toString();
+      const match = log.match(/mean_volume:\s*(-?\d+(?:\.\d+)?)\s*dB/);
+      if (!match) {
+        reject(new Error(`ffmpeg did not report mean_volume for ${filePath}: ${log.trim().slice(-500)}`));
+        return;
+      }
+      resolve(Number(match[1]));
+    });
+  });
+}
+
 // Reads one raw RGB pixel from a real decoded video frame at `atSeconds` —
 // used to prove a requested backgroundColor edit genuinely changed the
 // rendered pixels, not just that re-rendering happened. (x, y) should land
@@ -118,6 +151,51 @@ function makeToneAudio(dir, seconds, label) {
   return runFfmpeg(['-y', '-f', 'lavfi', '-i', `sine=frequency=220:duration=${seconds}`, '-c:a', 'libmp3lame', outPath]).then(
     () => outPath
   );
+}
+
+// A locally SYNTHESIZED tone at a different, distinguishable frequency from
+// makeToneAudio's own "narration" tone — never downloaded or real
+// copyrighted music — standing in for a background-music input, the exact
+// same convention test-video-assembly.js's own makeMusic uses for the
+// Runway pipeline's music tests.
+function makeMusicTone(dir, seconds, label) {
+  const outPath = path.join(dir, `music-${seconds}-${label || ++toneAudioCounter}.mp3`);
+  return runFfmpeg(['-y', '-f', 'lavfi', '-i', `sine=frequency=330:duration=${seconds}`, '-c:a', 'libmp3lame', outPath]).then(
+    () => outPath
+  );
+}
+
+// A narration fixture with a REAL silent gap in the actual audio signal
+// itself (tone, then true silence, then tone) — used only by the
+// musicVolumeDb test below. sidechaincompress ducks music based on the
+// narration audio's own real amplitude, never on subtitle cue timing, so a
+// fixture built from a continuous tone (makeToneAudio) is loud for its
+// entire duration and can never produce an unducked window no matter what
+// the .srt cues say — only real silence in the audio itself does.
+function makeGapAudio(dir, toneSeconds, silenceSeconds, label) {
+  const outPath = path.join(dir, `gap-audio-${label || ++toneAudioCounter}.mp3`);
+  return runFfmpeg([
+    '-y',
+    '-f',
+    'lavfi',
+    '-i',
+    `sine=frequency=220:duration=${toneSeconds}`,
+    '-f',
+    'lavfi',
+    '-i',
+    `anullsrc=r=44100:cl=mono:d=${silenceSeconds}`,
+    '-f',
+    'lavfi',
+    '-i',
+    `sine=frequency=220:duration=${toneSeconds}`,
+    '-filter_complex',
+    '[0:a][1:a][2:a]concat=n=3:v=0:a=1[out]',
+    '-map',
+    '[out]',
+    '-c:a',
+    'libmp3lame',
+    outPath,
+  ]).then(() => outPath);
 }
 
 // Builds a real, longer .srt fixture (real timestamps, real sequential
@@ -161,6 +239,22 @@ const FIXTURE_SRT = [
   '4',
   '00:00:07,000 --> 00:00:08,900',
   'It led her to a quiet, sunlit clearing.',
+  '',
+].join('\n');
+
+// A real, deliberate silent GAP between cue 1 (ends at 1.5s) and cue 2
+// (starts at 6.0s) — used only by the musicVolumeDb test below, which needs
+// a window where music plays UNDUCKED (sidechaincompress only ducks while
+// narration is actually speaking) to isolate musicVolumeDb's own effect
+// from ducking's.
+const GAP_SRT = [
+  '1',
+  '00:00:00,000 --> 00:00:01,500',
+  'Once upon a time.',
+  '',
+  '2',
+  '00:00:06,000 --> 00:00:07,500',
+  'The story continues.',
   '',
 ].join('\n');
 
@@ -219,16 +313,21 @@ async function main() {
     assert.strictEqual(lines.length, 1, 'text well under the budget should not be wrapped at all');
   });
 
-  await test('fitCueText picks a smaller font and more lines for a long cue, never truncating it', () => {
+  await test('fitCueText wraps a long cue to at most 2 lines at the given fixed font size, never truncating it', () => {
     const longCue =
-      'This is a much longer sentence than the others, written to force the layout to fall back ' +
-      'to a smaller font size and more lines while still keeping every single word of the real narration.';
-    const { fontSize, lines } = ssv.fitCueText(longCue);
-    assert.ok(fontSize <= 72);
+      'This is a much longer sentence than the others, written to force the layout to wrap across ' +
+      'more than one line while still keeping every single word of the real narration.';
+    const { lines } = ssv.fitCueText(longCue, 70);
+    assert.ok(lines.length <= 2, `expected at most 2 lines, got ${lines.length}`);
     const rejoined = lines.join(' ');
     for (const word of longCue.split(' ')) {
       assert.ok(rejoined.includes(word.replace(/[.,]$/, '')), `expected "${word}" to survive fitCueText`);
     }
+  });
+
+  await test('fitCueText never wraps a short cue beyond 1 line', () => {
+    const { lines } = ssv.fitCueText('A short line.', 70);
+    assert.strictEqual(lines.length, 1);
   });
 
   await test('buildAssScript holds each cue\'s story text until the NEXT cue begins (never blanks during a pause)', () => {
@@ -749,13 +848,17 @@ async function main() {
     for (const input of [undefined, null, {}, 'not an object']) {
       assert.deepStrictEqual(ssv.normalizeVideoEditSettings(input), {
         backgroundColor: null,
+        backgroundPreset: null,
         storyPosition: null,
         fontWeight: null,
+        textSize: null,
+        showCaptions: true,
         subtitleFontScale: 1,
         subtitleColor: null,
         subtitleTimingOffsetMs: 0,
         voiceSpeed: 1,
         voiceVolumeDb: 0,
+        musicVolumeDb: 0,
       });
     }
   });
@@ -763,23 +866,31 @@ async function main() {
   await test('normalizeVideoEditSettings accepts valid values and lowercases hex colors', () => {
     const normalized = ssv.normalizeVideoEditSettings({
       backgroundColor: '1A2B3C',
+      backgroundPreset: 'warm',
       storyPosition: 'top',
       fontWeight: 'bold',
+      textSize: 'xl',
+      showCaptions: false,
       subtitleFontScale: 1.5,
       subtitleColor: 'FF0000',
       subtitleTimingOffsetMs: 250,
       voiceSpeed: 1.25,
       voiceVolumeDb: 6,
+      musicVolumeDb: -6,
     });
     assert.deepStrictEqual(normalized, {
       backgroundColor: '1a2b3c',
+      backgroundPreset: 'warm',
       storyPosition: 'top',
       fontWeight: 'bold',
+      textSize: 'xl',
+      showCaptions: false,
       subtitleFontScale: 1.5,
       subtitleColor: 'ff0000',
       subtitleTimingOffsetMs: 250,
       voiceSpeed: 1.25,
       voiceVolumeDb: 6,
+      musicVolumeDb: -6,
     });
   });
 
@@ -793,6 +904,7 @@ async function main() {
       subtitleTimingOffsetMs: -999999,
       voiceSpeed: 10,
       voiceVolumeDb: -999,
+      musicVolumeDb: 999,
     });
     assert.strictEqual(normalized.backgroundColor, null);
     assert.strictEqual(normalized.storyPosition, null);
@@ -802,6 +914,55 @@ async function main() {
     assert.strictEqual(normalized.subtitleTimingOffsetMs, ssv.SUBTITLE_TIMING_OFFSET_MS_MIN);
     assert.strictEqual(normalized.voiceSpeed, ssv.VOICE_SPEED_MAX);
     assert.strictEqual(normalized.voiceVolumeDb, ssv.VOICE_VOLUME_DB_MIN);
+    assert.strictEqual(normalized.musicVolumeDb, ssv.VOICE_VOLUME_DB_MAX);
+  });
+
+  await test('normalizeVideoEditSettings accepts real backgroundPreset/textSize values and rejects invalid ones', () => {
+    for (const preset of ssv.VALID_BACKGROUND_PRESETS) {
+      assert.strictEqual(ssv.normalizeVideoEditSettings({ backgroundPreset: preset }).backgroundPreset, preset);
+    }
+    assert.strictEqual(ssv.normalizeVideoEditSettings({ backgroundPreset: 'custom' }).backgroundPreset, null);
+    assert.strictEqual(ssv.normalizeVideoEditSettings({ backgroundPreset: 'neon' }).backgroundPreset, null);
+
+    for (const size of ssv.VALID_TEXT_SIZES) {
+      assert.strictEqual(ssv.normalizeVideoEditSettings({ textSize: size }).textSize, size);
+    }
+    assert.strictEqual(ssv.normalizeVideoEditSettings({ textSize: 'huge' }).textSize, null);
+
+    assert.strictEqual(ssv.normalizeVideoEditSettings({ showCaptions: false }).showCaptions, false);
+    assert.strictEqual(ssv.normalizeVideoEditSettings({ showCaptions: 'no' }).showCaptions, true, 'a non-boolean must fall back to the default (true)');
+  });
+
+  await test('resolveBackgroundColor: a named preset takes priority over a raw backgroundColor; otherwise falls back to custom color or the rotating palette', () => {
+    const warm = ssv.normalizeVideoEditSettings({ backgroundPreset: 'warm' });
+    assert.strictEqual(ssv.resolveBackgroundColor(warm, 0), ssv.BACKGROUND_PRESET_COLORS.warm);
+    assert.strictEqual(ssv.BACKGROUND_PRESET_COLORS.warm, 'f5ebd7');
+
+    const presetOverCustom = ssv.normalizeVideoEditSettings({ backgroundPreset: 'dark', backgroundColor: 'ff00ff' });
+    assert.strictEqual(ssv.resolveBackgroundColor(presetOverCustom, 0), ssv.BACKGROUND_PRESET_COLORS.dark);
+
+    const customOnly = ssv.normalizeVideoEditSettings({ backgroundColor: 'ff00ff' });
+    assert.strictEqual(ssv.resolveBackgroundColor(customOnly, 0), 'ff00ff');
+
+    const neither = ssv.normalizeVideoEditSettings({});
+    assert.ok(
+      ssv.HEX_COLOR_RE.test(ssv.resolveBackgroundColor(neither, 2)),
+      'must still fall back to a real color from the rotating palette when neither preset nor custom color is set'
+    );
+  });
+
+  await test('buildAssScript sizes the large story text from textSize, and omits Caption events entirely when showCaptions is false', () => {
+    const cues = ssv.parseSrt(FIXTURE_SRT);
+    const xl = ssv.normalizeVideoEditSettings({ textSize: 'xl' });
+    const assXl = ssv.buildAssScript(cues, 9, xl);
+    assert.ok(assXl.includes(`Style: Story,DejaVu Sans,${ssv.TEXT_SIZE_PX.xl},`), 'expected the Story style to use the xl font size');
+
+    const noCaptions = ssv.normalizeVideoEditSettings({ showCaptions: false });
+    const assNoCaptions = ssv.buildAssScript(cues, 9, noCaptions);
+    assert.ok(!assNoCaptions.includes(',Caption,'), 'no Caption dialogue events must be emitted when showCaptions is false');
+
+    const withCaptions = ssv.buildAssScript(cues, 9, ssv.normalizeVideoEditSettings({}));
+    assert.ok(withCaptions.includes(',Caption,'), 'Caption dialogue events must still be emitted by default');
   });
 
   await test('normalizeVideoEditSettings is pure — the same input always JSON-serializes identically', () => {
@@ -1007,6 +1168,132 @@ async function main() {
       second.render.sections.map((s) => s.url),
       first.render.sections.map((s) => s.url),
       'identical editSettings must never trigger a wasted re-render'
+    );
+  });
+
+  // --- Background music (optional musicUrl parameter) ---
+  // Every OTHER test in this file omits musicUrl entirely and still passes,
+  // proving music-off (the default) is byte-for-byte unaffected. The actual
+  // audio DSP (looping/trimming, fade in/out, ducking under narration) is
+  // NOT re-verified here — prepareMusicTrack/duckAndMixMusicWithVoiceover
+  // are the exact same functions test-video-assembly.js already exhaustively
+  // tests for the Runway pipeline, reused rather than reimplemented. These
+  // tests only prove the WIRING into this module: a real mixed track is
+  // produced, resumed sections are never wastefully re-rendered just to add
+  // music, and a bad music source fails clearly rather than silently.
+
+  await test('continueSimpleStoryVideoAssembly mixes in real background music when musicUrl is given, matching the real narration duration', async () => {
+    const audioPath = await makeToneAudio(workDir, 4, 'music-basic-narration');
+    const musicPath = await makeMusicTone(workDir, 4, 'music-basic-track');
+
+    const result = await ssv.continueSimpleStoryVideoAssembly({
+      voiceover: { status: 'completed', url: audioPath },
+      subtitlesContent: FIXTURE_SRT,
+      existingRender: null,
+      jobId: 'test-job-music-basic',
+      musicUrl: musicPath,
+    });
+    assert.strictEqual(result.status, 'completed', result.error);
+
+    const outPath = path.join(workDir, 'output-music-basic.mp4');
+    fs.writeFileSync(outPath, result.buffer);
+    const probed = await probe(outPath);
+    assert.ok(
+      Math.abs(probed.duration - 4) < 0.5,
+      `expected the video to still match the real ~4s narration duration with music mixed in, got ${probed.duration}`
+    );
+  });
+
+  await test('continueSimpleStoryVideoAssembly reuses already-completed sections instead of re-rendering when music is added on a later call', async () => {
+    const audioPath = await makeToneAudio(workDir, 4, 'music-resume-narration');
+    const musicPath = await makeMusicTone(workDir, 4, 'music-resume-track');
+
+    const withoutMusic = await ssv.continueSimpleStoryVideoAssembly({
+      voiceover: { status: 'completed', url: audioPath },
+      subtitlesContent: FIXTURE_SRT,
+      existingRender: null,
+      jobId: 'test-job-music-resume',
+    });
+    assert.strictEqual(withoutMusic.status, 'completed', withoutMusic.error);
+    const urlsWithoutMusic = withoutMusic.render.sections.map((s) => s.url);
+
+    // Same exact voice-over/subtitles/editSettings — only musicUrl newly
+    // added, exactly like a job whose finalVideo is invalidated purely by
+    // turning musicEnabled on (see server.js's isFinalVideoStillAccurate).
+    // Music has no effect on any section's own rendered pixels, so this
+    // must reuse every section unchanged rather than paying to re-render
+    // them all just to add an audio-only change.
+    const withMusic = await ssv.continueSimpleStoryVideoAssembly({
+      voiceover: { status: 'completed', url: audioPath },
+      subtitlesContent: FIXTURE_SRT,
+      existingRender: withoutMusic.render,
+      jobId: 'test-job-music-resume',
+      musicUrl: musicPath,
+    });
+    assert.strictEqual(withMusic.status, 'completed', withMusic.error);
+    const urlsWithMusic = withMusic.render.sections.map((s) => s.url);
+
+    assert.deepStrictEqual(urlsWithMusic, urlsWithoutMusic, 'adding music must never trigger a wasted section re-render');
+  });
+
+  await test('continueSimpleStoryVideoAssembly fails clearly, never silently, when musicUrl points at a missing/corrupt file', async () => {
+    const audioPath = await makeToneAudio(workDir, 4, 'music-bad-source-narration');
+    const missingMusicPath = path.join(workDir, 'no-such-music-file.mp3');
+
+    const result = await ssv.continueSimpleStoryVideoAssembly({
+      voiceover: { status: 'completed', url: audioPath },
+      subtitlesContent: FIXTURE_SRT,
+      existingRender: null,
+      jobId: 'test-job-music-bad-source',
+      musicUrl: missingMusicPath,
+    });
+    assert.strictEqual(result.status, 'failed');
+    assert.ok(result.error, 'a missing/corrupt music file must produce a real, non-empty error, never a silently music-less success');
+  });
+
+  await test('continueSimpleStoryVideoAssembly\'s editSettings.musicVolumeDb genuinely changes music\'s real loudness during an unducked gap', async () => {
+    // A real silent gap in the NARRATION AUDIO ITSELF (1.5s tone, 4.5s true
+    // silence, 2s tone) — sidechaincompress ducks based on the narration's
+    // own real amplitude, not on .srt cue timing, so GAP_SRT's cue gap alone
+    // (used only for the on-screen text/section timing here) would never be
+    // enough on its own to produce an unducked window.
+    const audioPath = await makeGapAudio(workDir, 1.5, 4.5, 'music-volume-narration');
+    const musicPath = await makeMusicTone(workDir, 8, 'music-volume-track');
+    // Sits entirely inside the real silent gap (1.5s-6.0s), away from its
+    // edges, so ducking is genuinely inactive there and any loudness
+    // difference reflects musicVolumeDb alone.
+    const GAP_WINDOW = { start: 2.5, duration: 2.5 };
+
+    const quiet = await ssv.continueSimpleStoryVideoAssembly({
+      voiceover: { status: 'completed', url: audioPath },
+      subtitlesContent: GAP_SRT,
+      existingRender: null,
+      jobId: 'test-job-music-volume-quiet',
+      musicUrl: musicPath,
+      editSettings: { musicVolumeDb: -20 },
+    });
+    assert.strictEqual(quiet.status, 'completed', quiet.error);
+    const quietPath = path.join(workDir, 'output-music-volume-quiet.mp4');
+    fs.writeFileSync(quietPath, quiet.buffer);
+
+    const loud = await ssv.continueSimpleStoryVideoAssembly({
+      voiceover: { status: 'completed', url: audioPath },
+      subtitlesContent: GAP_SRT,
+      existingRender: null,
+      jobId: 'test-job-music-volume-loud',
+      musicUrl: musicPath,
+      editSettings: { musicVolumeDb: 20 },
+    });
+    assert.strictEqual(loud.status, 'completed', loud.error);
+    const loudPath = path.join(workDir, 'output-music-volume-loud.mp4');
+    fs.writeFileSync(loudPath, loud.buffer);
+
+    const quietMeanVolume = await measureMeanVolume(quietPath, GAP_WINDOW);
+    const loudMeanVolume = await measureMeanVolume(loudPath, GAP_WINDOW);
+    assert.ok(
+      loudMeanVolume > quietMeanVolume + 30,
+      `expected +20dB musicVolumeDb to measurably raise music's real loudness over -20dB during an ` +
+        `unducked gap (a real 40dB difference applied), got quiet=${quietMeanVolume}dB loud=${loudMeanVolume}dB`
     );
   });
 

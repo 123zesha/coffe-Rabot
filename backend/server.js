@@ -247,11 +247,14 @@ async function assembleAndStoreFinalVideo(
 ) {
   // Simple Story Video mode: an entirely separate, local-ffmpeg-only
   // pipeline (backend/simple-story-video.js) — no scene clips, no Runway
-  // healing, no music/resolution tier (that pipeline is always fixed
-  // 1080p/16:9 with no music, per its own module comment). subtitlesUsed
-  // still records the real subtitles content actually burned in — the same
-  // "was this reassembled since a real change" bookkeeping role it has for
-  // the Runway pipeline below.
+  // healing, and always fixed 1080p/16:9 (resolutionTier never applies to
+  // it). Background music, however, IS supported here, mixed in by that
+  // module itself using the same local-ffmpeg helpers the Runway pipeline
+  // below uses — resolved the same way (musicLibrary.resolveJobMusicUrl)
+  // and gated behind the same musicEnabled setting, off by default.
+  // subtitlesUsed still records the real subtitles content actually burned
+  // in — the same "was this reassembled since a real change" bookkeeping
+  // role it has for the Runway pipeline below.
   //
   // A real 15-20 minute story's full render (16+ real sections) can take
   // longer than one serverless function invocation safely allows — see
@@ -266,12 +269,37 @@ async function assembleAndStoreFinalVideo(
   // agent purely to advance a mechanical render with nothing left to
   // reason about.
   if (desiredVideoModeUsed === 'simple-story') {
+    // Resolving a job's music settings to a real local file can fail (an
+    // unknown musicTrack, or a library file the user removed after
+    // selecting it) — caught here, exactly like the Runway pipeline below,
+    // so it reads as a clear assembly failure with an actionable message,
+    // never an unhandled exception or a silently music-less video.
+    let musicUrl;
+    try {
+      musicUrl = musicLibrary.resolveJobMusicUrl(job);
+    } catch (error) {
+      return {
+        finalVideo: {
+          url: null,
+          status: 'failed',
+          subtitlesUsed: null,
+          musicUsed: null,
+          resolutionUsed: null,
+          videoModeUsed: null,
+          editSettingsUsed: null,
+          error: error.message,
+        },
+        simpleStoryRender: job.simpleStoryRender,
+      };
+    }
+
     const assembly = await simpleStoryVideo.continueSimpleStoryVideoAssembly({
       voiceover: job.voiceover,
       subtitlesContent: job.subtitles && job.subtitles.status === 'completed' ? job.subtitles.content : null,
       existingRender: job.simpleStoryRender,
       jobId,
       editSettings: job.videoEditSettings,
+      musicUrl,
     });
 
     if (assembly.status === 'in_progress') {
@@ -313,7 +341,7 @@ async function assembleAndStoreFinalVideo(
           url,
           status: 'completed',
           subtitlesUsed: job.subtitles.content,
-          musicUsed: null,
+          musicUsed: desiredMusicUsed,
           resolutionUsed: null,
           videoModeUsed: 'simple-story',
           editSettingsUsed: simpleStoryVideo.normalizeVideoEditSettings(job.videoEditSettings),
@@ -503,13 +531,18 @@ function isFinalVideoStillAccurate(job) {
   if (desiredVideoModeUsed === 'simple-story') {
     // Simple Story Video mode always uses subtitles as its on-screen text
     // source (not conditional on burnInSubtitles — see findFinalVideoBlocker)
-    // and never applies music/resolutionTier (that pipeline is always fixed
-    // 1080p/16:9 with no music — see simple-story-video.js). Checking those
-    // here would force a pointless reassembly on every check, since this
-    // pipeline never sets musicUsed/resolutionUsed to anything but null.
+    // and never applies resolutionTier (that pipeline is always fixed
+    // 1080p/16:9 — see simple-story-video.js). Background music DOES apply
+    // here (see assembleAndStoreFinalVideo above), so — unlike
+    // resolutionUsed below — musicUsed must still be checked, exactly like
+    // the Runway pipeline's own check further down.
     const desiredSubtitlesContent =
       job.subtitles && job.subtitles.status === 'completed' ? job.subtitles.content : null;
     if ((job.finalVideo.subtitlesUsed || null) !== desiredSubtitlesContent) {
+      return false;
+    }
+    const desiredMusicUsed = computeDesiredMusicUsed(job);
+    if (JSON.stringify(job.finalVideo.musicUsed || null) !== JSON.stringify(desiredMusicUsed)) {
       return false;
     }
     // A real videoEditSettings change (background color, subtitle
@@ -592,6 +625,37 @@ function findVoiceoverBlocker(job) {
 // own pipelines). Callers remain responsible for the findVoiceoverBlocker
 // and OPENAI_API_KEY checks first (each has its own audience-appropriate
 // error message) — this always makes a real generation attempt.
+// A fresh voice-over (generated OR uploaded — see the "Upload My Own
+// Voice" route below) invalidates every downstream asset that was built
+// from whatever narration existed before it: the final video, the Simple
+// Story Video render progress, and the subtitles (which must be
+// re-transcribed from THIS real audio, never carried over from a
+// different one). Shared so runGenerateVoiceover and the upload route can
+// never drift on what "a new voice-over landed" actually resets.
+function downstreamResetsForNewVoiceover() {
+  return {
+    finalVideo: {
+      url: null,
+      status: 'pending',
+      subtitlesUsed: null,
+      musicUsed: null,
+      resolutionUsed: null,
+      videoModeUsed: null,
+      editSettingsUsed: null,
+    },
+    simpleStoryRender: {
+      status: 'not_started',
+      totalSections: null,
+      sections: [],
+      audioUrlSnapshot: null,
+      subtitlesContentSnapshot: null,
+      editSettingsSnapshot: null,
+      error: null,
+    },
+    subtitles: { status: 'pending', format: 'srt', content: null, error: null, generatedFromVoiceoverUrl: null },
+  };
+}
+
 async function runGenerateVoiceover(job, jobId) {
   const voiceover = await voiceoverGeneration.generateVoiceover({
     script: job.script,
@@ -619,28 +683,34 @@ async function runGenerateVoiceover(job, jobId) {
     } catch (error) {
       console.error('Could not measure real voice-over duration for cost estimation:', error.message);
     }
-    updates.finalVideo = {
-      url: null,
-      status: 'pending',
-      subtitlesUsed: null,
-      musicUsed: null,
-      resolutionUsed: null,
-      videoModeUsed: null,
-      editSettingsUsed: null,
-    };
-    updates.simpleStoryRender = {
-      status: 'not_started',
-      totalSections: null,
-      sections: [],
-      audioUrlSnapshot: null,
-      subtitlesContentSnapshot: null,
-      editSettingsSnapshot: null,
-      error: null,
-    };
-    updates.subtitles = { status: 'pending', format: 'srt', content: null, error: null, generatedFromVoiceoverUrl: null };
+    Object.assign(updates, downstreamResetsForNewVoiceover());
   }
 
   return jobStore.updateJob(jobId, updates);
+}
+
+// Records the user's explicit, unambiguous confirmation of the production
+// plan — shared by the confirmVideoJob Agent tool (the chat-driven flow)
+// and POST /api/jobs/:id/approve-and-start (the chat-free "Story to Video"
+// flow), so the two can never diverge on what "confirmed" actually means or
+// snapshot different estimates. Snapshots the CURRENT live cost estimate
+// (see cost-estimation.js) into approvedCostEstimate — the fixed figure the
+// user actually saw and approved, which continueChatToVideoPipeline's
+// budget guard later compares a real, updated estimate against. Returns
+// the updated job, or null if the job doesn't exist.
+async function confirmJobForProduction(jobId) {
+  const currentJob = await jobStore.getJob(jobId);
+  if (!currentJob) {
+    return null;
+  }
+  const approvedCostEstimate = costEstimation.estimateProductionCost({
+    script: currentJob.script,
+    videoMode: currentJob.videoMode,
+    generateYoutubePackage: currentJob.generateYoutubePackage,
+    realVoiceoverDurationSeconds: currentJob.voiceover && currentJob.voiceover.durationSeconds,
+    voiceSource: currentJob.voiceSource,
+  });
+  return jobStore.updateJob(jobId, { confirmed: true, approvedCostEstimate });
 }
 
 // job.script must be a real, complete script before generating an optional
@@ -892,6 +962,15 @@ async function continueChatToVideoPipeline(jobId) {
   }
 
   if (job.voiceover.status !== 'completed') {
+    // "Upload My Own Voice" (see POST /:id/upload-voiceover) must NEVER
+    // fall through to a paid TTS call just because the upload hasn't
+    // landed yet — approve-and-start already refuses to confirm a job like
+    // this until the upload completes, so reaching here means it's still
+    // in flight (or was skipped some other way); either way, wait for the
+    // real upload rather than spend anything.
+    if (job.voiceSource === 'upload') {
+      return { status: 'waiting_for_upload', step: 'voiceover', job };
+    }
     const blocker = findVoiceoverBlocker(job);
     if (blocker) {
       return { status: 'failed', step: 'voiceover', error: blocker, job };
@@ -934,6 +1013,7 @@ async function continueChatToVideoPipeline(jobId) {
         videoMode: job.videoMode,
         generateYoutubePackage: job.generateYoutubePackage,
         realVoiceoverDurationSeconds: job.voiceover.durationSeconds,
+        voiceSource: job.voiceSource,
       });
       if (updatedEstimate.totalUsd > job.approvedCostEstimate.totalUsd * BUDGET_OVERRUN_TOLERANCE) {
         const budgetGuard = {
@@ -1113,6 +1193,7 @@ function summarizeJobForAgent(job) {
     videoMode: job.videoMode,
     generateYoutubePackage: job.generateYoutubePackage,
     realVoiceoverDurationSeconds: job.voiceover && job.voiceover.durationSeconds,
+    voiceSource: job.voiceSource,
   });
 
   if (Array.isArray(job.images)) {
@@ -1124,12 +1205,23 @@ function summarizeJobForAgent(job) {
   }
 
   if (job.voiceover && typeof job.voiceover === 'object') {
-    const { status, voice, voiceStyle, error } = job.voiceover;
+    const { status, voice, voiceStyle, error, source, originalFilename, syncWarning, durationSeconds } = job.voiceover;
     summarized.voiceover = {
       status,
       ...(voice ? { voice } : {}),
       ...(voiceStyle ? { voiceStyle } : {}),
       ...(error ? { error } : {}),
+      // "Upload My Own Voice" fields — only present when this job's
+      // narration is a real uploaded recording, never OpenAI TTS (see
+      // POST /:id/upload-voiceover). source lets the agent correctly say
+      // "your uploaded voice" instead of assuming/offering a TTS voice
+      // change; syncWarning is the free duration-heuristic check from that
+      // same route, surfaced here so the agent can honestly relay it if
+      // asked, never silently dropped.
+      ...(source ? { source } : {}),
+      ...(originalFilename ? { originalFilename } : {}),
+      ...(syncWarning ? { syncWarning } : {}),
+      ...(typeof durationSeconds === 'number' ? { durationSeconds } : {}),
     };
   }
 
@@ -1571,7 +1663,8 @@ const TOOLS = [
       'job (this only applies to Simple Story Video mode\'s own rendering — see assembleFinalVideo). Pass ' +
       'the string "default" for backgroundColor/storyPosition/fontWeight/subtitleColor to reset that one ' +
       'field back to its original built-in look; numeric fields reset the same way by passing their own ' +
-      'default value (subtitleFontScale: 1, subtitleTimingOffsetMs: 0, voiceSpeed: 1, voiceVolumeDb: 0). ' +
+      'default value (subtitleFontScale: 1, subtitleTimingOffsetMs: 0, voiceSpeed: 1, voiceVolumeDb: 0, ' +
+      'musicVolumeDb: 0). ' +
       'backgroundColor: a single solid hex color (e.g. "1a2a4a" for navy — no "#") used for EVERY section, ' +
       'replacing the default rotating color palette. storyPosition: "top"/"center"(default)/"bottom" for ' +
       'the large on-screen story text only — the small caption line always stays at the bottom, standard ' +
@@ -1579,13 +1672,23 @@ const TOOLS = [
       'caption text — the only two weights this app\'s bundled font supports (never claim a different font ' +
       'FAMILY can be applied; that would require a new font file this app does not have). ' +
       'subtitleFontScale: a multiplier (0.5-2.0) on BOTH text elements\' built-in sizes — e.g. 1.3 for ' +
-      '"make the text bigger". subtitleColor: a hex color (no "#") for both text elements, default white. ' +
+      '"make the text bigger". backgroundPreset: "warm" (a warm cream background), "white", "dark", or ' +
+      '"default" to reset — a named alternative to backgroundColor for the same solid-every-section-color ' +
+      'effect; takes priority over backgroundColor if both are somehow set. For a genuinely custom color ' +
+      'the user names or describes, use backgroundColor instead (convert it to hex yourself) — there is no ' +
+      '"custom" preset name. textSize: "medium", "large", or "xl" for the large on-screen story text\'s ' +
+      'real size (the small caption line is unaffected), or "default" to reset. showCaptions: true (default) ' +
+      'keeps the small bottom caption line alongside the large story text; false shows the large story text ' +
+      'only. subtitleColor: a hex color (no "#") for both text elements, default white. ' +
       'subtitleTimingOffsetMs: shifts every subtitle\'s timing by this many milliseconds (-10000 to 10000, ' +
       'positive = later) without touching the audio at all — use this for "the captions are out of sync" ' +
       'requests. voiceSpeed: a playback-speed multiplier (0.5-2.0, e.g. 0.9 for 10% slower) applied ' +
       'LOCALLY to the existing voice-over audio via ffmpeg — never a new text-to-speech call; on-screen ' +
       'text timing is automatically rescaled to stay in sync with the new speed. voiceVolumeDb: a decibel ' +
       'gain/cut (-30 to 30, e.g. 6 for noticeably louder, -6 for quieter) applied LOCALLY the same way. ' +
+      'musicVolumeDb: a decibel gain/cut (-30 to 30) on background music\'s own baseline level, on top of ' +
+      'its built-in automatic ducking under the narration — has no audible effect unless musicEnabled is ' +
+      'also on (see updateVideoJob). ' +
       'None of these fields ever require the user\'s confirmation before calling this — they are all free, ' +
       'local edits — but if the user instead asks for something this cannot do locally (a different VOICE ' +
       'or a re-written script, for example), tell them that requires generateVoiceover (a real, paid ' +
@@ -1595,13 +1698,17 @@ const TOOLS = [
       type: 'object',
       properties: {
         backgroundColor: { type: 'string' },
+        backgroundPreset: { type: 'string', enum: [...simpleStoryVideo.VALID_BACKGROUND_PRESETS, 'default'] },
         storyPosition: { type: 'string', enum: ['top', 'center', 'bottom', 'default'] },
         fontWeight: { type: 'string', enum: ['regular', 'bold', 'default'] },
+        textSize: { type: 'string', enum: [...simpleStoryVideo.VALID_TEXT_SIZES, 'default'] },
+        showCaptions: { type: 'boolean' },
         subtitleFontScale: { type: 'number', minimum: 0.5, maximum: 2.0 },
         subtitleColor: { type: 'string' },
         subtitleTimingOffsetMs: { type: 'integer', minimum: -10000, maximum: 10000 },
         voiceSpeed: { type: 'number', minimum: 0.5, maximum: 2.0 },
         voiceVolumeDb: { type: 'number', minimum: -30, maximum: 30 },
+        musicVolumeDb: { type: 'number', minimum: -30, maximum: 30 },
       },
       additionalProperties: false,
     },
@@ -1834,21 +1941,7 @@ async function executeTool(name, jobId, input) {
   }
 
   if (name === 'confirmVideoJob') {
-    const currentJob = await jobStore.getJob(jobId);
-    // Snapshots the estimate the user actually saw and confirmed against —
-    // see cost-estimation.js and job-store.js's approvedCostEstimate. This
-    // is what a later real cost re-estimate (e.g. once the voice-over's
-    // real duration is known) is compared against by the budget guard in
-    // continueChatToVideoPipeline, so "the approved budget" always means
-    // exactly what was shown at the moment of this confirmation.
-    const approvedCostEstimate = currentJob
-      ? costEstimation.estimateProductionCost({
-          script: currentJob.script,
-          videoMode: currentJob.videoMode,
-          generateYoutubePackage: currentJob.generateYoutubePackage,
-        })
-      : null;
-    const job = await jobStore.updateJob(jobId, { confirmed: true, approvedCostEstimate });
+    const job = await confirmJobForProduction(jobId);
     return JSON.stringify(job ? summarizeJobForAgent(job) : { error: 'job not found' });
   }
 
@@ -2080,8 +2173,14 @@ async function executeTool(name, jobId, input) {
     // for (normalizeVideoEditSettings itself is more lenient, since it also
     // has to tolerate a legacy/never-touched job record).
     const patch = {};
-    const stringFields = ['backgroundColor', 'storyPosition', 'fontWeight', 'subtitleColor'];
+    const stringFields = ['backgroundColor', 'backgroundPreset', 'storyPosition', 'fontWeight', 'textSize', 'subtitleColor'];
     const hexFields = ['backgroundColor', 'subtitleColor'];
+    const enumFields = {
+      backgroundPreset: simpleStoryVideo.VALID_BACKGROUND_PRESETS,
+      storyPosition: simpleStoryVideo.VALID_STORY_POSITIONS,
+      fontWeight: simpleStoryVideo.VALID_FONT_WEIGHTS,
+      textSize: simpleStoryVideo.VALID_TEXT_SIZES,
+    };
     for (const field of stringFields) {
       if (typeof input?.[field] !== 'string') {
         continue;
@@ -2095,9 +2194,17 @@ async function executeTool(name, jobId, input) {
           error: `${field} must be a 6-digit hex color with no "#" (e.g. "1a2a4a"), or "default" to reset — convert the requested color to hex first.`,
         });
       }
+      if (enumFields[field] && !enumFields[field].includes(input[field])) {
+        return JSON.stringify({
+          error: `${field} must be one of: ${enumFields[field].join(', ')}, or "default" to reset.`,
+        });
+      }
       patch[field] = input[field];
     }
-    for (const field of ['subtitleFontScale', 'subtitleTimingOffsetMs', 'voiceSpeed', 'voiceVolumeDb']) {
+    if (typeof input?.showCaptions === 'boolean') {
+      patch.showCaptions = input.showCaptions;
+    }
+    for (const field of ['subtitleFontScale', 'subtitleTimingOffsetMs', 'voiceSpeed', 'voiceVolumeDb', 'musicVolumeDb']) {
       if (typeof input?.[field] === 'number') {
         patch[field] = input[field];
       }
@@ -2344,6 +2451,33 @@ function sanitizeScriptPasteSettings(raw) {
   }
 
   return settings;
+}
+
+// "Story to Video": whitelists/validates the dedicated page's own job
+// fields (see frontend's Story-to-Video form) for POST /api/jobs/story-to-
+// video below — a separate, chat-free entry point from the pasted-script
+// flow above, so its own richer settings surface (voice source, on-screen
+// text presets — handled separately via videoEditSettings) never needs to
+// be shoehorned through sanitizeScriptPasteSettings. voiceStyle is only
+// honored for 'ai' voiceSource — an upload has no TTS voice to pick.
+function sanitizeStoryToVideoJobFields(raw, voiceSource) {
+  const fields = {};
+  for (const field of ['language', 'storyStyle', 'topic', 'duration']) {
+    if (typeof raw?.[field] === 'string' && raw[field].trim() && raw[field].trim().length <= MAX_FREE_TEXT_SETTING_LENGTH) {
+      fields[field] = raw[field].trim();
+    }
+  }
+  if (voiceSource === 'ai' && VOICE_STYLE_OPTIONS.includes(raw?.voiceStyle)) {
+    fields.voiceStyle = raw.voiceStyle;
+  }
+  if (raw?.generateYoutubePackage === true) {
+    fields.generateYoutubePackage = true;
+  }
+  if (raw?.musicEnabled === true && MUSIC_TRACK_OPTIONS.includes(raw.musicTrack)) {
+    fields.musicEnabled = true;
+    fields.musicTrack = raw.musicTrack;
+  }
+  return fields;
 }
 
 app.post('/api/agent', async (req, res) => {
@@ -2699,6 +2833,184 @@ app.post('/api/jobs/:id/generate-voiceover', async (req, res) => {
   }
 });
 
+// Shared by "Upload My Own Voice" (below) and "Upload My Own Music" (see
+// POST /:id/upload-music further down) — both accept the real audio file as
+// a raw request body (never base64/JSON — a 30-40 minute recording would
+// push a JSON envelope well past any reasonable size), validated by its
+// real Content-Type against the three formats this app supports. A
+// per-route express.raw() limit is used instead of raising the global
+// express.json() limit (which stays a deliberately small 1mb for every
+// other route) — these are the only places in the app that genuinely need
+// to accept a large upload.
+const AUDIO_UPLOAD_MAX_BYTES = 60 * 1024 * 1024; // comfortably covers a real 40-minute MP3/M4A recording
+const AUDIO_UPLOAD_CONTENT_TYPES = {
+  'audio/mpeg': 'mp3',
+  'audio/mp3': 'mp3',
+  'audio/wav': 'wav',
+  'audio/x-wav': 'wav',
+  'audio/wave': 'wav',
+  'audio/mp4': 'm4a',
+  'audio/x-m4a': 'm4a',
+  'audio/m4a': 'm4a',
+};
+
+function formatSecondsAsDuration(seconds) {
+  const totalSeconds = Math.max(0, Math.round(seconds));
+  const minutes = Math.floor(totalSeconds / 60);
+  const remainingSeconds = totalSeconds % 60;
+  return minutes > 0 ? `${minutes}m ${remainingSeconds}s` : `${remainingSeconds}s`;
+}
+
+app.post(
+  '/api/jobs/:id/upload-voiceover',
+  express.raw({ type: Object.keys(AUDIO_UPLOAD_CONTENT_TYPES), limit: AUDIO_UPLOAD_MAX_BYTES }),
+  async (req, res) => {
+    const job = await jobStore.getJob(req.params.id);
+    if (!job) {
+      return res.status(404).json({ error: 'job not found' });
+    }
+
+    const contentType = (req.headers['content-type'] || '').split(';')[0].trim().toLowerCase();
+    const extension = AUDIO_UPLOAD_CONTENT_TYPES[contentType];
+    if (!extension) {
+      return res.status(400).json({
+        error: `Unsupported audio format "${contentType || 'unknown'}" — upload an MP3, WAV, or M4A file.`,
+      });
+    }
+    if (!Buffer.isBuffer(req.body) || req.body.length === 0) {
+      return res.status(400).json({
+        error: 'No audio data was received — make sure the file is sent as the raw request body.',
+      });
+    }
+
+    let url;
+    let durationSeconds;
+    try {
+      url = await videoStorage.storeUploadedVoiceoverFile(req.body, job.id, { extension, contentType });
+      durationSeconds = await videoAssembly.getUrlMediaDurationSeconds(url);
+    } catch (error) {
+      console.error(
+        'Uploaded voice-over could not be stored/read:',
+        JSON.stringify({ name: error?.name, message: error?.message }, null, 2)
+      );
+      return res.status(400).json({
+        error: 'That file could not be read as a real audio file — make sure it is a valid, uncorrupted MP3, WAV, or M4A.',
+      });
+    }
+
+    // Free, honest sync check: compares the REAL measured audio duration
+    // against how long the pasted script would typically take to narrate
+    // at an average speaking pace (cost-estimation.js's own estimate) — no
+    // paid transcription is spent just to check this. This only catches an
+    // obviously wrong file (a different recording, a short clip instead of
+    // the full narration); it is a duration heuristic, never a word-for-
+    // word check — real synchronization comes from the subtitles generated
+    // next, transcribed from this exact real audio.
+    let syncWarning = null;
+    const scriptLength = typeof job.script === 'string' ? job.script.trim().length : 0;
+    if (scriptLength > 0) {
+      const expectedSeconds = costEstimation.estimateSpeechDurationSeconds(scriptLength);
+      const ratio = durationSeconds / expectedSeconds;
+      if (ratio < 0.5 || ratio > 2) {
+        syncWarning =
+          `This audio is ${formatSecondsAsDuration(durationSeconds)} long, but the pasted script would typically ` +
+          `take around ${formatSecondsAsDuration(expectedSeconds)} to narrate at an average pace — double-check ` +
+          "this is the right recording for this script before generating subtitles.";
+      }
+    }
+
+    const originalFilename =
+      typeof req.query.filename === 'string' && req.query.filename.trim() ? req.query.filename.trim().slice(0, 200) : null;
+
+    const voiceover = {
+      url,
+      status: 'completed',
+      voice: 'uploaded',
+      voiceStyle: '',
+      source: 'upload',
+      originalFilename,
+      durationSeconds,
+      syncWarning,
+      error: null,
+    };
+
+    const updatedJob = await jobStore.updateJob(job.id, { voiceover, ...downstreamResetsForNewVoiceover() });
+    // Includes a freshly computed cost estimate (now using the real
+    // measured duration, not the rougher script-length guess) so the
+    // Story to Video page can update its cost display right after a
+    // successful upload without a separate request.
+    const costEstimate = costEstimation.estimateProductionCost({
+      script: updatedJob.script,
+      videoMode: updatedJob.videoMode,
+      generateYoutubePackage: updatedJob.generateYoutubePackage,
+      realVoiceoverDurationSeconds: durationSeconds,
+      voiceSource: updatedJob.voiceSource,
+    });
+    res.json({ job: updatedJob, costEstimate });
+  }
+);
+
+// "Upload My Own Music" — the alternative to picking a track from the
+// shared local library (data/music/ — see backend/music-library.js), which
+// ships empty by default and so has nothing to pick from until the user
+// adds files to it themselves. This lets any job enable real background
+// music (see simple-story-video.js's own mixing, reused unchanged here)
+// without depending on that shared library being pre-populated. Sets
+// musicCustomUrl (which resolveJobMusicUrl already prefers over musicTrack)
+// and turns musicEnabled on — never generates or downloads any audio, only
+// stores the real bytes the user sent. musicTrack is cleared so a job never
+// carries a stale, no-longer-intended library selection alongside a fresh
+// upload. No duration/sync check is needed here (unlike voice-over): the
+// real narration duration is what music gets looped/trimmed to fit — see
+// prepareMusicTrack — regardless of how long or short the uploaded track is.
+app.post(
+  '/api/jobs/:id/upload-music',
+  express.raw({ type: Object.keys(AUDIO_UPLOAD_CONTENT_TYPES), limit: AUDIO_UPLOAD_MAX_BYTES }),
+  async (req, res) => {
+    const job = await jobStore.getJob(req.params.id);
+    if (!job) {
+      return res.status(404).json({ error: 'job not found' });
+    }
+
+    const contentType = (req.headers['content-type'] || '').split(';')[0].trim().toLowerCase();
+    const extension = AUDIO_UPLOAD_CONTENT_TYPES[contentType];
+    if (!extension) {
+      return res.status(400).json({
+        error: `Unsupported audio format "${contentType || 'unknown'}" — upload an MP3, WAV, or M4A file.`,
+      });
+    }
+    if (!Buffer.isBuffer(req.body) || req.body.length === 0) {
+      return res.status(400).json({
+        error: 'No audio data was received — make sure the file is sent as the raw request body.',
+      });
+    }
+
+    let url;
+    try {
+      url = await videoStorage.storeUploadedMusicFile(req.body, job.id, { extension, contentType });
+      // Read-only validation that this is a real, decodable audio file —
+      // mirrors upload-voiceover's own corrupt-file check — never persisted
+      // (music's own duration doesn't matter; see the module comment above).
+      await videoAssembly.getUrlMediaDurationSeconds(url);
+    } catch (error) {
+      console.error(
+        'Uploaded music track could not be stored/read:',
+        JSON.stringify({ name: error?.name, message: error?.message }, null, 2)
+      );
+      return res.status(400).json({
+        error: 'That file could not be read as a real audio file — make sure it is a valid, uncorrupted MP3, WAV, or M4A.',
+      });
+    }
+
+    const updatedJob = await jobStore.updateJob(job.id, {
+      musicEnabled: true,
+      musicCustomUrl: url,
+      musicTrack: null,
+    });
+    res.json({ job: updatedJob });
+  }
+);
+
 app.post('/api/jobs/:id/generate-youtube-package', async (req, res) => {
   const job = await jobStore.getJob(req.params.id);
 
@@ -2903,13 +3215,18 @@ app.post('/api/jobs/:id/assemble-video', async (req, res) => {
 // YouTube package after the user's one confirmation needs no long-held HTTP
 // request and no further Claude calls. Always 200 with a `status` field
 // ('waiting_for_confirmation' | 'in_progress' | 'done' | 'failed' |
-// 'awaiting_reconfirmation' | 'not_applicable') plus the current job —
-// never a 4xx/5xx for an expected pipeline state, since a poller needs to
-// keep reading job state either way; only a genuinely unknown job id or an
-// unexpected exception is a real HTTP error. 'awaiting_reconfirmation'
-// means the budget guard paused production (see job.budgetGuard) — the
-// frontend stops auto-polling and shows job.budgetGuard.reason until
-// POST /api/jobs/:id/reconfirm-budget below is called.
+// 'awaiting_reconfirmation' | 'waiting_for_upload' | 'not_applicable') plus
+// the current job — never a 4xx/5xx for an expected pipeline state, since a
+// poller needs to keep reading job state either way; only a genuinely
+// unknown job id or an unexpected exception is a real HTTP error.
+// 'awaiting_reconfirmation' means the budget guard paused production (see
+// job.budgetGuard) — the frontend stops auto-polling and shows
+// job.budgetGuard.reason until POST /api/jobs/:id/reconfirm-budget below is
+// called. 'waiting_for_upload' means this is an "Upload My Own Voice" job
+// (job.voiceSource === 'upload') whose audio hasn't arrived yet — approve-
+// and-start already refuses to reach this state under normal use (see
+// below), so seeing it means the frontend should call
+// POST /api/jobs/:id/upload-voiceover before polling again.
 app.post('/api/jobs/:id/continue-pipeline', async (req, res) => {
   try {
     const result = await continueChatToVideoPipeline(req.params.id);
@@ -2945,6 +3262,117 @@ app.post('/api/jobs/:id/reconfirm-budget', async (req, res) => {
     approvedCostEstimate: job.budgetGuard.updatedEstimate,
     budgetGuard: null,
   });
+  res.json(updatedJob);
+});
+
+// "Story to Video": creates a brand-new, independent job (never reusing or
+// overwriting any other job's script/voice-over/subtitles/render — same
+// job-isolation guarantee as a chat-pasted script) directly from the
+// dedicated Create Video page section, with NO Claude call at all — every
+// setting is already explicit form input, so there is nothing for the
+// agent to infer or ask about. Always 'simple-story' mode (this flow's
+// entire purpose — see the frontend's own "no Runway" messaging). Returns
+// the created job plus a live cost estimate; does NOT confirm it — the
+// user still reviews the estimate and calls approve-and-start below before
+// anything paid can run.
+app.post('/api/jobs/story-to-video', async (req, res) => {
+  const body = req.body || {};
+  const script = typeof body.script === 'string' ? body.script.trim() : '';
+  if (!script) {
+    return res.status(400).json({ error: 'A script is required — paste your complete script first.' });
+  }
+
+  const voiceSource = body.voiceSource === 'upload' ? 'upload' : 'ai';
+  const fields = sanitizeStoryToVideoJobFields(body, voiceSource);
+
+  // backgroundPreset/textSize each have a real default for THIS flow
+  // specifically (a warm cream background, a large 70px story text) —
+  // different from normalizeVideoEditSettings' own neutral "keep the
+  // original built-in look" default, which exists for backward
+  // compatibility with jobs that pre-date this feature (see
+  // simple-story-video.js). A valid custom backgroundColor still wins over
+  // the warm-cream default when no preset name was sent (the UI's
+  // "Custom" choice).
+  const backgroundPreset = simpleStoryVideo.VALID_BACKGROUND_PRESETS.includes(body.backgroundPreset)
+    ? body.backgroundPreset
+    : simpleStoryVideo.HEX_COLOR_RE.test(body.backgroundColor || '')
+      ? null
+      : 'warm';
+  const textSize = simpleStoryVideo.VALID_TEXT_SIZES.includes(body.textSize) ? body.textSize : 'large';
+  const videoEditSettings = simpleStoryVideo.normalizeVideoEditSettings({
+    backgroundPreset,
+    backgroundColor: body.backgroundColor,
+    textSize,
+    showCaptions: body.showCaptions,
+    voiceSpeed: body.voiceSpeed,
+    voiceVolumeDb: body.voiceVolumeDb,
+    musicVolumeDb: body.musicVolumeDb,
+  });
+
+  const job = await jobStore.createJob();
+  const updatedJob = await jobStore.updateJob(job.id, {
+    script,
+    videoMode: 'simple-story',
+    chatToVideoAutoPipeline: true,
+    voiceSource,
+    videoEditSettings,
+    generateYoutubePackage: false,
+    ...fields,
+  });
+
+  const costEstimate = costEstimation.estimateProductionCost({
+    script: updatedJob.script,
+    videoMode: updatedJob.videoMode,
+    generateYoutubePackage: updatedJob.generateYoutubePackage,
+    voiceSource,
+  });
+
+  res.json({ job: updatedJob, costEstimate });
+});
+
+// The chat-free flow's own confirmation gate — the REST equivalent of the
+// confirmVideoJob Agent tool, sharing the exact same confirmJobForProduction
+// snapshot logic so "confirmed" and "approvedCostEstimate" can never mean
+// something different depending on which flow produced them. Two guards
+// beyond that shared logic, specific to this flow:
+// - An "Upload My Own Voice" job cannot be approved before its real audio
+//   has actually arrived (POST /:id/upload-voiceover) — approving first
+//   would otherwise strand the job waiting forever with nothing to poll
+//   its way out of (continueChatToVideoPipeline deliberately never falls
+//   back to paid TTS for an upload job — see there).
+// - An optional maxBudgetUsd lets the page enforce its own "Review Cost"
+//   ceiling: if the live estimate already exceeds what the user typed as
+//   their max, this refuses rather than silently approving something over
+//   their own stated limit.
+app.post('/api/jobs/:id/approve-and-start', async (req, res) => {
+  const job = await jobStore.getJob(req.params.id);
+  if (!job) {
+    return res.status(404).json({ error: 'job not found' });
+  }
+  if (job.voiceSource === 'upload' && job.voiceover.status !== 'completed') {
+    return res.status(400).json({
+      error: 'Upload your voice recording before approving this job — see POST /api/jobs/:id/upload-voiceover.',
+    });
+  }
+
+  const maxBudgetUsd = typeof req.body?.maxBudgetUsd === 'number' ? req.body.maxBudgetUsd : null;
+  if (maxBudgetUsd !== null) {
+    const currentEstimate = costEstimation.estimateProductionCost({
+      script: job.script,
+      videoMode: job.videoMode,
+      generateYoutubePackage: job.generateYoutubePackage,
+      realVoiceoverDurationSeconds: job.voiceover.durationSeconds,
+      voiceSource: job.voiceSource,
+    });
+    if (maxBudgetUsd < currentEstimate.totalUsd) {
+      return res.status(400).json({
+        error: `The estimated cost ($${currentEstimate.totalUsd}) already exceeds your maximum budget ($${maxBudgetUsd}) — raise your budget or reduce the script/settings before approving.`,
+        costEstimate: currentEstimate,
+      });
+    }
+  }
+
+  const updatedJob = await confirmJobForProduction(job.id);
   res.json(updatedJob);
 });
 
