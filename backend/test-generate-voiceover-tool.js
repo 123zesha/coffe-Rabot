@@ -16,8 +16,33 @@
 
 const path = require('path');
 const fs = require('fs');
+const os = require('os');
 const http = require('http');
 const assert = require('assert');
+const { execFileSync } = require('child_process');
+const ffmpegPath = require('ffmpeg-static');
+
+// A real, validly-encoded MP3 buffer (~3 MB, several times larger than
+// OpenAI's real gpt-4o-mini-tts output for a ~4000-character chunk) used by
+// the large-audio stress test below in place of arbitrary non-audio bytes —
+// voiceover-generation.js's chunk-joining logic now actually decodes each
+// chunk (see its concatenateAudioChunks), so the mocked "TTS response" must
+// be real, decodable audio, not filler bytes. Generated once via ffmpeg's
+// own lavfi silent source (ffmpeg-static, already a project dependency) —
+// no network, no paid API, and independent of any locally-installed tool.
+const LARGE_MOCK_AUDIO_BUFFER = (() => {
+  const outPath = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'mock-tts-audio-')), 'silence.mp3');
+  execFileSync(ffmpegPath, [
+    '-y',
+    '-f', 'lavfi',
+    '-i', 'anullsrc=r=44100:cl=mono',
+    '-t', '75',
+    '-c:a', 'libmp3lame',
+    '-b:a', '320k',
+    outPath,
+  ]);
+  return fs.readFileSync(outPath);
+})();
 
 const JOBS_FILE = path.resolve(__dirname, '..', 'data', 'jobs.json');
 const originalJobsFile = fs.existsSync(JOBS_FILE) ? fs.readFileSync(JOBS_FILE, 'utf8') : null;
@@ -50,7 +75,7 @@ const REAL_SCRIPT =
 let mockRequestCount = 0;
 let mockShouldFail = false;
 let lastRequestBody = null;
-let mockAudioBytesPerChunk = 0;
+let useLargeMockAudio = false;
 
 function startMockOpenAi() {
   return new Promise((resolve) => {
@@ -72,11 +97,7 @@ function startMockOpenAi() {
         }
 
         res.writeHead(200, { 'Content-Type': 'audio/mpeg' });
-        res.end(
-          mockAudioBytesPerChunk > 0
-            ? Buffer.alloc(mockAudioBytesPerChunk, 1)
-            : Buffer.from('fake mp3 audio bytes')
-        );
+        res.end(useLargeMockAudio ? LARGE_MOCK_AUDIO_BUFFER : Buffer.from('fake mp3 audio bytes'));
       });
     });
     server.listen(0, () => resolve(server));
@@ -115,24 +136,27 @@ async function main() {
     // Reproduces the exact real production failure this fix addresses: a
     // ~12,800-character script (this app's own real 15-20 minute target
     // length) split into several TTS chunks (MAX_TTS_INPUT_LENGTH = 4096),
-    // each chunk here simulated as 3 MB of audio — several times larger
-    // than OpenAI's real gpt-4o-mini-tts output for a ~4000-character chunk,
-    // chosen deliberately so the combined audio (well over 10 MB) WOULD have
-    // blown the Upstash "ERR max request size exceeded (10485760 bytes)"
-    // limit had it still been embedded as a base64 data: URI in the job
-    // record — the real error seen in production logs.
+    // each chunk here a real ~2.9 MB MP3 (LARGE_MOCK_AUDIO_BUFFER) — several
+    // times larger than OpenAI's real gpt-4o-mini-tts output for a
+    // ~4000-character chunk, chosen deliberately so the combined audio (well
+    // over 10 MB) WOULD have blown the Upstash "ERR max request size
+    // exceeded (10485760 bytes)" limit had it still been embedded as a
+    // base64 data: URI in the job record — the real error seen in
+    // production logs. Must be REAL, decodable audio (not arbitrary bytes):
+    // voiceover-generation.js's concatenateAudioChunks now actually decodes
+    // every chunk to join them at the sample level (see its own comment).
     const LONG_SCRIPT = Array(55).fill(REAL_SCRIPT).join(' '); // ~12,800 characters
     const job = await jobStore.createJob();
     await jobStore.updateJob(job.id, { script: LONG_SCRIPT });
 
     mockRequestCount = 0;
-    mockAudioBytesPerChunk = 3 * 1024 * 1024;
-    const bytesPerChunkUsed = mockAudioBytesPerChunk;
+    useLargeMockAudio = true;
+    const bytesPerChunkUsed = LARGE_MOCK_AUDIO_BUFFER.length;
     let result;
     try {
       result = JSON.parse(await app.executeTool('generateVoiceover', job.id, {}));
     } finally {
-      mockAudioBytesPerChunk = 0;
+      useLargeMockAudio = false;
     }
 
     assert.ok(mockRequestCount >= 3, `expected multiple TTS chunks for a ~12,700 character script, got ${mockRequestCount}`);

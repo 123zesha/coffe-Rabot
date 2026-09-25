@@ -13,10 +13,29 @@
 // or:
 //   npm run test:voiceover-generation
 
+const path = require('path');
+const fs = require('fs');
+const os = require('os');
 const http = require('http');
 const assert = require('assert');
+const { execFileSync } = require('child_process');
+const ffmpegPath = require('ffmpeg-static');
 
 const { generateVoiceover, resolveVoiceDirection } = require('./voiceover-generation');
+
+// A real, validly-encoded (if tiny/silent) MP3 buffer used as every mocked
+// TTS chunk's "audio" below. generateVoiceover's chunk-joining logic
+// (concatenateAudioChunks) now actually decodes each chunk to join a
+// multi-chunk script's audio at the sample level (see its own comment in
+// voiceover-generation.js), so the mocked response must be real, decodable
+// audio, not placeholder text. Generated once via ffmpeg's own lavfi silent
+// source (ffmpeg-static, already a project dependency) — no network, no
+// paid API.
+const MOCK_AUDIO_BUFFER = (() => {
+  const outPath = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'mock-tts-audio-')), 'silence.mp3');
+  execFileSync(ffmpegPath, ['-y', '-f', 'lavfi', '-i', 'anullsrc=r=24000:cl=mono', '-t', '0.3', '-c:a', 'libmp3lame', outPath]);
+  return fs.readFileSync(outPath);
+})();
 
 let failures = 0;
 
@@ -50,7 +69,7 @@ function startMockOpenAi() {
           requestBodies.push(null);
         }
         res.writeHead(200, { 'Content-Type': 'audio/mpeg' });
-        res.end(Buffer.from('fake mp3 audio bytes'));
+        res.end(MOCK_AUDIO_BUFFER);
       });
     });
     server.listen(0, () => resolve(server));
