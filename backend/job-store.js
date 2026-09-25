@@ -110,6 +110,8 @@ const JOB_FIELDS = [
   'resolutionTier',
   'videoMode',
   'chatToVideoAutoPipeline',
+  'approvedCostEstimate',
+  'budgetGuard',
 ];
 
 // The only real, supported output-format values — 'horizontal' (16:9),
@@ -616,6 +618,19 @@ function createDefaultJob(id) {
     // agent (see UPDATABLE_JOB_FIELDS in server.js) — set once at job
     // creation and never changed afterward.
     chatToVideoAutoPipeline: false,
+    // The cost estimate (see backend/cost-estimation.js) the user actually
+    // saw and approved when confirmVideoJob was called: a snapshot, not a
+    // live value, so a later re-estimate has something fixed to compare
+    // against. Backend-only, like chatToVideoAutoPipeline above.
+    approvedCostEstimate: null,
+    // Set by server.js's continueChatToVideoPipeline when a real, updated
+    // cost estimate (e.g. once the voice-over's real measured duration is
+    // known) exceeds approvedCostEstimate by more than its tolerance:
+    // pauses the auto-pipeline at 'awaiting_reconfirmation' instead of
+    // silently spending past what was approved. Cleared by
+    // POST /api/jobs/:id/reconfirm-budget once the user accepts the new
+    // figure. Backend-only.
+    budgetGuard: null,
   };
 }
 

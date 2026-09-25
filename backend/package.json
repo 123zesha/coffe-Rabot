@@ -36,7 +36,8 @@
     "test:simple-story-video-mode": "node test-simple-story-video-mode.js",
     "test:agent-multi-step-flow": "node test-agent-multi-step-flow.js",
     "test:chat-to-video": "node test-chat-to-video.js",
-    "test:chat-to-video-pipeline": "node test-chat-to-video-pipeline.js"
+    "test:chat-to-video-pipeline": "node test-chat-to-video-pipeline.js",
+    "test:cost-estimation": "node test-cost-estimation.js"
   },
   "keywords": [],
   "author": "",

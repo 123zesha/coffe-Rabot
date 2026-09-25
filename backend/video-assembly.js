@@ -646,9 +646,32 @@ async function extractThumbnailFrame(videoUrl, { atSeconds = 2 } = {}) {
   }
 }
 
+// Real duration of an ALREADY-generated media file (e.g. a job's voice-over
+// audio), given only its stored url — resolves every url shape this app's
+// job records actually use (data:, /generated/, http(s), a plain local
+// path — see fetchToFile above) to real bytes, then decodes them locally
+// with getMediaDuration. Purely local ffmpeg work, zero paid API cost —
+// used by server.js right after a real (paid) voice-over generation to get
+// an honest, measured duration for the production cost estimate, rather
+// than the rougher script-length guess used before any audio exists.
+// Throws on a missing/corrupt file — callers treat this as best-effort and
+// never let a failure here undo an already-successful, already-paid
+// generation.
+async function getUrlMediaDurationSeconds(url) {
+  const workDir = fs.mkdtempSync(path.join(os.tmpdir(), 'media-duration-'));
+  const filePath = path.join(workDir, 'input');
+  try {
+    await fetchToFile(url, filePath);
+    return await getMediaDuration(filePath);
+  } finally {
+    fs.rmSync(workDir, { recursive: true, force: true });
+  }
+}
+
 module.exports = {
   assembleFinalVideo,
   getMediaDuration,
+  getUrlMediaDurationSeconds,
   verifyAssembledVideoBuffer,
   extractThumbnailFrame,
   ffmpegPath,

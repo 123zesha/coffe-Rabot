@@ -233,6 +233,96 @@ async function main() {
     assert.strictEqual(imageRequestCount, before.image);
   });
 
+  await test('runGenerateVoiceover measures a real, positive voice-over duration locally (zero paid cost) for the cost estimate to use', async () => {
+    const job = await jobStore.createJob();
+    await jobStore.updateJob(job.id, {
+      script: REAL_SCRIPT,
+      videoMode: 'simple-story',
+      voiceStyle: 'neutral-narrator',
+      chatToVideoAutoPipeline: true,
+      confirmed: true,
+    });
+
+    const step1 = await continueChatToVideoPipeline(job.id);
+    assert.strictEqual(step1.status, 'in_progress');
+    assert.strictEqual(step1.step, 'voiceover');
+    assert.strictEqual(
+      typeof step1.job.voiceover.durationSeconds,
+      'number',
+      'a real, local ffmpeg measurement must run right after a successful voice-over generation'
+    );
+    assert.ok(step1.job.voiceover.durationSeconds > 0);
+  });
+
+  await test('budget guard pauses production for reconfirmation when the real narration costs meaningfully more than approved, and never runs subtitles until reconfirmed', async () => {
+    const job = await jobStore.createJob();
+    await jobStore.updateJob(job.id, {
+      script: REAL_SCRIPT,
+      videoMode: 'simple-story',
+      voiceStyle: 'neutral-narrator',
+      chatToVideoAutoPipeline: true,
+      confirmed: true,
+      // Artificially far below anything the real script could cost, so the
+      // budget guard is guaranteed to trip once the real voice-over
+      // duration is known — this is standing in for "the user approved a
+      // much smaller estimate than what the real narration turned out to
+      // need".
+      approvedCostEstimate: { totalUsd: 0.0001, breakdown: {}, estimatedDurationSeconds: 1, basis: 'script-length', note: '' },
+    });
+
+    ttsRequestCount = 0;
+    transcriptionRequestCount = 0;
+
+    const step1 = await continueChatToVideoPipeline(job.id);
+    assert.strictEqual(step1.status, 'in_progress');
+    assert.strictEqual(step1.step, 'voiceover');
+    assert.strictEqual(ttsRequestCount, 1, 'the voice-over itself is unaffected by the guard — it already happened before duration is known');
+
+    const step2 = await continueChatToVideoPipeline(job.id);
+    assert.strictEqual(step2.status, 'awaiting_reconfirmation');
+    assert.strictEqual(step2.step, 'subtitles');
+    assert.strictEqual(transcriptionRequestCount, 0, 'subtitles/transcription must never run while the budget guard is unresolved');
+    assert.ok(step2.job.budgetGuard);
+    assert.strictEqual(step2.job.budgetGuard.approvedUsd, 0.0001);
+    assert.ok(step2.job.budgetGuard.updatedEstimate.totalUsd > 0.0001);
+    assert.ok(step2.job.budgetGuard.reason && step2.job.budgetGuard.reason.length > 0);
+    // Snapshotted now, BEFORE reconfirm-budget mutates the underlying job
+    // record in place (the no-Redis fallback store returns live object
+    // references, not copies — step2.job would otherwise reflect the
+    // post-reconfirm state too, since it's the same object).
+    const updatedEstimateTotalUsd = step2.job.budgetGuard.updatedEstimate.totalUsd;
+
+    // Repeated polling while paused must stay paused, never re-run the
+    // check or advance on its own.
+    const step3 = await continueChatToVideoPipeline(job.id);
+    assert.strictEqual(step3.status, 'awaiting_reconfirmation');
+    assert.strictEqual(transcriptionRequestCount, 0);
+
+    const reconfirmRes = await fetch(`${baseUrl}/api/jobs/${job.id}/reconfirm-budget`, { method: 'POST' });
+    const reconfirmBody = await reconfirmRes.json();
+    assert.strictEqual(reconfirmRes.status, 200, JSON.stringify(reconfirmBody));
+    assert.strictEqual(reconfirmBody.budgetGuard, null);
+    assert.strictEqual(reconfirmBody.approvedCostEstimate.totalUsd, updatedEstimateTotalUsd);
+
+    // Now the pipeline resumes normally, past the point it was paused at.
+    const step4 = await continueChatToVideoPipeline(job.id);
+    assert.strictEqual(step4.status, 'in_progress');
+    assert.strictEqual(step4.step, 'subtitles');
+    assert.strictEqual(step4.job.subtitles.status, 'completed');
+    assert.strictEqual(transcriptionRequestCount, 1);
+  });
+
+  await test('POST /api/jobs/:id/reconfirm-budget refuses when there is nothing pending, and 404s for an unknown job', async () => {
+    const job = await jobStore.createJob();
+    await jobStore.updateJob(job.id, { chatToVideoAutoPipeline: true, confirmed: true });
+
+    const res = await fetch(`${baseUrl}/api/jobs/${job.id}/reconfirm-budget`, { method: 'POST' });
+    assert.strictEqual(res.status, 400);
+
+    const notFoundRes = await fetch(`${baseUrl}/api/jobs/no-such-job/reconfirm-budget`, { method: 'POST' });
+    assert.strictEqual(notFoundRes.status, 404);
+  });
+
   await test('continueChatToVideoPipeline reports a failed voiceover step honestly when the job has no script, without any real call', async () => {
     const job = await jobStore.createJob();
     await jobStore.updateJob(job.id, {
