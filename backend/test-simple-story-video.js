@@ -852,7 +852,9 @@ async function main() {
         storyPosition: null,
         fontWeight: null,
         textSize: null,
+        textSizePx: null,
         showCaptions: true,
+        textBackground: true,
         subtitleFontScale: 1,
         subtitleColor: null,
         subtitleTimingOffsetMs: 0,
@@ -884,7 +886,9 @@ async function main() {
       storyPosition: 'top',
       fontWeight: 'bold',
       textSize: 'xl',
+      textSizePx: null,
       showCaptions: false,
+      textBackground: true,
       subtitleFontScale: 1.5,
       subtitleColor: 'ff0000',
       subtitleTimingOffsetMs: 250,
@@ -965,6 +969,52 @@ async function main() {
     assert.ok(withCaptions.includes(',Caption,'), 'Caption dialogue events must still be emitted by default');
   });
 
+  await test('normalizeVideoEditSettings clamps/rounds textSizePx and defaults it to null (legacy textSize/64px behavior)', () => {
+    assert.strictEqual(ssv.normalizeVideoEditSettings({}).textSizePx, null);
+    assert.strictEqual(ssv.normalizeVideoEditSettings({ textSizePx: 90.6 }).textSizePx, 91, 'must round to the nearest integer px');
+    assert.strictEqual(
+      ssv.normalizeVideoEditSettings({ textSizePx: 999 }).textSizePx,
+      ssv.TEXT_SIZE_PX_MAX,
+      'must clamp above the max'
+    );
+    assert.strictEqual(
+      ssv.normalizeVideoEditSettings({ textSizePx: -5 }).textSizePx,
+      ssv.TEXT_SIZE_PX_MIN,
+      'must clamp below the min'
+    );
+    assert.strictEqual(ssv.normalizeVideoEditSettings({ textSizePx: 'not-a-number' }).textSizePx, null);
+  });
+
+  await test('normalizeVideoEditSettings defaults textBackground to true (the original always-on box)', () => {
+    assert.strictEqual(ssv.normalizeVideoEditSettings({}).textBackground, true);
+    assert.strictEqual(ssv.normalizeVideoEditSettings({ textBackground: false }).textBackground, false);
+    assert.strictEqual(
+      ssv.normalizeVideoEditSettings({ textBackground: 'nonsense' }).textBackground,
+      true,
+      'a non-boolean value must fall back to the default rather than being coerced'
+    );
+  });
+
+  await test('buildAssScript: textSizePx takes priority over the legacy textSize tiers, and an already-existing job with only textSize keeps rendering at exactly its original size', () => {
+    const cues = ssv.parseSrt(FIXTURE_SRT);
+
+    // A pre-existing job's stored shape: only the legacy textSize, no
+    // textSizePx at all — must resolve to EXACTLY the original hardcoded
+    // px value, byte-for-byte the same as before this control existed.
+    const legacyOnly = ssv.buildAssScript(cues, 9, ssv.normalizeVideoEditSettings({ textSize: 'xl' }));
+    assert.ok(legacyOnly.includes(`Style: Story,DejaVu Sans,${ssv.TEXT_SIZE_PX.xl},`));
+
+    // A new job using the numeric control directly, with no legacy
+    // textSize at all.
+    const numericOnly = ssv.buildAssScript(cues, 9, ssv.normalizeVideoEditSettings({ textSizePx: 100 }));
+    assert.ok(numericOnly.includes('Style: Story,DejaVu Sans,100,'));
+
+    // Both somehow set (e.g. a legacy job later edited with the new
+    // control) — textSizePx must win.
+    const bothSet = ssv.buildAssScript(cues, 9, ssv.normalizeVideoEditSettings({ textSize: 'xl', textSizePx: 45 }));
+    assert.ok(bothSet.includes('Style: Story,DejaVu Sans,45,'), 'textSizePx must take priority over the legacy textSize tier');
+  });
+
   await test('normalizeVideoEditSettings is pure — the same input always JSON-serializes identically', () => {
     const input = { backgroundColor: '2d3142', voiceSpeed: 1.1 };
     const a = JSON.stringify(ssv.normalizeVideoEditSettings(input));
@@ -1034,12 +1084,43 @@ async function main() {
     assert.strictEqual(storyFields[3], ssv.assColorFromHex('ff0000'), 'story PrimaryColour must reflect subtitleColor');
     assert.strictEqual(storyFields[7], '0', 'fontWeight "regular" must turn story Bold off');
     assert.strictEqual(storyFields[18], '8', 'storyPosition "top" must set Story Alignment to 8');
+    // textBackground defaults to true (unset here) — must reproduce the
+    // exact original hardcoded box values, unchanged by this feature.
+    assert.strictEqual(storyFields[6], '&H99000000', 'default textBackground must keep the original semi-opaque box color');
+    assert.strictEqual(storyFields[15], '3', 'default textBackground must keep BorderStyle 3 (opaque box)');
 
     // The caption line always stays bottom-center regardless of
     // storyPosition — only its fontsize/color/weight follow editSettings.
     assert.strictEqual(captionFields[2], '60', 'caption fontsize must be 30 * subtitleFontScale(2)');
     assert.strictEqual(captionFields[3], ssv.assColorFromHex('ff0000'));
     assert.strictEqual(captionFields[18], '2', 'the caption line must always stay bottom-center (Alignment 2)');
+  });
+
+  await test('buildAssScript: textBackground false removes the story text\'s box (plain outlined text instead), and never touches the Caption style', () => {
+    const cues = ssv.parseSrt(FIXTURE_SRT);
+    const noBox = ssv.buildAssScript(cues, 10, ssv.normalizeVideoEditSettings({ textBackground: false }));
+    const storyLine = noBox.split('\n').find((line) => line.startsWith('Style: Story,'));
+    const captionLine = noBox.split('\n').find((line) => line.startsWith('Style: Caption,'));
+    const storyFields = storyLine.split(',');
+    const captionFields = captionLine.split(',');
+
+    assert.strictEqual(storyFields[6], '&H00000000', 'the box color must become fully transparent');
+    assert.strictEqual(storyFields[15], '1', 'BorderStyle must switch to 1 (outline only, no box)');
+    assert.strictEqual(storyFields[16], '3', 'a real outline width must replace the box');
+    assert.strictEqual(storyFields[17], '0', 'no shadow/box-padding is needed once there is no box');
+
+    // The default look (textBackground true, the exact original hardcoded
+    // values) reproduced exactly for comparison.
+    const withBox = ssv.buildAssScript(cues, 10, ssv.normalizeVideoEditSettings({}));
+    const withBoxFields = withBox.split('\n').find((line) => line.startsWith('Style: Story,')).split(',');
+    assert.strictEqual(withBoxFields[6], '&H99000000');
+    assert.strictEqual(withBoxFields[15], '3');
+    assert.strictEqual(withBoxFields[16], '0');
+    assert.strictEqual(withBoxFields[17], '4');
+
+    // The small bottom caption line's own style is completely unaffected by
+    // textBackground — it never had a box to begin with.
+    assert.strictEqual(captionFields[15], '1');
   });
 
   await test('assColorFromHex converts RRGGBB to ASS &H00BBGGRR and falls back to white for invalid input', () => {
@@ -1091,6 +1172,53 @@ async function main() {
     assert.ok(Math.abs(pixel.r - 0x20) <= 20, `expected R≈0x20, got 0x${pixel.r.toString(16)}`);
     assert.ok(Math.abs(pixel.g - 0x40) <= 20, `expected G≈0x40, got 0x${pixel.g.toString(16)}`);
     assert.ok(Math.abs(pixel.b - 0x80) <= 20, `expected B≈0x80, got 0x${pixel.b.toString(16)}`);
+  });
+
+  await test('continueSimpleStoryVideoAssembly: textBackground genuinely removes the story text\'s box from the actual rendered pixels, not just the interface/ASS script', async () => {
+    const audioPath = await makeToneAudio(workDir, 4, 'text-bg');
+    const bgColor = 'ff00ff'; // bright magenta, easy to tell apart from the box's near-black overlay
+    const commonArgs = {
+      voiceover: { status: 'completed', url: audioPath },
+      subtitlesContent: FIXTURE_SRT,
+      existingRender: null,
+    };
+
+    const withBox = await ssv.continueSimpleStoryVideoAssembly({
+      ...commonArgs,
+      jobId: 'test-job-text-bg-on',
+      editSettings: { backgroundColor: bgColor, textBackground: true },
+    });
+    assert.strictEqual(withBox.status, 'completed', withBox.error);
+    const withBoxPath = path.join(workDir, 'output-text-bg-on.mp4');
+    fs.writeFileSync(withBoxPath, withBox.buffer);
+
+    const withoutBox = await ssv.continueSimpleStoryVideoAssembly({
+      ...commonArgs,
+      jobId: 'test-job-text-bg-off',
+      editSettings: { backgroundColor: bgColor, textBackground: false },
+    });
+    assert.strictEqual(withoutBox.status, 'completed', withoutBox.error);
+    const withoutBoxPath = path.join(workDir, 'output-text-bg-off.mp4');
+    fs.writeFileSync(withoutBoxPath, withoutBox.buffer);
+
+    // Empirically-verified point that sits inside the story text box's
+    // vertical span (its padding, not any glyph stroke) — covered by the
+    // semi-opaque black box when textBackground is on, plain scene
+    // background when it's off.
+    const x = Math.round(ssv.SIMPLE_STORY_WIDTH / 2) - 300;
+    const y = Math.round(ssv.SIMPLE_STORY_HEIGHT / 2) - 60;
+
+    const onPixel = await probePixelColor(withBoxPath, 1.0, x, y);
+    const offPixel = await probePixelColor(withoutBoxPath, 1.0, x, y);
+
+    assert.ok(
+      onPixel.r < 200 && onPixel.b < 200,
+      `expected the box to visibly darken this point when textBackground is on, got rgb(${onPixel.r},${onPixel.g},${onPixel.b})`
+    );
+    assert.ok(
+      offPixel.r > 235 && offPixel.b > 235,
+      `expected plain background magenta here once the box is removed, got rgb(${offPixel.r},${offPixel.g},${offPixel.b})`
+    );
   });
 
   await test('continueSimpleStoryVideoAssembly applies voiceSpeed to both the audio and the on-screen text timing', async () => {

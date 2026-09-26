@@ -290,12 +290,32 @@
             </div>
 
             <div class="form-field">
-              <label for="story-text-size">On-screen text size</label>
-              <select id="story-text-size">
-                <option value="medium">Medium</option>
-                <option value="large" selected>Large</option>
-                <option value="xl">Extra Large</option>
-              </select>
+              <label for="story-text-size">On-screen text size (px)</label>
+              <div class="stepper-field">
+                <button type="button" id="story-text-size-decrease" class="stepper-btn" aria-label="Decrease text size">&minus;</button>
+                <input type="number" id="story-text-size" min="24" max="160" step="1" value="70">
+                <button type="button" id="story-text-size-increase" class="stepper-btn" aria-label="Increase text size">+</button>
+              </div>
+            </div>
+
+            <div class="form-field">
+              <label for="story-text-color">Text color</label>
+              <input type="color" id="story-text-color" value="#ffffff">
+            </div>
+
+            <div class="form-field">
+              <label class="checkbox-field">
+                <input type="checkbox" id="story-text-bold" checked>
+                Bold text
+              </label>
+            </div>
+
+            <div class="form-field">
+              <label class="checkbox-field">
+                <input type="checkbox" id="story-text-background" checked>
+                Text background
+              </label>
+              <p class="field-hint">Uncheck to remove the box behind the on-screen text and show plain outlined text instead.</p>
             </div>
 
             <div class="form-field form-field-wide">

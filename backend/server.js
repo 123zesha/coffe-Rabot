@@ -1677,10 +1677,14 @@ const TOOLS = [
       '"default" to reset — a named alternative to backgroundColor for the same solid-every-section-color ' +
       'effect; takes priority over backgroundColor if both are somehow set. For a genuinely custom color ' +
       'the user names or describes, use backgroundColor instead (convert it to hex yourself) — there is no ' +
-      '"custom" preset name. textSize: "medium", "large", or "xl" for the large on-screen story text\'s ' +
-      'real size (the small caption line is unaffected), or "default" to reset. showCaptions: true (default) ' +
+      '"custom" preset name. textSizePx: a real px number (24-160) for the large on-screen story text\'s ' +
+      'exact size (the small caption line is unaffected) — the current, actual size control; pass 70 to ' +
+      'reset to the original default. textSize: "medium"/"large"/"xl", a LEGACY alternative kept only for ' +
+      'backward compatibility — prefer textSizePx for any new request. showCaptions: true (default) ' +
       'keeps the small bottom caption line alongside the large story text; false shows the large story text ' +
-      'only. subtitleColor: a hex color (no "#") for both text elements, default white. ' +
+      'only. textBackground: true (default) shows the large story text on an opaque box, matching the ' +
+      'original look; false removes the box for plain outlined text instead. subtitleColor: a hex color ' +
+      '(no "#") for both text elements, default white. ' +
       'subtitleTimingOffsetMs: shifts every subtitle\'s timing by this many milliseconds (-10000 to 10000, ' +
       'positive = later) without touching the audio at all — use this for "the captions are out of sync" ' +
       'requests. voiceSpeed: a playback-speed multiplier (0.5-2.0, e.g. 0.9 for 10% slower) applied ' +
@@ -1703,7 +1707,9 @@ const TOOLS = [
         storyPosition: { type: 'string', enum: ['top', 'center', 'bottom', 'default'] },
         fontWeight: { type: 'string', enum: ['regular', 'bold', 'default'] },
         textSize: { type: 'string', enum: [...simpleStoryVideo.VALID_TEXT_SIZES, 'default'] },
+        textSizePx: { type: 'number', minimum: simpleStoryVideo.TEXT_SIZE_PX_MIN, maximum: simpleStoryVideo.TEXT_SIZE_PX_MAX },
         showCaptions: { type: 'boolean' },
+        textBackground: { type: 'boolean' },
         subtitleFontScale: { type: 'number', minimum: 0.5, maximum: 2.0 },
         subtitleColor: { type: 'string' },
         subtitleTimingOffsetMs: { type: 'integer', minimum: -10000, maximum: 10000 },
@@ -2205,7 +2211,10 @@ async function executeTool(name, jobId, input) {
     if (typeof input?.showCaptions === 'boolean') {
       patch.showCaptions = input.showCaptions;
     }
-    for (const field of ['subtitleFontScale', 'subtitleTimingOffsetMs', 'voiceSpeed', 'voiceVolumeDb', 'musicVolumeDb']) {
+    if (typeof input?.textBackground === 'boolean') {
+      patch.textBackground = input.textBackground;
+    }
+    for (const field of ['subtitleFontScale', 'subtitleTimingOffsetMs', 'voiceSpeed', 'voiceVolumeDb', 'musicVolumeDb', 'textSizePx']) {
       if (typeof input?.[field] === 'number') {
         patch[field] = input[field];
       }
@@ -3384,12 +3393,27 @@ app.post('/api/jobs/story-to-video', async (req, res) => {
     : simpleStoryVideo.HEX_COLOR_RE.test(body.backgroundColor || '')
       ? null
       : 'warm';
+  // textSize still defaults to 'large' (70px) for THIS flow specifically,
+  // exactly as before — kept for backward compatibility with any caller
+  // still sending it. textSizePx (the frontend's current +/- stepper
+  // control) is optional and, whenever a real number is sent, takes
+  // priority over textSize (see normalizeVideoEditSettings/buildAssScript),
+  // so a fresh job created with an explicit size renders at exactly that
+  // size regardless of the legacy default. fontWeight/subtitleColor/
+  // textBackground fall through to normalizeVideoEditSettings' own neutral
+  // defaults (bold white text on an opaque box) when the frontend sends
+  // none, exactly matching this flow's original always-on look.
   const textSize = simpleStoryVideo.VALID_TEXT_SIZES.includes(body.textSize) ? body.textSize : 'large';
+  const textSizePx = Number.isFinite(Number(body.textSizePx)) ? Number(body.textSizePx) : undefined;
   const videoEditSettings = simpleStoryVideo.normalizeVideoEditSettings({
     backgroundPreset,
     backgroundColor: body.backgroundColor,
     textSize,
+    textSizePx,
+    fontWeight: body.fontWeight,
+    subtitleColor: body.subtitleColor,
     showCaptions: body.showCaptions,
+    textBackground: body.textBackground,
     voiceSpeed: body.voiceSpeed,
     voiceVolumeDb: body.voiceVolumeDb,
     musicVolumeDb: body.musicVolumeDb,
