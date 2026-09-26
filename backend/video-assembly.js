@@ -171,6 +171,55 @@ async function duckAndMixMusicWithVoiceover(preparedMusicPath, voiceoverPath, ou
   ]);
 }
 
+// Joins several independently-encoded audio files (each a real, complete
+// file with its own container header — e.g. every chunk OpenAI's TTS API
+// returns for a long script, or every file a user selects for "Upload My
+// Own Voice") into ONE continuous track, in the given order. A raw byte
+// concatenation of independent files (Buffer.concat) leaves every later
+// file's own header sitting mid-stream as if it were audio data — this is
+// exactly the "invalid concatenated file" shape ffmpeg itself flags, and in
+// practice produces short garbled/dropout artifacts right at each seam.
+// Decoding each file to real audio samples first, then joining those
+// samples and encoding the result ONCE, produces one genuine, gapless
+// track with no embedded headers in the middle. A single buffer is
+// returned unchanged (no ffmpeg call at all).
+async function concatenateAudioBuffers(buffers) {
+  if (buffers.length === 1) {
+    return buffers[0];
+  }
+
+  const workDir = fs.mkdtempSync(path.join(os.tmpdir(), 'audio-concat-'));
+  try {
+    const wavPaths = [];
+    for (let i = 0; i < buffers.length; i++) {
+      const inputPath = path.join(workDir, `input-${i}.audio`);
+      const wavPath = path.join(workDir, `input-${i}.wav`);
+      fs.writeFileSync(inputPath, buffers[i]);
+      await runFfmpeg(['-y', '-i', inputPath, wavPath]);
+      wavPaths.push(wavPath);
+    }
+
+    const outPath = path.join(workDir, 'concatenated.mp3');
+    const inputArgs = wavPaths.flatMap((wavPath) => ['-i', wavPath]);
+    const filterInputs = wavPaths.map((_, i) => `[${i}:a]`).join('');
+    await runFfmpeg([
+      '-y',
+      ...inputArgs,
+      '-filter_complex',
+      `${filterInputs}concat=n=${wavPaths.length}:v=0:a=1[out]`,
+      '-map',
+      '[out]',
+      '-c:a',
+      'libmp3lame',
+      outPath,
+    ]);
+
+    return fs.readFileSync(outPath);
+  } finally {
+    fs.rmSync(workDir, { recursive: true, force: true });
+  }
+}
+
 function runFfmpeg(args) {
   return new Promise((resolve, reject) => {
     execFile(ffmpegPath, args, { maxBuffer: 1024 * 1024 * 64 }, (error, stdout, stderr) => {
@@ -682,6 +731,8 @@ module.exports = {
   prepareMusicTrack,
   duckAndMixMusicWithVoiceover,
   MUSIC_VOLUME_WITH_VOICEOVER,
+  concatenateAudioBuffers,
+  fetchToFile,
   ffmpegPath,
   OUTPUT_DIMENSIONS_BY_FORMAT,
   OUTPUT_DIMENSIONS_BY_FORMAT_AND_TIER,

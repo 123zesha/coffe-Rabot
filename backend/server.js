@@ -1,5 +1,6 @@
 const path = require('path');
 const fs = require('fs');
+const os = require('os');
 require('dotenv').config({ path: path.resolve(__dirname, '..', '.env'), quiet: true });
 
 const express = require('express');
@@ -2883,14 +2884,99 @@ app.post(
       });
     }
 
+    // "Upload My Own Voice" lets a user select more than one audio file at
+    // once (e.g. a narration recorded in separate takes) — the frontend
+    // uploads them ONE AT A TIME, in the order selected, tagging each
+    // request with its 1-based position (partIndex) and the total count
+    // (totalParts) so this route can join them into one continuous
+    // voice-over. Both omitted (or totalParts <= 1) is a plain single-file
+    // upload — byte-for-byte the same request/response shape as before
+    // this feature existed.
+    const totalParts = Math.max(1, Number(req.query.totalParts) || 1);
+    const partIndex = Math.max(1, Number(req.query.partIndex) || 1);
+    if (partIndex > totalParts) {
+      return res.status(400).json({ error: 'partIndex cannot be greater than totalParts.' });
+    }
+
+    let combinedBuffer = req.body;
+    if (partIndex > 1) {
+      // Every earlier part was already joined into job.voiceover.url (see
+      // the "more parts to come" branch below, which never advances past
+      // 'pending') — fetch that real, already-combined audio and join this
+      // new part onto the end of it, IN ORDER, at the sample level
+      // (video-assembly.js's concatenateAudioBuffers). A raw byte
+      // concatenation here would reintroduce the exact seam-glitch bug
+      // that function's own comment describes, now for user recordings
+      // instead of TTS chunks.
+      if (!job.voiceover || !job.voiceover.url) {
+        return res.status(400).json({
+          error: `Expected part ${partIndex - 1} of ${totalParts} to have been uploaded first.`,
+        });
+      }
+      const workDir = fs.mkdtempSync(path.join(os.tmpdir(), 'voiceover-upload-part-'));
+      try {
+        const previousPath = path.join(workDir, 'previous');
+        await videoAssembly.fetchToFile(job.voiceover.url, previousPath);
+        combinedBuffer = await videoAssembly.concatenateAudioBuffers([fs.readFileSync(previousPath), req.body]);
+      } catch (error) {
+        console.error(
+          'Could not join the next uploaded voice-over part:',
+          JSON.stringify({ name: error?.name, message: error?.message }, null, 2)
+        );
+        return res.status(400).json({
+          error:
+            'Could not combine this file with the previously uploaded part(s) — make sure every file is a valid, ' +
+            'uncorrupted MP3, WAV, or M4A.',
+        });
+      } finally {
+        fs.rmSync(workDir, { recursive: true, force: true });
+      }
+    }
+
+    const isLastPart = partIndex === totalParts;
+
     let url;
+    try {
+      url = await videoStorage.storeUploadedVoiceoverFile(combinedBuffer, job.id, { extension, contentType });
+    } catch (error) {
+      console.error(
+        'Uploaded voice-over could not be stored:',
+        JSON.stringify({ name: error?.name, message: error?.message }, null, 2)
+      );
+      return res.status(400).json({
+        error: 'That file could not be read as a real audio file — make sure it is a valid, uncorrupted MP3, WAV, or M4A.',
+      });
+    }
+
+    if (!isLastPart) {
+      // Not the final file yet — status stays 'pending' so nothing
+      // downstream (subtitles, approve-and-start) treats this job as ready
+      // before the whole narration has arrived. voiceover.url already
+      // points at the real, correctly-joined audio received SO FAR, so the
+      // next part's upload (above) has the right thing to join onto.
+      const updatedJob = await jobStore.updateJob(job.id, {
+        voiceover: {
+          url,
+          status: 'pending',
+          voice: 'uploaded',
+          voiceStyle: '',
+          source: 'upload',
+          originalFilename: null,
+          durationSeconds: null,
+          syncWarning: null,
+          error: null,
+        },
+        ...downstreamResetsForNewVoiceover(),
+      });
+      return res.json({ job: updatedJob, partIndex, totalParts });
+    }
+
     let durationSeconds;
     try {
-      url = await videoStorage.storeUploadedVoiceoverFile(req.body, job.id, { extension, contentType });
       durationSeconds = await videoAssembly.getUrlMediaDurationSeconds(url);
     } catch (error) {
       console.error(
-        'Uploaded voice-over could not be stored/read:',
+        'Uploaded voice-over could not be read:',
         JSON.stringify({ name: error?.name, message: error?.message }, null, 2)
       );
       return res.status(400).json({

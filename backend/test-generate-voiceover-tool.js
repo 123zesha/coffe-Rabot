@@ -26,8 +26,8 @@ const ffmpegPath = require('ffmpeg-static');
 // OpenAI's real gpt-4o-mini-tts output for a ~4000-character chunk) used by
 // the large-audio stress test below in place of arbitrary non-audio bytes —
 // voiceover-generation.js's chunk-joining logic now actually decodes each
-// chunk (see its concatenateAudioChunks), so the mocked "TTS response" must
-// be real, decodable audio, not filler bytes. Generated once via ffmpeg's
+// chunk (see video-assembly.js's concatenateAudioBuffers), so the mocked
+// "TTS response" must be real, decodable audio, not filler bytes. Generated once via ffmpeg's
 // own lavfi silent source (ffmpeg-static, already a project dependency) —
 // no network, no paid API, and independent of any locally-installed tool.
 const LARGE_MOCK_AUDIO_BUFFER = (() => {
@@ -143,8 +143,9 @@ async function main() {
     // exceeded (10485760 bytes)" limit had it still been embedded as a
     // base64 data: URI in the job record — the real error seen in
     // production logs. Must be REAL, decodable audio (not arbitrary bytes):
-    // voiceover-generation.js's concatenateAudioChunks now actually decodes
-    // every chunk to join them at the sample level (see its own comment).
+    // voiceover-generation.js now joins chunks via video-assembly.js's
+    // concatenateAudioBuffers, which actually decodes every chunk to join
+    // them at the sample level (see its own comment).
     const LONG_SCRIPT = Array(55).fill(REAL_SCRIPT).join(' '); // ~12,800 characters
     const job = await jobStore.createJob();
     await jobStore.updateJob(job.id, { script: LONG_SCRIPT });

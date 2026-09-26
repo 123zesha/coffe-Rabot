@@ -75,6 +75,47 @@ async function main() {
   await runFfmpeg(simpleStoryVideo.ffmpegPath, ['-y', '-f', 'lavfi', '-i', 'sine=frequency=440:duration=2', wavPath]);
   const wavBuffer = fs.readFileSync(wavPath);
 
+  // Two real, distinguishable audio fixtures (different tones) used to prove
+  // multi-file "Upload My Own Voice" both really joins the parts (combined
+  // duration) AND preserves the exact order they were uploaded in (part A's
+  // tone plays during the first part of the combined file, part B's during
+  // the second) — see measureBandVolume below.
+  const partALowTonePath = path.join(workDir, 'part-a-low.mp3');
+  await runFfmpeg(simpleStoryVideo.ffmpegPath, [
+    '-y', '-f', 'lavfi', '-i', 'sine=frequency=300:duration=3', '-c:a', 'libmp3lame', partALowTonePath,
+  ]);
+  const partALowToneBuffer = fs.readFileSync(partALowTonePath);
+
+  const partBHighTonePath = path.join(workDir, 'part-b-high.mp3');
+  await runFfmpeg(simpleStoryVideo.ffmpegPath, [
+    '-y', '-f', 'lavfi', '-i', 'sine=frequency=900:duration=2', '-c:a', 'libmp3lame', partBHighTonePath,
+  ]);
+  const partBHighToneBuffer = fs.readFileSync(partBHighTonePath);
+
+  // How strongly filePath's real decoded audio energy falls within a narrow
+  // band around freq during [start, start+duration) — used to tell which of
+  // two distinctly-toned fixtures is actually playing at a given point in a
+  // combined file, never guessed from filenames/order alone.
+  async function measureBandVolume(filePath, { freq, start, duration }) {
+    let output = '';
+    await new Promise((resolve, reject) => {
+      execFile(
+        simpleStoryVideo.ffmpegPath,
+        ['-ss', String(start), '-t', String(duration), '-i', filePath, '-af', `bandpass=f=${freq}:width_type=h:w=100,volumedetect`, '-f', 'null', '-'],
+        { maxBuffer: 1024 * 1024 * 16 },
+        (error, stdout, stderr) => {
+          output = (stderr || '').toString();
+          // volumedetect always exits non-zero with -f null - (nothing was
+          // asked to be produced) but still prints the real measurement.
+          resolve();
+        }
+      );
+    });
+    const match = output.match(/mean_volume:\s*(-?\d+(?:\.\d+)?)\s*dB/);
+    if (!match) throw new Error(`Could not read mean_volume from ffmpeg output: ${output.slice(-500)}`);
+    return Number(match[1]);
+  }
+
   // Make sure no BLOB_READ_WRITE_TOKEN is set, so storage falls back to the
   // local data/generated/ path (see video-storage.js) rather than trying a
   // real network call to Vercel Blob.
@@ -82,6 +123,7 @@ async function main() {
 
   const server = require('./server');
   const jobStore = require('./job-store');
+  const videoStorage = require('./video-storage');
   const { continueChatToVideoPipeline } = server;
 
   const httpServer = server.listen(0);
@@ -309,6 +351,122 @@ async function main() {
     const body = await res.json();
     assert.strictEqual(body.job.subtitles.status, 'pending', 'a fresh upload must invalidate stale subtitles');
     assert.strictEqual(body.job.finalVideo.status, 'pending', 'a fresh upload must invalidate a stale final video');
+  });
+
+  // ---------------------------------------------------------------------
+  // POST /api/jobs/:id/upload-voiceover — multiple files ("Choose File"
+  // now accepts more than one, combined in order into one continuous
+  // voice-over; see server.js's partIndex/totalParts handling).
+  // ---------------------------------------------------------------------
+
+  await test('POST /api/jobs/:id/upload-voiceover combines two uploaded files into one continuous voice-over whose real duration is the sum of both parts', async () => {
+    const createRes = await fetch(`${baseUrl}/api/jobs/story-to-video`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ script: SHORT_SCRIPT, voiceSource: 'upload' }),
+    });
+    const job = (await createRes.json()).job;
+
+    const partRes = await fetch(
+      `${baseUrl}/api/jobs/${job.id}/upload-voiceover?partIndex=1&totalParts=2&filename=part-a.mp3`,
+      { method: 'POST', headers: { 'Content-Type': 'audio/mpeg' }, body: partALowToneBuffer }
+    );
+    assert.strictEqual(partRes.status, 200, JSON.stringify(await partRes.clone().json()));
+
+    const finalRes = await fetch(
+      `${baseUrl}/api/jobs/${job.id}/upload-voiceover?partIndex=2&totalParts=2&filename=part-a.mp3%2C%20part-b.mp3`,
+      { method: 'POST', headers: { 'Content-Type': 'audio/mpeg' }, body: partBHighToneBuffer }
+    );
+    assert.strictEqual(finalRes.status, 200, JSON.stringify(await finalRes.clone().json()));
+    const body = await finalRes.json();
+
+    assert.strictEqual(body.job.voiceover.status, 'completed');
+    assert.strictEqual(body.job.voiceover.originalFilename, 'part-a.mp3, part-b.mp3');
+    // ~3s + ~2s = ~5s, real measured duration — proves an actual sample-level
+    // join happened, not just the last part overwriting the first.
+    assert.ok(
+      body.job.voiceover.durationSeconds > 4.5 && body.job.voiceover.durationSeconds < 5.5,
+      `expected the combined duration to be about 5s, got ${body.job.voiceover.durationSeconds}`
+    );
+  });
+
+  await test('POST /api/jobs/:id/upload-voiceover keeps the voice-over "pending" (never "completed") until the final part arrives, so approval stays blocked', async () => {
+    const createRes = await fetch(`${baseUrl}/api/jobs/story-to-video`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ script: SHORT_SCRIPT, voiceSource: 'upload' }),
+    });
+    const job = (await createRes.json()).job;
+
+    const partRes = await fetch(`${baseUrl}/api/jobs/${job.id}/upload-voiceover?partIndex=1&totalParts=2`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'audio/mpeg' },
+      body: partALowToneBuffer,
+    });
+    assert.strictEqual(partRes.status, 200);
+    const partBody = await partRes.json();
+    assert.strictEqual(partBody.job.voiceover.status, 'pending', 'must not complete until the last part arrives');
+    assert.strictEqual(partBody.job.voiceover.durationSeconds, null);
+
+    const persisted = await jobStore.getJob(job.id);
+    assert.strictEqual(persisted.voiceover.status, 'pending');
+
+    const approveRes = await fetch(`${baseUrl}/api/jobs/${job.id}/approve-and-start`, { method: 'POST' });
+    assert.strictEqual(approveRes.status, 400, 'must still refuse to approve with only part 1 of 2 uploaded');
+    const approveBody = await approveRes.json();
+    assert.ok(/upload your voice recording/i.test(approveBody.error));
+  });
+
+  await test('POST /api/jobs/:id/upload-voiceover preserves the exact order files were uploaded in (part A audibly plays before part B)', async () => {
+    const createRes = await fetch(`${baseUrl}/api/jobs/story-to-video`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ script: SHORT_SCRIPT, voiceSource: 'upload' }),
+    });
+    const job = (await createRes.json()).job;
+
+    await fetch(`${baseUrl}/api/jobs/${job.id}/upload-voiceover?partIndex=1&totalParts=2`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'audio/mpeg' },
+      body: partALowToneBuffer,
+    });
+    const finalRes = await fetch(`${baseUrl}/api/jobs/${job.id}/upload-voiceover?partIndex=2&totalParts=2`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'audio/mpeg' },
+      body: partBHighToneBuffer,
+    });
+    const body = await finalRes.json();
+    const combinedPath = path.join(videoStorage.GENERATED_DIR, body.job.voiceover.url.slice('/generated/'.length));
+
+    // First ~2.5s (inside part A's ~3s) must be dominated by the LOW tone,
+    // not the HIGH one; the last ~1.5s (inside part B's ~2s) must be the
+    // reverse — proving A really plays first and B second, not the other
+    // way around and not overlapped/mixed.
+    const earlyLow = await measureBandVolume(combinedPath, { freq: 300, start: 0.3, duration: 2 });
+    const earlyHigh = await measureBandVolume(combinedPath, { freq: 900, start: 0.3, duration: 2 });
+    assert.ok(earlyLow > earlyHigh + 15, `expected part A's low tone to dominate the start (low=${earlyLow}dB, high=${earlyHigh}dB)`);
+
+    const lateLow = await measureBandVolume(combinedPath, { freq: 300, start: 3.5, duration: 1 });
+    const lateHigh = await measureBandVolume(combinedPath, { freq: 900, start: 3.5, duration: 1 });
+    assert.ok(lateHigh > lateLow + 15, `expected part B's high tone to dominate the end (low=${lateLow}dB, high=${lateHigh}dB)`);
+  });
+
+  await test('POST /api/jobs/:id/upload-voiceover refuses a later part when an earlier one was never uploaded', async () => {
+    const createRes = await fetch(`${baseUrl}/api/jobs/story-to-video`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ script: SHORT_SCRIPT, voiceSource: 'upload' }),
+    });
+    const job = (await createRes.json()).job;
+
+    const res = await fetch(`${baseUrl}/api/jobs/${job.id}/upload-voiceover?partIndex=2&totalParts=3`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'audio/mpeg' },
+      body: partBHighToneBuffer,
+    });
+    assert.strictEqual(res.status, 400);
+    const body = await res.json();
+    assert.ok(/part 1 of 3/.test(body.error));
   });
 
   // ---------------------------------------------------------------------
