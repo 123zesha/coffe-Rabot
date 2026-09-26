@@ -267,8 +267,9 @@
 
             <div id="upload-voice-options" class="form-field-wide story-subgroup" hidden>
               <div class="form-field form-field-wide">
-                <label for="story-voice-upload">Upload narration audio (MP3, WAV, or M4A — up to about 40 minutes)</label>
-                <input type="file" id="story-voice-upload" accept=".mp3,.wav,.m4a,audio/mpeg,audio/wav,audio/x-wav,audio/wave,audio/mp4,audio/x-m4a">
+                <label for="story-voice-upload">Upload narration audio (MP3, WAV, or M4A — up to about 40 minutes total)</label>
+                <input type="file" id="story-voice-upload" accept=".mp3,.wav,.m4a,audio/mpeg,audio/wav,audio/x-wav,audio/wave,audio/mp4,audio/x-m4a" multiple>
+                <p class="field-hint">Select more than one file to combine them, in the order selected, into one continuous voice-over.</p>
                 <p id="story-voice-upload-status" class="field-hint"></p>
               </div>
               <p class="field-hint">

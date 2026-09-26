@@ -25,11 +25,11 @@ const { generateVoiceover, resolveVoiceDirection } = require('./voiceover-genera
 
 // A real, validly-encoded (if tiny/silent) MP3 buffer used as every mocked
 // TTS chunk's "audio" below. generateVoiceover's chunk-joining logic
-// (concatenateAudioChunks) now actually decodes each chunk to join a
-// multi-chunk script's audio at the sample level (see its own comment in
-// voiceover-generation.js), so the mocked response must be real, decodable
-// audio, not placeholder text. Generated once via ffmpeg's own lavfi silent
-// source (ffmpeg-static, already a project dependency) — no network, no
+// (video-assembly.js's concatenateAudioBuffers) now actually decodes each
+// chunk to join a multi-chunk script's audio at the sample level (see its
+// own comment in video-assembly.js), so the mocked response must be real,
+// decodable audio, not placeholder text. Generated once via ffmpeg's own
+// lavfi silent source (ffmpeg-static, already a project dependency) — no
 // paid API.
 const MOCK_AUDIO_BUFFER = (() => {
   const outPath = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'mock-tts-audio-')), 'silence.mp3');

@@ -649,12 +649,22 @@
     storyDurationCustomInput.hidden = storyDurationSelect.value !== 'custom';
   });
 
-  let storyUploadedFile = null;
+  // Array, in the order the browser lists them in the FileList (the order
+  // files were selected/added in the OS file picker) — combined into one
+  // continuous voice-over on upload (see the upload loop below).
+  let storyUploadedFiles = [];
   storyVoiceUploadInput.addEventListener('change', () => {
-    storyUploadedFile = storyVoiceUploadInput.files && storyVoiceUploadInput.files[0] ? storyVoiceUploadInput.files[0] : null;
-    storyVoiceUploadStatus.textContent = storyUploadedFile
-      ? `Selected: ${storyUploadedFile.name} (${(storyUploadedFile.size / (1024 * 1024)).toFixed(1)}MB)`
-      : '';
+    storyUploadedFiles = storyVoiceUploadInput.files ? Array.from(storyVoiceUploadInput.files) : [];
+    if (storyUploadedFiles.length === 0) {
+      storyVoiceUploadStatus.textContent = '';
+    } else if (storyUploadedFiles.length === 1) {
+      const file = storyUploadedFiles[0];
+      storyVoiceUploadStatus.textContent = `Selected: ${file.name} (${(file.size / (1024 * 1024)).toFixed(1)}MB)`;
+    } else {
+      const totalMb = storyUploadedFiles.reduce((sum, file) => sum + file.size, 0) / (1024 * 1024);
+      const names = storyUploadedFiles.map((file) => file.name).join(', ');
+      storyVoiceUploadStatus.textContent = `Selected ${storyUploadedFiles.length} files (${totalMb.toFixed(1)}MB total): ${names}`;
+    }
   });
 
   function resolveStoryVoiceSpeed() {
@@ -757,7 +767,7 @@
       return;
     }
     const useUpload = voiceSourceUploadRadio.checked;
-    if (useUpload && !storyUploadedFile) {
+    if (useUpload && storyUploadedFiles.length === 0) {
       setStoryCostStatus('Please choose an audio file to upload first.', 'error');
       storyCostReview.hidden = false;
       return;
@@ -817,16 +827,37 @@
       let warning = null;
 
       if (useUpload) {
-        setStoryCostStatus('Uploading your narration audio…', 'loading');
-        const contentType = normalizeAudioContentType(storyUploadedFile);
-        const uploadRes = await fetch(
-          `/api/jobs/${storyJobId}/upload-voiceover?filename=${encodeURIComponent(storyUploadedFile.name)}`,
-          { method: 'POST', headers: { 'Content-Type': contentType }, body: storyUploadedFile }
-        );
-        const uploadBody = await uploadRes.json();
-        if (!uploadRes.ok) {
-          setStoryCostStatus(uploadBody.error || 'Could not upload that audio file.', 'error');
-          return;
+        // Uploaded ONE AT A TIME, in the order selected, and awaited in
+        // sequence (never in parallel) so the server always has the right
+        // "combined so far" audio to join the next part onto — see
+        // POST /api/jobs/:id/upload-voiceover's partIndex/totalParts
+        // handling. A single file takes this same path with totalParts=1,
+        // identical to the request this route always accepted.
+        const totalParts = storyUploadedFiles.length;
+        const combinedFilename = storyUploadedFiles.map((file) => file.name).join(', ');
+        let uploadBody = null;
+        for (let i = 0; i < totalParts; i++) {
+          const file = storyUploadedFiles[i];
+          setStoryCostStatus(
+            totalParts > 1 ? `Uploading your narration audio… (${i + 1} of ${totalParts})` : 'Uploading your narration audio…',
+            'loading'
+          );
+          const contentType = normalizeAudioContentType(file);
+          const params = new URLSearchParams({
+            filename: i === totalParts - 1 ? combinedFilename : file.name,
+            partIndex: String(i + 1),
+            totalParts: String(totalParts),
+          });
+          const uploadRes = await fetch(`/api/jobs/${storyJobId}/upload-voiceover?${params.toString()}`, {
+            method: 'POST',
+            headers: { 'Content-Type': contentType },
+            body: file,
+          });
+          uploadBody = await uploadRes.json();
+          if (!uploadRes.ok) {
+            setStoryCostStatus(uploadBody.error || 'Could not upload that audio file.', 'error');
+            return;
+          }
         }
         costEstimate = uploadBody.costEstimate;
         if (uploadBody.job.voiceover && uploadBody.job.voiceover.syncWarning) {
