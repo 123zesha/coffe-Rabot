@@ -139,14 +139,24 @@ function resolveBackgroundColor(editSettings, sectionIndex) {
 }
 
 // Large on-screen story text size tiers, in real px at this mode's fixed
-// 1080p canvas — the 68-72px range the "Story to Video" flow asks for.
-// Only the large story text uses this; the small bottom caption line keeps
-// its own separate, unrelated base size (captionFontSize in buildAssScript)
-// regardless of textSize, since making tiny captions huge was never asked
-// for. subtitleFontScale (below) still multiplies whichever of these is
-// chosen, so the two controls compose rather than conflict.
+// 1080p canvas — the 68-72px range the "Story to Video" flow originally
+// shipped with. Kept only so an already-existing job's stored textSize
+// ('medium'/'large'/'xl'/null) keeps rendering at EXACTLY the same size it
+// always did — see textSizePx below, which replaced this as the actual
+// user-facing control (a direct numeric px value, with a +/- stepper in the
+// UI) and takes priority whenever it's set. Only the large story text uses
+// either of these; the small bottom caption line keeps its own separate,
+// unrelated base size (captionFontSize in buildAssScript) regardless.
+// subtitleFontScale (below) still multiplies whichever size is chosen, so
+// the controls compose rather than conflict.
 const TEXT_SIZE_PX = { medium: 68, large: 70, xl: 72 };
 const VALID_TEXT_SIZES = Object.keys(TEXT_SIZE_PX);
+// Real bounds for the numeric textSizePx control — wide enough for genuine
+// creative range (a small unobtrusive caption-sized story line up to a
+// huge, near-full-width one) while staying clear of degenerate layouts
+// (near-zero or larger than the 1080-tall canvas itself).
+const TEXT_SIZE_PX_MIN = 24;
+const TEXT_SIZE_PX_MAX = 160;
 
 // --- Selective, local-only video editing (videoEditSettings) ---
 //
@@ -198,7 +208,23 @@ function normalizeVideoEditSettings(raw) {
     storyPosition: VALID_STORY_POSITIONS.includes(input.storyPosition) ? input.storyPosition : null,
     fontWeight: VALID_FONT_WEIGHTS.includes(input.fontWeight) ? input.fontWeight : null,
     textSize: VALID_TEXT_SIZES.includes(input.textSize) ? input.textSize : null,
+    // The large story text's real font size in px, set directly (the +/-
+    // stepper in the UI) — takes priority over the legacy textSize tiers
+    // above whenever it's a real number. null (default — including when a
+    // job record stores it as null, which clampNumber's own Number(null)=0
+    // would otherwise wrongly treat as a real 0 to clamp) falls back to
+    // textSize/64px exactly as before this control existed, so an
+    // already-existing job that never touches this renders unchanged.
+    textSizePx:
+      typeof input.textSizePx === 'number' && Number.isFinite(input.textSizePx)
+        ? Math.round(Math.min(TEXT_SIZE_PX_MAX, Math.max(TEXT_SIZE_PX_MIN, input.textSizePx)))
+        : null,
     showCaptions: typeof input.showCaptions === 'boolean' ? input.showCaptions : true,
+    // Whether the large story text has an opaque box behind it (the
+    // original, always-on look) or plain outlined text with no box —
+    // default true keeps every already-existing job's rendered look
+    // byte-for-byte unchanged.
+    textBackground: typeof input.textBackground === 'boolean' ? input.textBackground : true,
     subtitleFontScale: clampNumber(input.subtitleFontScale, SUBTITLE_FONT_SCALE_MIN, SUBTITLE_FONT_SCALE_MAX, 1),
     subtitleColor: HEX_COLOR_RE.test(input.subtitleColor || '') ? input.subtitleColor.toLowerCase() : null,
     subtitleTimingOffsetMs: clampNumber(
@@ -545,8 +571,25 @@ function buildAssScript(cues, audioDuration, editSettings = {}) {
   const captionBold = fontWeight === 'bold' ? 1 : 0;
   const storyAlignment = storyPosition === 'top' ? 8 : storyPosition === 'bottom' ? 2 : 5;
   const storyMarginV = storyPosition === 'center' ? 0 : 60;
-  const storyFontSize = Math.round((TEXT_SIZE_PX[editSettings.textSize] || 64) * subtitleFontScale);
+  // textSizePx (the numeric +/- stepper control) takes priority over the
+  // legacy textSize tiers whenever it's a real number; falls back to the
+  // exact original resolution otherwise, so an already-existing job that
+  // never touches either renders at exactly the same 64px it always did.
+  const storyFontSize = Math.round(
+    (typeof editSettings.textSizePx === 'number' ? editSettings.textSizePx : TEXT_SIZE_PX[editSettings.textSize] || 64) *
+      subtitleFontScale
+  );
   const captionFontSize = Math.round(30 * subtitleFontScale);
+  // Whether the large story text has an opaque box behind it (the
+  // original, always-on look — BorderStyle 3 with a semi-opaque
+  // BackColour) or plain outlined text with no box (BorderStyle 1, the
+  // same look the small caption line below already uses). Only ever
+  // changes these two style rows; nothing else about layout/timing.
+  const storyHasBackground = editSettings.textBackground !== false;
+  const storyBorderStyle = storyHasBackground ? 3 : 1;
+  const storyOutline = storyHasBackground ? 0 : 3;
+  const storyShadow = storyHasBackground ? 4 : 0;
+  const storyBackColour = storyHasBackground ? '&H99000000' : '&H00000000';
 
   const header =
     '[Script Info]\n' +
@@ -560,9 +603,12 @@ function buildAssScript(cues, audioDuration, editSettings = {}) {
     'Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, ' +
     'Alignment, MarginL, MarginR, MarginV, Encoding\n' +
     // Story: large, centered by default (Alignment 5 = middle-center; see
-    // storyPosition above), an opaque box background (BorderStyle 3) for
-    // readability over any background color.
-    `Style: Story,${FONT_FAMILY},${storyFontSize},${textColorAss},${textColorAss},&H00000000,&H99000000,${storyBold},0,0,0,100,100,0,0,3,0,4,${storyAlignment},120,120,${storyMarginV},1\n` +
+    // storyPosition above). textBackground true (default) draws an opaque
+    // box behind the text (BorderStyle 3) for readability over any
+    // background color; false draws plain outlined text instead (BorderStyle
+    // 1, outline width 3, no shadow — the same look the Caption style below
+    // already uses successfully).
+    `Style: Story,${FONT_FAMILY},${storyFontSize},${textColorAss},${textColorAss},&H00000000,${storyBackColour},${storyBold},0,0,0,100,100,0,0,${storyBorderStyle},${storyOutline},${storyShadow},${storyAlignment},120,120,${storyMarginV},1\n` +
     // Caption: small, always bottom-center (Alignment 2), plain outline (no
     // box) — the familiar closed-caption look, mirroring what
     // burnInSubtitles already produces elsewhere in this app. Still
@@ -1087,5 +1133,7 @@ module.exports = {
   VALID_BACKGROUND_PRESETS,
   TEXT_SIZE_PX,
   VALID_TEXT_SIZES,
+  TEXT_SIZE_PX_MIN,
+  TEXT_SIZE_PX_MAX,
   resolveBackgroundColor,
 };

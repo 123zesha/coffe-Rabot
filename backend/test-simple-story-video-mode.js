@@ -602,6 +602,32 @@ async function main() {
     assert.strictEqual(persisted.videoEditSettings.musicVolumeDb, -8);
   });
 
+  await test('updateVideoEditSettings accepts textSizePx and textBackground, and keeps textSizePx separate from the legacy textSize', async () => {
+    const job = await jobStore.createJob();
+    await jobStore.updateJob(job.id, { videoMode: 'simple-story' });
+
+    const result = JSON.parse(
+      await app.executeTool('updateVideoEditSettings', job.id, { textSizePx: 95, textBackground: false })
+    );
+    assert.strictEqual(result.error, undefined, JSON.stringify(result));
+    assert.strictEqual(result.videoEditSettings.textSizePx, 95);
+    assert.strictEqual(result.videoEditSettings.textBackground, false);
+    assert.strictEqual(result.videoEditSettings.textSize, null, 'textSizePx must not implicitly set the legacy textSize field');
+
+    const persisted = await jobStore.getJob(job.id);
+    assert.strictEqual(persisted.videoEditSettings.textSizePx, 95);
+    assert.strictEqual(persisted.videoEditSettings.textBackground, false);
+  });
+
+  await test('updateVideoEditSettings clamps an out-of-range textSizePx to the valid 24-160 bounds, same as every other numeric field', async () => {
+    const job = await jobStore.createJob();
+    await jobStore.updateJob(job.id, { videoMode: 'simple-story' });
+
+    const result = JSON.parse(await app.executeTool('updateVideoEditSettings', job.id, { textSizePx: 500 }));
+    assert.strictEqual(result.error, undefined, JSON.stringify(result));
+    assert.strictEqual(result.videoEditSettings.textSizePx, simpleStoryVideo.TEXT_SIZE_PX_MAX);
+  });
+
   await test('updateVideoEditSettings refuses an invalid hex color with a clear, actionable error and changes nothing', async () => {
     const job = await jobStore.createJob();
     await jobStore.updateJob(job.id, { videoMode: 'simple-story' });

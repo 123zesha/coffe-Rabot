@@ -191,6 +191,44 @@ async function main() {
     assert.strictEqual(body.job.videoEditSettings.showCaptions, false);
   });
 
+  await test('POST /api/jobs/story-to-video accepts textSizePx, fontWeight, subtitleColor, and textBackground, with textSizePx taking priority over the legacy textSize default', async () => {
+    const res = await fetch(`${baseUrl}/api/jobs/story-to-video`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        script: SHORT_SCRIPT,
+        textSizePx: 95,
+        fontWeight: 'regular',
+        subtitleColor: 'ff9900',
+        textBackground: false,
+      }),
+    });
+    assert.strictEqual(res.status, 200);
+    const body = await res.json();
+    assert.strictEqual(body.job.videoEditSettings.textSizePx, 95);
+    assert.strictEqual(body.job.videoEditSettings.fontWeight, 'regular');
+    assert.strictEqual(body.job.videoEditSettings.subtitleColor, 'ff9900');
+    assert.strictEqual(body.job.videoEditSettings.textBackground, false);
+    // The legacy default ('large') is still recorded for backward
+    // compatibility, but textSizePx must be what actually renders — see
+    // simple-story-video.js's buildAssScript priority test.
+    assert.strictEqual(body.job.videoEditSettings.textSize, 'large');
+  });
+
+  await test('POST /api/jobs/story-to-video defaults to a 70px text size, bold, white text, with the box on — the exact original look', async () => {
+    const res = await fetch(`${baseUrl}/api/jobs/story-to-video`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ script: SHORT_SCRIPT }),
+    });
+    const body = await res.json();
+    assert.strictEqual(body.job.videoEditSettings.textSize, 'large');
+    assert.strictEqual(body.job.videoEditSettings.textSizePx, null);
+    assert.strictEqual(body.job.videoEditSettings.fontWeight, null, 'null resolves to bold — the original default — via buildAssScript');
+    assert.strictEqual(body.job.videoEditSettings.subtitleColor, null, 'null resolves to white via buildAssScript');
+    assert.strictEqual(body.job.videoEditSettings.textBackground, true);
+  });
+
   await test('POST /api/jobs/story-to-video accepts separate narration and music volume settings, both defaulting to 0', async () => {
     const defaultRes = await fetch(`${baseUrl}/api/jobs/story-to-video`, {
       method: 'POST',

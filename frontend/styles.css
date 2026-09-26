@@ -381,6 +381,41 @@ a {
   accent-color: var(--color-primary);
 }
 
+.form-field input[type="color"] {
+  padding: 4px;
+  height: 44px;
+  cursor: pointer;
+}
+
+.stepper-field {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.stepper-field input[type="number"] {
+  width: 90px;
+  text-align: center;
+}
+
+.stepper-btn {
+  flex: none;
+  width: 40px;
+  height: 40px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius);
+  background: var(--color-bg);
+  color: var(--color-text);
+  font-size: 1.2rem;
+  font-weight: 700;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.stepper-btn:hover {
+  background: var(--color-surface);
+}
+
 .story-cost-review {
   margin-top: 32px;
   padding: 24px;

@@ -486,19 +486,28 @@ function createDefaultJob(id) {
     //   sending backgroundColor directly instead of a preset name — there
     //   is no separate 'custom' preset value.
     // - textSize: 'medium' | 'large' | 'xl', or null (default, the
-    //   original 64px) — the large on-screen story text's font size in real
-    //   px at this mode's fixed 1080p canvas (see simple-story-video.js's
-    //   TEXT_SIZE_PX); the small bottom caption line is unaffected.
+    //   original 64px) — LEGACY, kept only so an already-existing job's
+    //   stored value keeps rendering unchanged; textSizePx (below) is the
+    //   current, actual control and takes priority whenever it's set.
+    // - textSizePx: a real px number (24-160), or null (default, falls back
+    //   to textSize/64px above) — the large on-screen story text's font
+    //   size at this mode's fixed 1080p canvas, set directly via the
+    //   frontend's +/- stepper; the small bottom caption line is unaffected.
     // - showCaptions: whether the small bottom caption line renders
     //   alongside the large story text (default true, the original
     //   always-on behavior). false renders the large story text only.
+    // - textBackground: whether the large story text has an opaque box
+    //   behind it (default true, the original always-on look) or plain
+    //   outlined text with no box (false).
     videoEditSettings: {
       backgroundColor: null,
       backgroundPreset: null,
       storyPosition: null,
       fontWeight: null,
       textSize: null,
+      textSizePx: null,
       showCaptions: true,
+      textBackground: true,
       subtitleFontScale: 1,
       subtitleColor: null,
       subtitleTimingOffsetMs: 0,

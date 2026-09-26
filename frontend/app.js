@@ -45,7 +45,12 @@
   const storyVoiceUploadStatus = document.getElementById('story-voice-upload-status');
   const storyBackgroundSelect = document.getElementById('story-background');
   const storyBackgroundCustomInput = document.getElementById('story-background-custom');
-  const storyTextSizeSelect = document.getElementById('story-text-size');
+  const storyTextSizeInput = document.getElementById('story-text-size');
+  const storyTextSizeDecreaseBtn = document.getElementById('story-text-size-decrease');
+  const storyTextSizeIncreaseBtn = document.getElementById('story-text-size-increase');
+  const storyTextColorInput = document.getElementById('story-text-color');
+  const storyTextBoldToggle = document.getElementById('story-text-bold');
+  const storyTextBackgroundToggle = document.getElementById('story-text-background');
   const storyShowCaptionsToggle = document.getElementById('story-show-captions');
   const storyDurationSelect = document.getElementById('story-duration');
   const storyDurationCustomInput = document.getElementById('story-duration-custom');
@@ -649,6 +654,18 @@
     storyDurationCustomInput.hidden = storyDurationSelect.value !== 'custom';
   });
 
+  const STORY_TEXT_SIZE_MIN = Number(storyTextSizeInput.min) || 24;
+  const STORY_TEXT_SIZE_MAX = Number(storyTextSizeInput.max) || 160;
+
+  function stepStoryTextSize(delta) {
+    const current = Number(storyTextSizeInput.value) || STORY_TEXT_SIZE_MIN;
+    const next = Math.min(STORY_TEXT_SIZE_MAX, Math.max(STORY_TEXT_SIZE_MIN, current + delta));
+    storyTextSizeInput.value = String(next);
+  }
+  storyTextSizeDecreaseBtn.addEventListener('click', () => stepStoryTextSize(-1));
+  storyTextSizeIncreaseBtn.addEventListener('click', () => stepStoryTextSize(1));
+  storyTextSizeInput.addEventListener('change', () => stepStoryTextSize(0));
+
   // Array, in the order the browser lists them in the FileList (the order
   // files were selected/added in the OS file picker) — combined into one
   // continuous voice-over on upload (see the upload loop below).
@@ -805,7 +822,10 @@
           voiceSpeed: resolveStoryVoiceSpeed(),
           backgroundPreset,
           backgroundColor,
-          textSize: storyTextSizeSelect.value,
+          textSizePx: Number(storyTextSizeInput.value) || undefined,
+          subtitleColor: storyTextColorInput.value.replace('#', ''),
+          fontWeight: storyTextBoldToggle.checked ? 'bold' : 'regular',
+          textBackground: storyTextBackgroundToggle.checked,
           showCaptions: storyShowCaptionsToggle.checked,
           duration: resolveStoryDuration(),
           language: storyLanguageSelect.value,
