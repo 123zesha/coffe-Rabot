@@ -289,6 +289,44 @@
               <input type="color" id="story-background-custom" value="#f5ebd7" hidden>
             </div>
 
+            <div class="form-field form-field-wide">
+              <label>Background image (optional)</label>
+              <div class="radio-row">
+                <label class="radio-field">
+                  <input type="radio" name="story-background-image-source" id="bg-image-source-none" value="none" checked>
+                  None (use the solid color above)
+                </label>
+                <label class="radio-field">
+                  <input type="radio" name="story-background-image-source" id="bg-image-source-upload" value="upload">
+                  Upload Image
+                </label>
+                <label class="radio-field">
+                  <input type="radio" name="story-background-image-source" id="bg-image-source-generate" value="generate">
+                  Generate with AI
+                </label>
+              </div>
+            </div>
+
+            <div id="bg-image-upload-options" class="form-field-wide story-subgroup" hidden>
+              <div class="form-field form-field-wide">
+                <label for="story-background-image-upload">Upload a background image (PNG, JPEG, or WEBP)</label>
+                <input type="file" id="story-background-image-upload" accept=".png,.jpg,.jpeg,.webp,image/png,image/jpeg,image/webp">
+                <p id="story-background-image-upload-status" class="field-hint"></p>
+              </div>
+              <p class="field-hint">Used as every section's background instead of a solid color — scaled to fill the frame without stretching.</p>
+            </div>
+
+            <div id="bg-image-generate-options" class="form-field-wide story-subgroup" hidden>
+              <div class="form-field form-field-wide">
+                <label for="story-background-image-prompt">Describe the illustration you want</label>
+                <textarea id="story-background-image-prompt" rows="2" placeholder="e.g. a cozy reading nook with warm lamplight and bookshelves"></textarea>
+              </div>
+              <p class="field-hint">
+                Generating this illustration is a real, paid OpenAI image call (about $0.07, one time for the
+                whole video) — see the estimated cost before you approve production below.
+              </p>
+            </div>
+
             <div class="form-field">
               <label for="story-text-size">On-screen text size (px)</label>
               <div class="stepper-field">

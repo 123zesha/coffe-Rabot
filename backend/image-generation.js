@@ -306,9 +306,38 @@ async function generateThumbnailImage({ thumbnailConcept, thumbnailText, jobId }
   }
 }
 
+// Generates a single, original illustration for Simple Story Video mode's
+// OPTIONAL static background-image feature (see server.js's POST
+// /api/jobs/:id/generate-background-image and simple-story-video.js's
+// videoEditSettings.backgroundImage) — one real, paid OpenAI image call per
+// request, reusing this SAME image backend/model as every other image this
+// app generates (no new provider). Structurally identical to
+// generateThumbnailImage above (no character-consistency reference — this
+// is a standalone illustration, not a scene sequence), just with prompt
+// wording suited to a video background rather than a thumbnail. Never
+// fabricates a url on failure.
+async function generateBackgroundImage({ prompt, jobId }) {
+  const fullPrompt =
+    'A single, beautiful illustration to use as a static video background — no text, no words, no ' +
+    'letters anywhere in the image, calm and uncluttered enough for readable text to be overlaid on top ' +
+    `later, widescreen (16:9) framing. Style/subject: ${prompt}`;
+
+  try {
+    const result = await generateSceneImage({ prompt: fullPrompt, characterContext: '', referenceImageBuffer: null, jobId });
+    return { url: result.url, status: 'completed', error: null };
+  } catch (error) {
+    console.error(
+      'OpenAI background image generation error:',
+      JSON.stringify({ message: describeError(error) }, null, 2)
+    );
+    return { url: null, status: 'failed', error: describeError(error) };
+  }
+}
+
 module.exports = {
   generateImagesForPrompts,
   generateThumbnailImage,
+  generateBackgroundImage,
   IMAGE_MODEL,
   IMAGE_SIZE,
   IMAGE_SIZE_BY_FORMAT,

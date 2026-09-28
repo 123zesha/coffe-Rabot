@@ -165,6 +165,26 @@ function makeMusicTone(dir, seconds, label) {
   );
 }
 
+// A single-frame, solid-color PNG — stands in for a real uploaded/generated
+// background illustration without needing a real image file on disk. Used
+// only to prove editSettings.backgroundImage's real bytes reach the actual
+// rendered pixels (see the "renders a real backgroundImage" test below);
+// the exact image content never matters, only that it's a real, decodable
+// image ffmpeg can read as a static background.
+function makeSolidImage(dir, hexColor, label) {
+  const outPath = path.join(dir, `bg-image-${label || ++toneAudioCounter}.png`);
+  return runFfmpeg([
+    '-y',
+    '-f',
+    'lavfi',
+    '-i',
+    `color=c=0x${hexColor}:s=320x240`,
+    '-frames:v',
+    '1',
+    outPath,
+  ]).then(() => outPath);
+}
+
 // A narration fixture with a REAL silent gap in the actual audio signal
 // itself (tone, then true silence, then tone) — used only by the
 // musicVolumeDb test below. sidechaincompress ducks music based on the
@@ -849,6 +869,7 @@ async function main() {
       assert.deepStrictEqual(ssv.normalizeVideoEditSettings(input), {
         backgroundColor: null,
         backgroundPreset: null,
+        backgroundImage: null,
         storyPosition: null,
         fontWeight: null,
         textSize: null,
@@ -883,6 +904,7 @@ async function main() {
     assert.deepStrictEqual(normalized, {
       backgroundColor: '1a2b3c',
       backgroundPreset: 'warm',
+      backgroundImage: null,
       storyPosition: 'top',
       fontWeight: 'bold',
       textSize: 'xl',
@@ -935,6 +957,16 @@ async function main() {
 
     assert.strictEqual(ssv.normalizeVideoEditSettings({ showCaptions: false }).showCaptions, false);
     assert.strictEqual(ssv.normalizeVideoEditSettings({ showCaptions: 'no' }).showCaptions, true, 'a non-boolean must fall back to the default (true)');
+  });
+
+  await test('normalizeVideoEditSettings accepts a real backgroundImage string and rejects/defaults invalid input', () => {
+    assert.strictEqual(ssv.normalizeVideoEditSettings({}).backgroundImage, null, 'default is null, unchanged rendering for every existing job');
+    assert.strictEqual(
+      ssv.normalizeVideoEditSettings({ backgroundImage: '/generated/some-image.png' }).backgroundImage,
+      '/generated/some-image.png'
+    );
+    assert.strictEqual(ssv.normalizeVideoEditSettings({ backgroundImage: '  ' }).backgroundImage, null, 'whitespace-only must not count as set');
+    assert.strictEqual(ssv.normalizeVideoEditSettings({ backgroundImage: 42 }).backgroundImage, null, 'a non-string must fall back to null');
   });
 
   await test('resolveBackgroundColor: a named preset takes priority over a raw backgroundColor; otherwise falls back to custom color or the rotating palette', () => {
@@ -1219,6 +1251,33 @@ async function main() {
       offPixel.r > 235 && offPixel.b > 235,
       `expected plain background magenta here once the box is removed, got rgb(${offPixel.r},${offPixel.g},${offPixel.b})`
     );
+  });
+
+  await test('continueSimpleStoryVideoAssembly renders a real backgroundImage into the actual pixels, overriding backgroundColor', async () => {
+    const audioPath = await makeToneAudio(workDir, 4, 'bg-image');
+    // A solid orange test image — passed as a plain local file path, one of
+    // the shapes fetchAudioToFile already accepts (see this module's own
+    // top comment) — deliberately different from backgroundColor below, so
+    // a pixel matching the IMAGE's color (not the color) proves
+    // backgroundImage genuinely took priority, not just that rendering ran.
+    const imagePath = await makeSolidImage(workDir, 'ff8000', 'orange');
+    const result = await ssv.continueSimpleStoryVideoAssembly({
+      voiceover: { status: 'completed', url: audioPath },
+      subtitlesContent: FIXTURE_SRT,
+      existingRender: null,
+      jobId: 'test-job-bg-image',
+      editSettings: { backgroundColor: '000000', backgroundImage: imagePath },
+    });
+    assert.strictEqual(result.status, 'completed', result.error);
+
+    const outPath = path.join(workDir, 'output-bg-image.mp4');
+    fs.writeFileSync(outPath, result.buffer);
+    // Top-left corner, well after the fade-in, is plain background — same
+    // point the backgroundColor pixel test above uses.
+    const pixel = await probePixelColor(outPath, 1.5, 10, 10);
+    assert.ok(Math.abs(pixel.r - 0xff) <= 20, `expected R≈0xff (the image's orange, not black), got 0x${pixel.r.toString(16)}`);
+    assert.ok(Math.abs(pixel.g - 0x80) <= 20, `expected G≈0x80, got 0x${pixel.g.toString(16)}`);
+    assert.ok(pixel.b <= 20, `expected B≈0x00, got 0x${pixel.b.toString(16)}`);
   });
 
   await test('continueSimpleStoryVideoAssembly applies voiceSpeed to both the audio and the on-screen text timing', async () => {

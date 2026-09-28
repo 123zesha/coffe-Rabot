@@ -710,6 +710,7 @@ async function confirmJobForProduction(jobId) {
     generateYoutubePackage: currentJob.generateYoutubePackage,
     realVoiceoverDurationSeconds: currentJob.voiceover && currentJob.voiceover.durationSeconds,
     voiceSource: currentJob.voiceSource,
+    generateBackgroundImage: currentJob.generateBackgroundImage,
   });
   return jobStore.updateJob(jobId, { confirmed: true, approvedCostEstimate });
 }
@@ -1015,6 +1016,7 @@ async function continueChatToVideoPipeline(jobId) {
         generateYoutubePackage: job.generateYoutubePackage,
         realVoiceoverDurationSeconds: job.voiceover.durationSeconds,
         voiceSource: job.voiceSource,
+        generateBackgroundImage: job.generateBackgroundImage,
       });
       if (updatedEstimate.totalUsd > job.approvedCostEstimate.totalUsd * BUDGET_OVERRUN_TOLERANCE) {
         const budgetGuard = {
@@ -1195,6 +1197,7 @@ function summarizeJobForAgent(job) {
     generateYoutubePackage: job.generateYoutubePackage,
     realVoiceoverDurationSeconds: job.voiceover && job.voiceover.durationSeconds,
     voiceSource: job.voiceSource,
+    generateBackgroundImage: job.generateBackgroundImage,
   });
 
   if (Array.isArray(job.images)) {
@@ -1677,7 +1680,13 @@ const TOOLS = [
       '"default" to reset — a named alternative to backgroundColor for the same solid-every-section-color ' +
       'effect; takes priority over backgroundColor if both are somehow set. For a genuinely custom color ' +
       'the user names or describes, use backgroundColor instead (convert it to hex yourself) — there is no ' +
-      '"custom" preset name. textSizePx: a real px number (24-160) for the large on-screen story text\'s ' +
+      '"custom" preset name. backgroundImage: a url the user gives you for a real image to use as EVERY ' +
+      'section\'s background instead of a solid color (scaled/cropped to cover the frame, never stretched) ' +
+      '— takes priority over backgroundPreset/backgroundColor when set; pass "default" to remove it and go ' +
+      'back to a solid-color background. This app cannot generate or upload an image on the user\'s behalf ' +
+      'from chat alone — if they want to upload a file or have one AI-generated, point them to the ' +
+      'Background Image controls in the Story-to-Video form instead of trying to do it here. ' +
+      'textSizePx: a real px number (24-160) for the large on-screen story text\'s ' +
       'exact size (the small caption line is unaffected) — the current, actual size control; pass 70 to ' +
       'reset to the original default. textSize: "medium"/"large"/"xl", a LEGACY alternative kept only for ' +
       'backward compatibility — prefer textSizePx for any new request. showCaptions: true (default) ' +
@@ -1704,6 +1713,7 @@ const TOOLS = [
       properties: {
         backgroundColor: { type: 'string' },
         backgroundPreset: { type: 'string', enum: [...simpleStoryVideo.VALID_BACKGROUND_PRESETS, 'default'] },
+        backgroundImage: { type: 'string' },
         storyPosition: { type: 'string', enum: ['top', 'center', 'bottom', 'default'] },
         fontWeight: { type: 'string', enum: ['regular', 'bold', 'default'] },
         textSize: { type: 'string', enum: [...simpleStoryVideo.VALID_TEXT_SIZES, 'default'] },
@@ -2180,7 +2190,7 @@ async function executeTool(name, jobId, input) {
     // for (normalizeVideoEditSettings itself is more lenient, since it also
     // has to tolerate a legacy/never-touched job record).
     const patch = {};
-    const stringFields = ['backgroundColor', 'backgroundPreset', 'storyPosition', 'fontWeight', 'textSize', 'subtitleColor'];
+    const stringFields = ['backgroundColor', 'backgroundPreset', 'backgroundImage', 'storyPosition', 'fontWeight', 'textSize', 'subtitleColor'];
     const hexFields = ['backgroundColor', 'subtitleColor'];
     const enumFields = {
       backgroundPreset: simpleStoryVideo.VALID_BACKGROUND_PRESETS,
@@ -2864,6 +2874,17 @@ const AUDIO_UPLOAD_CONTENT_TYPES = {
   'audio/m4a': 'm4a',
 };
 
+// "Upload My Own Background Image" (POST /:id/upload-background-image
+// further down) accepts the real image file as a raw request body, the same
+// "raw body, not base64/JSON" reasoning as AUDIO_UPLOAD_CONTENT_TYPES above.
+const IMAGE_UPLOAD_MAX_BYTES = 15 * 1024 * 1024; // comfortably covers a real, high-resolution illustration
+const IMAGE_UPLOAD_CONTENT_TYPES = {
+  'image/png': 'png',
+  'image/jpeg': 'jpg',
+  'image/jpg': 'jpg',
+  'image/webp': 'webp',
+};
+
 function formatSecondsAsDuration(seconds) {
   const totalSeconds = Math.max(0, Math.round(seconds));
   const minutes = Math.floor(totalSeconds / 60);
@@ -3040,6 +3061,7 @@ app.post(
       generateYoutubePackage: updatedJob.generateYoutubePackage,
       realVoiceoverDurationSeconds: durationSeconds,
       voiceSource: updatedJob.voiceSource,
+      generateBackgroundImage: updatedJob.generateBackgroundImage,
     });
     res.json({ job: updatedJob, costEstimate });
   }
@@ -3105,6 +3127,109 @@ app.post(
     res.json({ job: updatedJob });
   }
 );
+
+// "Upload My Own Background Image" — one static illustration used as EVERY
+// section's background instead of a solid color (see simple-story-video.js's
+// videoEditSettings.backgroundImage and renderSection). Only applies to
+// Simple Story Video mode's own rendering, exactly like updateVideoEditSettings
+// — the cinematic pipeline has no equivalent local-edit capability. Never
+// generates or downloads any image itself, only stores the real bytes the
+// user sent; normalizeVideoEditSettings runs over the merged settings so this
+// can never write an invalid videoEditSettings shape. Always free — never
+// touches job.generateBackgroundImage (which stays whatever it already was),
+// since only AI generation costs anything.
+app.post(
+  '/api/jobs/:id/upload-background-image',
+  express.raw({ type: Object.keys(IMAGE_UPLOAD_CONTENT_TYPES), limit: IMAGE_UPLOAD_MAX_BYTES }),
+  async (req, res) => {
+    const job = await jobStore.getJob(req.params.id);
+    if (!job) {
+      return res.status(404).json({ error: 'job not found' });
+    }
+    if ((job.videoMode || jobStore.DEFAULT_VIDEO_MODE) !== 'simple-story') {
+      return res.status(400).json({
+        error: "A background image only applies to Simple Story Video mode's own rendering — this job's videoMode is 'cinematic'.",
+      });
+    }
+
+    const contentType = (req.headers['content-type'] || '').split(';')[0].trim().toLowerCase();
+    const extension = IMAGE_UPLOAD_CONTENT_TYPES[contentType];
+    if (!extension) {
+      return res.status(400).json({
+        error: `Unsupported image format "${contentType || 'unknown'}" — upload a PNG, JPEG, or WEBP file.`,
+      });
+    }
+    if (!Buffer.isBuffer(req.body) || req.body.length === 0) {
+      return res.status(400).json({
+        error: 'No image data was received — make sure the file is sent as the raw request body.',
+      });
+    }
+
+    let url;
+    try {
+      url = await videoStorage.storeUploadedBackgroundImageFile(req.body, job.id, { extension, contentType });
+    } catch (error) {
+      console.error(
+        'Uploaded background image could not be stored:',
+        JSON.stringify({ name: error?.name, message: error?.message }, null, 2)
+      );
+      return res.status(400).json({
+        error: 'That file could not be stored — make sure it is a valid, uncorrupted PNG, JPEG, or WEBP image.',
+      });
+    }
+
+    const normalized = simpleStoryVideo.normalizeVideoEditSettings({ ...job.videoEditSettings, backgroundImage: url });
+    const updatedJob = await jobStore.updateJob(job.id, { videoEditSettings: normalized });
+    res.json({ job: updatedJob });
+  }
+);
+
+// "Generate Background Image with AI" — the alternative to uploading one,
+// for a user with no illustration of their own. One real, paid OpenAI image
+// call (see image-generation.js's generateBackgroundImage) using the SAME
+// image provider/model every other image in this app already uses — no new
+// provider. Explicitly user-initiated (a dedicated button click), so no
+// further confirmation gate is needed beyond that. Also sets
+// job.generateBackgroundImage — the flag cost-estimation.js's own breakdown
+// reads to show this cost (see server.js's POST /api/jobs/story-to-video,
+// which normally sets it already at creation time from the same "Generate
+// with AI" choice; setting it again here is a harmless no-op in that case,
+// and a safety net for any other path that reaches this route).
+app.post('/api/jobs/:id/generate-background-image', async (req, res) => {
+  const job = await jobStore.getJob(req.params.id);
+  if (!job) {
+    return res.status(404).json({ error: 'job not found' });
+  }
+  if ((job.videoMode || jobStore.DEFAULT_VIDEO_MODE) !== 'simple-story') {
+    return res.status(400).json({
+      error: "A background image only applies to Simple Story Video mode's own rendering — this job's videoMode is 'cinematic'.",
+    });
+  }
+  const prompt = typeof req.body?.prompt === 'string' ? req.body.prompt.trim() : '';
+  if (!prompt) {
+    return res.status(400).json({ error: 'A short description of the illustration you want is required.' });
+  }
+  if (!process.env.OPENAI_API_KEY) {
+    return res.status(500).json({ error: 'OPENAI_API_KEY is not configured' });
+  }
+
+  const result = await imageGeneration.generateBackgroundImage({ prompt, jobId: job.id });
+  if (result.status !== 'completed') {
+    return res.status(502).json({ error: result.error || 'Background image generation failed unexpectedly.' });
+  }
+
+  const normalized = simpleStoryVideo.normalizeVideoEditSettings({ ...job.videoEditSettings, backgroundImage: result.url });
+  const updatedJob = await jobStore.updateJob(job.id, { videoEditSettings: normalized, generateBackgroundImage: true });
+  const costEstimate = costEstimation.estimateProductionCost({
+    script: updatedJob.script,
+    videoMode: updatedJob.videoMode,
+    generateYoutubePackage: updatedJob.generateYoutubePackage,
+    realVoiceoverDurationSeconds: updatedJob.voiceover && updatedJob.voiceover.durationSeconds,
+    voiceSource: updatedJob.voiceSource,
+    generateBackgroundImage: updatedJob.generateBackgroundImage,
+  });
+  res.json({ job: updatedJob, costEstimate });
+});
 
 app.post('/api/jobs/:id/generate-youtube-package', async (req, res) => {
   const job = await jobStore.getJob(req.params.id);
@@ -3420,6 +3545,15 @@ app.post('/api/jobs/story-to-video', async (req, res) => {
   });
 
   const job = await jobStore.createJob();
+  // generateBackgroundImage reflects the user's OWN choice at creation time
+  // ("Generate with AI" vs. "Upload Image"/"None" — see the Background
+  // Image radio group in the Story-to-Video form) — never inferred from
+  // whether an image url is already set, since an uploaded image also ends
+  // up in videoEditSettings.backgroundImage but costs nothing. Persisted so
+  // every later cost-estimate recomputation (confirm, budget-guard,
+  // summarizeJobForAgent) keeps showing this cost consistently, not just
+  // this first response.
+  const generateBackgroundImage = Boolean(body.generateBackgroundImage);
   const updatedJob = await jobStore.updateJob(job.id, {
     script,
     videoMode: 'simple-story',
@@ -3427,6 +3561,7 @@ app.post('/api/jobs/story-to-video', async (req, res) => {
     voiceSource,
     videoEditSettings,
     generateYoutubePackage: false,
+    generateBackgroundImage,
     ...fields,
   });
 
@@ -3435,6 +3570,7 @@ app.post('/api/jobs/story-to-video', async (req, res) => {
     videoMode: updatedJob.videoMode,
     generateYoutubePackage: updatedJob.generateYoutubePackage,
     voiceSource,
+    generateBackgroundImage: updatedJob.generateBackgroundImage,
   });
 
   res.json({ job: updatedJob, costEstimate });
@@ -3473,6 +3609,7 @@ app.post('/api/jobs/:id/approve-and-start', async (req, res) => {
       generateYoutubePackage: job.generateYoutubePackage,
       realVoiceoverDurationSeconds: job.voiceover.durationSeconds,
       voiceSource: job.voiceSource,
+      generateBackgroundImage: job.generateBackgroundImage,
     });
     if (maxBudgetUsd < currentEstimate.totalUsd) {
       return res.status(400).json({

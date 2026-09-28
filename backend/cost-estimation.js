@@ -20,6 +20,15 @@ const TRANSCRIPTION_ESTIMATED_USD_PER_MINUTE = 0.006;
 // 'simple-story' thumbnails are a free local ffmpeg frame extraction (see
 // server.js's runGenerateYoutubePackage).
 const THUMBNAIL_IMAGE_ESTIMATED_USD = 0.07;
+// One 'simple-story' background illustration (see image-generation.js's
+// generateBackgroundImage / server.js's POST /:id/generate-background-image)
+// — the SAME per-image rate as THUMBNAIL_IMAGE_ESTIMATED_USD (same model/
+// quality/size), kept as its own named constant since it's conceptually a
+// different feature. Applies once per job, regardless of the video's
+// length, since only ONE illustration is ever generated per job — never
+// per section. Uploading your own image, or using no image at all, is
+// always free; this only applies when the user chose "Generate with AI".
+const BACKGROUND_IMAGE_ESTIMATED_USD = 0.07;
 // One short Claude call producing titles/description/tags/thumbnail
 // concept from an already-finished script.
 const YOUTUBE_PACKAGE_TEXT_ESTIMATED_USD = 0.02;
@@ -42,12 +51,22 @@ function estimateSpeechDurationSeconds(scriptLength) {
 // voiceover cost is always zero; subtitles/transcription still costs real
 // money either way, since Whisper transcribes whichever real audio exists
 // (generated or uploaded) to produce synchronized subtitles.
+// generateBackgroundImage: whether this 'simple-story' job's background
+// illustration is (or will be) AI-generated, set once at job creation from
+// the user's own "Generate with AI" choice (see server.js's POST
+// /api/jobs/story-to-video and job-store.js's generateBackgroundImage
+// field) — never inferred from whether videoEditSettings.backgroundImage
+// happens to be set, since an UPLOADED image also sets that field but costs
+// nothing. Defaults to false/falsy, so any job that never touches this
+// feature (every job created before it existed, and any 'cinematic' job)
+// shows exactly the same total this function already produced.
 function estimateProductionCost({
   script,
   videoMode,
   generateYoutubePackage,
   realVoiceoverDurationSeconds,
   voiceSource,
+  generateBackgroundImage,
 } = {}) {
   const scriptLength = typeof script === 'string' ? script.trim().length : 0;
   const hasRealDuration = typeof realVoiceoverDurationSeconds === 'number' && realVoiceoverDurationSeconds > 0;
@@ -59,6 +78,7 @@ function estimateProductionCost({
     voiceover: scriptLength > 0 && !usesUploadedVoice ? round4((scriptLength / 1000) * TTS_ESTIMATED_USD_PER_1K_CHARACTERS) : 0,
     subtitles: scriptLength > 0 || hasRealDuration ? round4(estimatedMinutes * TRANSCRIPTION_ESTIMATED_USD_PER_MINUTE) : 0,
     thumbnail: generateYoutubePackage ? (videoMode === 'simple-story' ? 0 : THUMBNAIL_IMAGE_ESTIMATED_USD) : 0,
+    backgroundImage: generateBackgroundImage ? BACKGROUND_IMAGE_ESTIMATED_USD : 0,
     youtubePackageText: generateYoutubePackage ? YOUTUBE_PACKAGE_TEXT_ESTIMATED_USD : 0,
   };
 

@@ -136,6 +136,16 @@ async function storeUploadedMusicFile(buffer, jobId, { extension, contentType })
   return storeMediaFile(buffer, `uploaded-music-${jobId}`, { extension, contentType });
 }
 
+// Stores a user-UPLOADED background-image file's real bytes for one job
+// (see server.js's POST /:id/upload-background-image) — the same
+// "extension/contentType passed through, not hardcoded" reasoning as
+// storeUploadedVoiceoverFile/storeUploadedMusicFile above, since a real
+// uploaded image's format varies (png/jpeg/webp). The resulting url is
+// stored on job.videoEditSettings.backgroundImage.
+async function storeUploadedBackgroundImageFile(buffer, jobId, { extension, contentType }) {
+  return storeMediaFile(buffer, `uploaded-background-image-${jobId}`, { extension, contentType });
+}
+
 // Stores one generated scene/thumbnail image's real PNG bytes for one job.
 // See this module's own top comment for why job.images[].url can no longer
 // safely embed images directly as data: URIs once enough scenes (or one
@@ -153,6 +163,7 @@ module.exports = {
   storeAudioFile,
   storeUploadedVoiceoverFile,
   storeUploadedMusicFile,
+  storeUploadedBackgroundImageFile,
   storeImageFile,
   hasBlobToken,
   GENERATED_DIR,

@@ -648,6 +648,24 @@ async function main() {
     assert.strictEqual(result.videoEditSettings.backgroundColor, null);
   });
 
+  await test('updateVideoEditSettings accepts a backgroundImage url the user gives it, and "default" removes it', async () => {
+    const job = await jobStore.createJob();
+    await jobStore.updateJob(job.id, { videoMode: 'simple-story' });
+
+    const setResult = JSON.parse(
+      await app.executeTool('updateVideoEditSettings', job.id, { backgroundImage: 'https://example.com/illustration.png' })
+    );
+    assert.strictEqual(setResult.error, undefined, JSON.stringify(setResult));
+    assert.strictEqual(setResult.videoEditSettings.backgroundImage, 'https://example.com/illustration.png');
+
+    const persisted = await jobStore.getJob(job.id);
+    assert.strictEqual(persisted.videoEditSettings.backgroundImage, 'https://example.com/illustration.png');
+
+    const resetResult = JSON.parse(await app.executeTool('updateVideoEditSettings', job.id, { backgroundImage: 'default' }));
+    assert.strictEqual(resetResult.error, undefined, JSON.stringify(resetResult));
+    assert.strictEqual(resetResult.videoEditSettings.backgroundImage, null);
+  });
+
   await test('an edit setting change forces a real reassembly; an unchanged one stays a safe no-op', async () => {
     const job = await jobStore.createJob();
     const voiceoverUrl = await makeFixtureVoiceoverDataUri(workDir);

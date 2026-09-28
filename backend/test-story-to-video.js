@@ -17,6 +17,7 @@
 const path = require('path');
 const fs = require('fs');
 const os = require('os');
+const http = require('http');
 const assert = require('assert');
 const { execFile } = require('child_process');
 
@@ -75,6 +76,12 @@ async function main() {
   await runFfmpeg(simpleStoryVideo.ffmpegPath, ['-y', '-f', 'lavfi', '-i', 'sine=frequency=440:duration=2', wavPath]);
   const wavBuffer = fs.readFileSync(wavPath);
 
+  // A real, single-frame solid-color PNG — for the "Upload My Own
+  // Background Image" tests below (POST /:id/upload-background-image).
+  const bgImagePath = path.join(workDir, 'bg-image.png');
+  await runFfmpeg(simpleStoryVideo.ffmpegPath, ['-y', '-f', 'lavfi', '-i', 'color=c=0x336699:s=320x240', '-frames:v', '1', bgImagePath]);
+  const bgImageBuffer = fs.readFileSync(bgImagePath);
+
   // Two real, distinguishable audio fixtures (different tones) used to prove
   // multi-file "Upload My Own Voice" both really joins the parts (combined
   // duration) AND preserves the exact order they were uploaded in (part A's
@@ -120,6 +127,26 @@ async function main() {
   // local data/generated/ path (see video-storage.js) rather than trying a
   // real network call to Vercel Blob.
   delete process.env.BLOB_READ_WRITE_TOKEN;
+
+  // A minimal stand-in for the real OpenAI Images API (same technique
+  // test-generate-scene-images-tool.js uses) — for POST /:id/generate-
+  // background-image's tests below. Redirecting OPENAI_BASE_URL here, before
+  // image-generation.js's client is ever constructed, guarantees that route
+  // never makes a real, paid OpenAI call in this test file.
+  let mockOpenAiRequestCount = 0;
+  const mockOpenAiServer = await new Promise((resolve) => {
+    const s = http.createServer((req, res) => {
+      mockOpenAiRequestCount++;
+      req.on('data', () => {});
+      req.on('end', () => {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ data: [{ b64_json: 'ZmFrZWltYWdlZGF0YQ==' }] }));
+      });
+    });
+    s.listen(0, () => resolve(s));
+  });
+  process.env.OPENAI_API_KEY = 'test-key';
+  process.env.OPENAI_BASE_URL = `http://localhost:${mockOpenAiServer.address().port}/v1`;
 
   const server = require('./server');
   const jobStore = require('./job-store');
@@ -645,6 +672,199 @@ async function main() {
   });
 
   // ---------------------------------------------------------------------
+  // POST /api/jobs/story-to-video — backgroundImage cost estimate
+  // ---------------------------------------------------------------------
+
+  await test('POST /api/jobs/story-to-video shows zero backgroundImage cost when no background-image option is sent at all (the default, "None")', async () => {
+    const res = await fetch(`${baseUrl}/api/jobs/story-to-video`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ script: SHORT_SCRIPT }),
+    });
+    const body = await res.json();
+    assert.strictEqual(body.job.generateBackgroundImage, false);
+    assert.strictEqual(body.costEstimate.breakdown.backgroundImage, 0);
+  });
+
+  await test('POST /api/jobs/story-to-video shows zero backgroundImage cost when generateBackgroundImage is explicitly false ("Upload Image" or "None")', async () => {
+    const res = await fetch(`${baseUrl}/api/jobs/story-to-video`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ script: SHORT_SCRIPT, generateBackgroundImage: false }),
+    });
+    const body = await res.json();
+    assert.strictEqual(body.job.generateBackgroundImage, false);
+    assert.strictEqual(body.costEstimate.breakdown.backgroundImage, 0);
+  });
+
+  await test('POST /api/jobs/story-to-video shows exactly $0.07 backgroundImage cost, included in the total, when generateBackgroundImage is true ("Generate with AI")', async () => {
+    const res = await fetch(`${baseUrl}/api/jobs/story-to-video`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ script: SHORT_SCRIPT, generateBackgroundImage: true }),
+    });
+    const body = await res.json();
+    assert.strictEqual(body.job.generateBackgroundImage, true);
+    assert.strictEqual(body.costEstimate.breakdown.backgroundImage, 0.07);
+
+    const withoutFlag = await (
+      await fetch(`${baseUrl}/api/jobs/story-to-video`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ script: SHORT_SCRIPT }),
+      })
+    ).json();
+    assert.ok(
+      Math.abs(body.costEstimate.totalUsd - withoutFlag.costEstimate.totalUsd - 0.07) < 0.0001,
+      `expected the total to be exactly $0.07 higher than the no-image total; got ${body.costEstimate.totalUsd} vs ${withoutFlag.costEstimate.totalUsd}`
+    );
+  });
+
+  // ---------------------------------------------------------------------
+  // POST /api/jobs/:id/upload-background-image
+  // ---------------------------------------------------------------------
+
+  await test('POST /api/jobs/:id/upload-background-image 404s for an unknown job', async () => {
+    const res = await fetch(`${baseUrl}/api/jobs/no-such-job/upload-background-image`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'image/png' },
+      body: bgImageBuffer,
+    });
+    assert.strictEqual(res.status, 404);
+  });
+
+  await test('POST /api/jobs/:id/upload-background-image rejects an unsupported content type', async () => {
+    const createRes = await fetch(`${baseUrl}/api/jobs/story-to-video`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ script: SHORT_SCRIPT }),
+    });
+    const job = (await createRes.json()).job;
+
+    const res = await fetch(`${baseUrl}/api/jobs/${job.id}/upload-background-image`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'text/plain' },
+      body: 'not an image',
+    });
+    assert.strictEqual(res.status, 400);
+    const body = await res.json();
+    assert.ok(/Unsupported image format/.test(body.error));
+  });
+
+  await test('POST /api/jobs/:id/upload-background-image rejects an empty body', async () => {
+    const createRes = await fetch(`${baseUrl}/api/jobs/story-to-video`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ script: SHORT_SCRIPT }),
+    });
+    const job = (await createRes.json()).job;
+
+    const res = await fetch(`${baseUrl}/api/jobs/${job.id}/upload-background-image`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'image/png' },
+      body: Buffer.alloc(0),
+    });
+    assert.strictEqual(res.status, 400);
+  });
+
+  await test('POST /api/jobs/:id/upload-background-image stores a real PNG, sets backgroundImage, and stays free (generateBackgroundImage untouched)', async () => {
+    const createRes = await fetch(`${baseUrl}/api/jobs/story-to-video`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ script: SHORT_SCRIPT }),
+    });
+    const job = (await createRes.json()).job;
+    assert.strictEqual(job.videoEditSettings.backgroundImage, null, 'no image yet');
+    assert.strictEqual(job.videoEditSettings.backgroundPreset, 'warm', 'the default preset, still present alongside no image');
+    assert.strictEqual(job.generateBackgroundImage, false);
+
+    const res = await fetch(`${baseUrl}/api/jobs/${job.id}/upload-background-image`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'image/png' },
+      body: bgImageBuffer,
+    });
+    assert.strictEqual(res.status, 200, JSON.stringify(await res.clone().json()));
+    const body = await res.json();
+
+    assert.ok(body.job.videoEditSettings.backgroundImage, 'expected a real stored url for the uploaded image');
+    assert.strictEqual(body.job.videoEditSettings.backgroundPreset, 'warm', 'unrelated settings must be untouched');
+    assert.strictEqual(body.job.generateBackgroundImage, false, 'an uploaded image must never be billed as AI-generated');
+  });
+
+  await test('POST /api/jobs/:id/upload-background-image refuses a cinematic-mode job', async () => {
+    const job = await jobStore.createJob();
+    await jobStore.updateJob(job.id, { videoMode: 'cinematic' });
+
+    const res = await fetch(`${baseUrl}/api/jobs/${job.id}/upload-background-image`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'image/png' },
+      body: bgImageBuffer,
+    });
+    assert.strictEqual(res.status, 400);
+    const body = await res.json();
+    assert.ok(/Simple Story Video mode/.test(body.error));
+  });
+
+  // ---------------------------------------------------------------------
+  // POST /api/jobs/:id/generate-background-image
+  // ---------------------------------------------------------------------
+
+  await test('POST /api/jobs/:id/generate-background-image requires a non-empty prompt', async () => {
+    const createRes = await fetch(`${baseUrl}/api/jobs/story-to-video`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ script: SHORT_SCRIPT }),
+    });
+    const job = (await createRes.json()).job;
+
+    const res = await fetch(`${baseUrl}/api/jobs/${job.id}/generate-background-image`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ prompt: '   ' }),
+    });
+    assert.strictEqual(res.status, 400);
+    const body = await res.json();
+    assert.ok(/description/.test(body.error));
+  });
+
+  await test('POST /api/jobs/:id/generate-background-image makes exactly one real (mocked) OpenAI call, stores backgroundImage, sets generateBackgroundImage, and returns a costEstimate showing $0.07', async () => {
+    const createRes = await fetch(`${baseUrl}/api/jobs/story-to-video`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ script: SHORT_SCRIPT }),
+    });
+    const job = (await createRes.json()).job;
+
+    mockOpenAiRequestCount = 0;
+    const res = await fetch(`${baseUrl}/api/jobs/${job.id}/generate-background-image`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ prompt: 'a cozy reading nook with warm lamplight' }),
+    });
+    assert.strictEqual(res.status, 200, JSON.stringify(await res.clone().json()));
+    const body = await res.json();
+
+    assert.strictEqual(mockOpenAiRequestCount, 1, 'expected exactly one real generation call');
+    assert.ok(body.job.videoEditSettings.backgroundImage, 'expected a real stored url for the generated image');
+    assert.strictEqual(body.job.generateBackgroundImage, true);
+    assert.strictEqual(body.costEstimate.breakdown.backgroundImage, 0.07);
+  });
+
+  await test('POST /api/jobs/:id/generate-background-image refuses a cinematic-mode job before making any OpenAI call', async () => {
+    const job = await jobStore.createJob();
+    await jobStore.updateJob(job.id, { videoMode: 'cinematic' });
+
+    mockOpenAiRequestCount = 0;
+    const res = await fetch(`${baseUrl}/api/jobs/${job.id}/generate-background-image`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ prompt: 'a mountain landscape' }),
+    });
+    assert.strictEqual(res.status, 400);
+    assert.strictEqual(mockOpenAiRequestCount, 0);
+  });
+
+  // ---------------------------------------------------------------------
   // POST /api/jobs/:id/approve-and-start
   // ---------------------------------------------------------------------
 
@@ -807,6 +1027,7 @@ async function main() {
   });
 
   httpServer.close();
+  mockOpenAiServer.close();
   fs.rmSync(workDir, { recursive: true, force: true });
 
   if (originalJobsFile !== null) {
