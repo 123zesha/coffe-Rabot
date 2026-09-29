@@ -104,6 +104,7 @@ const JOB_FIELDS = [
   'status',
   'confirmed',
   'generateYoutubePackage',
+  'generateBackgroundImage',
   'youtubePackage',
   'burnInSubtitles',
   'outputFormat',
@@ -499,9 +500,16 @@ function createDefaultJob(id) {
     // - textBackground: whether the large story text has an opaque box
     //   behind it (default true, the original always-on look) or plain
     //   outlined text with no box (false).
+    // - backgroundImage: a url/path (same shapes voiceover.url/musicCustomUrl
+    //   already use — data:, /generated/, http(s)://), or null (default) —
+    //   ONE static illustration used as every section's background instead
+    //   of a solid color, set via server.js's upload/generate-background-
+    //   image paths. Takes priority over backgroundPreset/backgroundColor
+    //   when set.
     videoEditSettings: {
       backgroundColor: null,
       backgroundPreset: null,
+      backgroundImage: null,
       storyPosition: null,
       fontWeight: null,
       textSize: null,
@@ -607,6 +615,15 @@ function createDefaultJob(id) {
     // the user directly asking in chat for a title/description/thumbnail
     // to be created — see prompts/system-prompt.md.
     generateYoutubePackage: false,
+    // Whether this 'simple-story' job's background illustration (see
+    // videoEditSettings.backgroundImage above) is/was AI-generated rather
+    // than uploaded or left as a solid color — set once, at job creation,
+    // from the user's own "Generate with AI" choice (server.js's POST
+    // /api/jobs/story-to-video), and used ONLY to drive cost-estimation.js's
+    // own breakdown/total: an uploaded image, or no image at all, is always
+    // free and must never show this cost. Default false leaves every
+    // already-existing job's cost estimate byte-for-byte unchanged.
+    generateBackgroundImage: false,
     // Populated by the real YouTube-package generation (see
     // backend/youtube-package.js for the text half — titles/description/
     // tags/thumbnail concept — and backend/image-generation.js's

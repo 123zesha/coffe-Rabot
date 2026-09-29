@@ -45,6 +45,14 @@
   const storyVoiceUploadStatus = document.getElementById('story-voice-upload-status');
   const storyBackgroundSelect = document.getElementById('story-background');
   const storyBackgroundCustomInput = document.getElementById('story-background-custom');
+  const bgImageSourceNoneRadio = document.getElementById('bg-image-source-none');
+  const bgImageSourceUploadRadio = document.getElementById('bg-image-source-upload');
+  const bgImageSourceGenerateRadio = document.getElementById('bg-image-source-generate');
+  const bgImageUploadOptions = document.getElementById('bg-image-upload-options');
+  const bgImageGenerateOptions = document.getElementById('bg-image-generate-options');
+  const storyBackgroundImageUploadInput = document.getElementById('story-background-image-upload');
+  const storyBackgroundImageUploadStatus = document.getElementById('story-background-image-upload-status');
+  const storyBackgroundImagePromptInput = document.getElementById('story-background-image-prompt');
   const storyTextSizeInput = document.getElementById('story-text-size');
   const storyTextSizeDecreaseBtn = document.getElementById('story-text-size-decrease');
   const storyTextSizeIncreaseBtn = document.getElementById('story-text-size-increase');
@@ -428,6 +436,23 @@
       : '';
   });
 
+  function updateBackgroundImageSourceVisibility() {
+    bgImageUploadOptions.hidden = !bgImageSourceUploadRadio.checked;
+    bgImageGenerateOptions.hidden = !bgImageSourceGenerateRadio.checked;
+  }
+  bgImageSourceNoneRadio.addEventListener('change', updateBackgroundImageSourceVisibility);
+  bgImageSourceUploadRadio.addEventListener('change', updateBackgroundImageSourceVisibility);
+  bgImageSourceGenerateRadio.addEventListener('change', updateBackgroundImageSourceVisibility);
+
+  let storyBackgroundImageFile = null;
+  storyBackgroundImageUploadInput.addEventListener('change', () => {
+    storyBackgroundImageFile =
+      storyBackgroundImageUploadInput.files && storyBackgroundImageUploadInput.files[0] ? storyBackgroundImageUploadInput.files[0] : null;
+    storyBackgroundImageUploadStatus.textContent = storyBackgroundImageFile
+      ? `Selected: ${storyBackgroundImageFile.name} (${(storyBackgroundImageFile.size / (1024 * 1024)).toFixed(1)}MB)`
+      : '';
+  });
+
   function formatVolumeDb(value) {
     const num = Number(value);
     if (num === 0) return 'Default';
@@ -713,6 +738,15 @@
     return 'application/octet-stream';
   }
 
+  function normalizeImageContentType(file) {
+    if (file.type) return file.type;
+    const lower = file.name.toLowerCase();
+    if (lower.endsWith('.png')) return 'image/png';
+    if (lower.endsWith('.jpg') || lower.endsWith('.jpeg')) return 'image/jpeg';
+    if (lower.endsWith('.webp')) return 'image/webp';
+    return 'application/octet-stream';
+  }
+
   function setStoryCostStatus(text, type) {
     storyCostStatus.textContent = text;
     storyCostStatus.className = 'generate-status' + (type ? ' ' + type : '');
@@ -725,6 +759,7 @@
       ['Voice-over (text-to-speech)', costEstimate.breakdown.voiceover],
       ['Subtitles (transcription)', costEstimate.breakdown.subtitles],
       ['Thumbnail', costEstimate.breakdown.thumbnail],
+      ['Background image (AI-generated)', costEstimate.breakdown.backgroundImage],
       ['YouTube package text', costEstimate.breakdown.youtubePackageText],
     ];
     for (const [label, amount] of rows) {
@@ -802,6 +837,18 @@
       storyCostReview.hidden = false;
       return;
     }
+    const useBgImageUpload = bgImageSourceUploadRadio.checked;
+    const useBgImageGenerate = bgImageSourceGenerateRadio.checked;
+    if (useBgImageUpload && !storyBackgroundImageFile) {
+      setStoryCostStatus('Please choose a background image to upload first.', 'error');
+      storyCostReview.hidden = false;
+      return;
+    }
+    if (useBgImageGenerate && !storyBackgroundImagePromptInput.value.trim()) {
+      setStoryCostStatus('Please describe the illustration you want generated.', 'error');
+      storyCostReview.hidden = false;
+      return;
+    }
 
     storyReviewCostBtn.disabled = true;
     setStoryCostStatus('Preparing your production plan…', 'loading');
@@ -831,6 +878,7 @@
           language: storyLanguageSelect.value,
           voiceVolumeDb: Number(storyNarrationVolumeInput.value) || 0,
           musicVolumeDb: Number(storyMusicVolumeInput.value) || 0,
+          generateBackgroundImage: useBgImageGenerate,
           musicEnabled,
           musicTrack: useMusicLibrary ? storyMusicTrackSelect.value : undefined,
           generateYoutubePackage: storyYoutubePackageToggle.checked,
@@ -898,6 +946,34 @@
           setStoryCostStatus(musicUploadBody.error || 'Could not upload that music file.', 'error');
           return;
         }
+      }
+
+      if (useBgImageUpload) {
+        setStoryCostStatus('Uploading your background image…', 'loading');
+        const bgImageContentType = normalizeImageContentType(storyBackgroundImageFile);
+        const bgImageUploadRes = await fetch(`/api/jobs/${storyJobId}/upload-background-image`, {
+          method: 'POST',
+          headers: { 'Content-Type': bgImageContentType },
+          body: storyBackgroundImageFile,
+        });
+        const bgImageUploadBody = await bgImageUploadRes.json();
+        if (!bgImageUploadRes.ok) {
+          setStoryCostStatus(bgImageUploadBody.error || 'Could not upload that background image.', 'error');
+          return;
+        }
+      } else if (useBgImageGenerate) {
+        setStoryCostStatus('Generating your background illustration…', 'loading');
+        const bgImageGenerateRes = await fetch(`/api/jobs/${storyJobId}/generate-background-image`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ prompt: storyBackgroundImagePromptInput.value.trim() }),
+        });
+        const bgImageGenerateBody = await bgImageGenerateRes.json();
+        if (!bgImageGenerateRes.ok) {
+          setStoryCostStatus(bgImageGenerateBody.error || 'Could not generate that background image.', 'error');
+          return;
+        }
+        costEstimate = bgImageGenerateBody.costEstimate;
       }
 
       if (warning) {

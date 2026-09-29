@@ -165,6 +165,26 @@ function makeMusicTone(dir, seconds, label) {
   );
 }
 
+// A single-frame, solid-color PNG — stands in for a real uploaded/generated
+// background illustration without needing a real image file on disk. Used
+// only to prove editSettings.backgroundImage's real bytes reach the actual
+// rendered pixels (see the "renders a real backgroundImage" test below);
+// the exact image content never matters, only that it's a real, decodable
+// image ffmpeg can read as a static background.
+function makeSolidImage(dir, hexColor, label) {
+  const outPath = path.join(dir, `bg-image-${label || ++toneAudioCounter}.png`);
+  return runFfmpeg([
+    '-y',
+    '-f',
+    'lavfi',
+    '-i',
+    `color=c=0x${hexColor}:s=320x240`,
+    '-frames:v',
+    '1',
+    outPath,
+  ]).then(() => outPath);
+}
+
 // A narration fixture with a REAL silent gap in the actual audio signal
 // itself (tone, then true silence, then tone) — used only by the
 // musicVolumeDb test below. sidechaincompress ducks music based on the
@@ -298,30 +318,57 @@ async function main() {
     assert.strictEqual(sections[0].end, 9);
   });
 
-  await test('wrapText never drops real text, even when it must merge overflow onto the last line', () => {
+  await test('wrapText never drops real text, and never lets any line exceed the character budget (no more merging overflow into one oversized line)', () => {
     const longText = 'one two three four five six seven eight nine ten eleven twelve thirteen fourteen';
-    const lines = ssv.wrapText(longText, 20, 2);
-    assert.strictEqual(lines.length, 2);
+    const lines = ssv.wrapText(longText, 20);
+    assert.ok(lines.length > 2, `expected this long a text to need more than 2 real lines at budget 20, got ${lines.length}`);
+    for (const line of lines) {
+      assert.ok(line.length <= 20, `expected every line to stay within the 20-char budget, got "${line}" (${line.length} chars)`);
+    }
     const rejoined = lines.join(' ');
     for (const word of longText.split(' ')) {
       assert.ok(rejoined.includes(word), `expected "${word}" to survive wrapping`);
     }
   });
 
-  await test('wrapText respects the per-line character budget when it does not need to merge', () => {
-    const lines = ssv.wrapText('short story text here', 100, 3);
+  await test('wrapText respects the per-line character budget when it fits on one line', () => {
+    const lines = ssv.wrapText('short story text here', 100);
     assert.strictEqual(lines.length, 1, 'text well under the budget should not be wrapped at all');
   });
 
-  await test('fitCueText wraps a long cue to at most 2 lines at the given fixed font size, never truncating it', () => {
+  await test('fitCueText wraps a long cue to as many lines as needed, never letting any single line exceed the safe character budget, and never truncating it', () => {
     const longCue =
       'This is a much longer sentence than the others, written to force the layout to wrap across ' +
       'more than one line while still keeping every single word of the real narration.';
-    const { lines } = ssv.fitCueText(longCue, 70);
-    assert.ok(lines.length <= 2, `expected at most 2 lines, got ${lines.length}`);
+    const fontSize = 70;
+    const maxCharsPerLine = Math.floor((ssv.SIMPLE_STORY_WIDTH * 0.82) / (fontSize * 0.56));
+    const { lines } = ssv.fitCueText(longCue, fontSize);
+    for (const line of lines) {
+      assert.ok(
+        line.length <= maxCharsPerLine,
+        `expected every line to stay within the ${maxCharsPerLine}-char safe budget (never run off the frame — WrapStyle: 2 means libass won't wrap it for us), got "${line}" (${line.length} chars)`
+      );
+    }
     const rejoined = lines.join(' ');
     for (const word of longCue.split(' ')) {
       assert.ok(rejoined.includes(word.replace(/[.,]$/, '')), `expected "${word}" to survive fitCueText`);
+    }
+  });
+
+  await test('fitCueText reproduces the real reported overflow case: a long narration sentence at the default 70px size never produces an over-width line', () => {
+    // The exact shape of sentence a real user reported running past the
+    // frame's edges before this fix (a single long clause with no early
+    // natural break) — this is a regression test for that real bug, not
+    // just a synthetic one.
+    const realSentence = 'Before the sun was up, Mr. Anderson showed him how to mix flour, knead the dough, and shape the loaves just right.';
+    const fontSize = 70;
+    const maxCharsPerLine = Math.floor((ssv.SIMPLE_STORY_WIDTH * 0.82) / (fontSize * 0.56));
+    const { lines } = ssv.fitCueText(realSentence, fontSize);
+    for (const line of lines) {
+      assert.ok(
+        line.length <= maxCharsPerLine,
+        `this exact real-world sentence must never produce a line wider than the safe budget — got "${line}" (${line.length} chars, budget ${maxCharsPerLine})`
+      );
     }
   });
 
@@ -849,6 +896,7 @@ async function main() {
       assert.deepStrictEqual(ssv.normalizeVideoEditSettings(input), {
         backgroundColor: null,
         backgroundPreset: null,
+        backgroundImage: null,
         storyPosition: null,
         fontWeight: null,
         textSize: null,
@@ -883,6 +931,7 @@ async function main() {
     assert.deepStrictEqual(normalized, {
       backgroundColor: '1a2b3c',
       backgroundPreset: 'warm',
+      backgroundImage: null,
       storyPosition: 'top',
       fontWeight: 'bold',
       textSize: 'xl',
@@ -935,6 +984,16 @@ async function main() {
 
     assert.strictEqual(ssv.normalizeVideoEditSettings({ showCaptions: false }).showCaptions, false);
     assert.strictEqual(ssv.normalizeVideoEditSettings({ showCaptions: 'no' }).showCaptions, true, 'a non-boolean must fall back to the default (true)');
+  });
+
+  await test('normalizeVideoEditSettings accepts a real backgroundImage string and rejects/defaults invalid input', () => {
+    assert.strictEqual(ssv.normalizeVideoEditSettings({}).backgroundImage, null, 'default is null, unchanged rendering for every existing job');
+    assert.strictEqual(
+      ssv.normalizeVideoEditSettings({ backgroundImage: '/generated/some-image.png' }).backgroundImage,
+      '/generated/some-image.png'
+    );
+    assert.strictEqual(ssv.normalizeVideoEditSettings({ backgroundImage: '  ' }).backgroundImage, null, 'whitespace-only must not count as set');
+    assert.strictEqual(ssv.normalizeVideoEditSettings({ backgroundImage: 42 }).backgroundImage, null, 'a non-string must fall back to null');
   });
 
   await test('resolveBackgroundColor: a named preset takes priority over a raw backgroundColor; otherwise falls back to custom color or the rotating palette', () => {
@@ -1219,6 +1278,33 @@ async function main() {
       offPixel.r > 235 && offPixel.b > 235,
       `expected plain background magenta here once the box is removed, got rgb(${offPixel.r},${offPixel.g},${offPixel.b})`
     );
+  });
+
+  await test('continueSimpleStoryVideoAssembly renders a real backgroundImage into the actual pixels, overriding backgroundColor', async () => {
+    const audioPath = await makeToneAudio(workDir, 4, 'bg-image');
+    // A solid orange test image — passed as a plain local file path, one of
+    // the shapes fetchAudioToFile already accepts (see this module's own
+    // top comment) — deliberately different from backgroundColor below, so
+    // a pixel matching the IMAGE's color (not the color) proves
+    // backgroundImage genuinely took priority, not just that rendering ran.
+    const imagePath = await makeSolidImage(workDir, 'ff8000', 'orange');
+    const result = await ssv.continueSimpleStoryVideoAssembly({
+      voiceover: { status: 'completed', url: audioPath },
+      subtitlesContent: FIXTURE_SRT,
+      existingRender: null,
+      jobId: 'test-job-bg-image',
+      editSettings: { backgroundColor: '000000', backgroundImage: imagePath },
+    });
+    assert.strictEqual(result.status, 'completed', result.error);
+
+    const outPath = path.join(workDir, 'output-bg-image.mp4');
+    fs.writeFileSync(outPath, result.buffer);
+    // Top-left corner, well after the fade-in, is plain background — same
+    // point the backgroundColor pixel test above uses.
+    const pixel = await probePixelColor(outPath, 1.5, 10, 10);
+    assert.ok(Math.abs(pixel.r - 0xff) <= 20, `expected R≈0xff (the image's orange, not black), got 0x${pixel.r.toString(16)}`);
+    assert.ok(Math.abs(pixel.g - 0x80) <= 20, `expected G≈0x80, got 0x${pixel.g.toString(16)}`);
+    assert.ok(pixel.b <= 20, `expected B≈0x00, got 0x${pixel.b.toString(16)}`);
   });
 
   await test('continueSimpleStoryVideoAssembly applies voiceSpeed to both the audio and the on-screen text timing', async () => {

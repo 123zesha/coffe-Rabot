@@ -26,7 +26,7 @@ const SAMPLE_SCRIPT = 'a'.repeat(9000); // 9000 characters, ~10 estimated spoken
 test('estimateProductionCost returns an all-zero breakdown for an empty/missing script', () => {
   const result = estimateProductionCost({ script: '', videoMode: 'simple-story', generateYoutubePackage: false });
   assert.strictEqual(result.totalUsd, 0);
-  assert.deepStrictEqual(result.breakdown, { voiceover: 0, subtitles: 0, thumbnail: 0, youtubePackageText: 0 });
+  assert.deepStrictEqual(result.breakdown, { voiceover: 0, subtitles: 0, thumbnail: 0, backgroundImage: 0, youtubePackageText: 0 });
 
   const missing = estimateProductionCost({});
   assert.strictEqual(missing.totalUsd, 0);
@@ -50,6 +50,31 @@ test('estimateProductionCost never charges for a thumbnail image in simple-story
 test('estimateProductionCost charges for a real thumbnail image in cinematic mode with the YouTube package on', () => {
   const result = estimateProductionCost({ script: SAMPLE_SCRIPT, videoMode: 'cinematic', generateYoutubePackage: true });
   assert.ok(result.breakdown.thumbnail > 0, 'cinematic mode uses a real, paid OpenAI image call for its thumbnail');
+});
+
+test('estimateProductionCost shows zero backgroundImage cost by default, and for an explicit "None"/"Upload Image" choice', () => {
+  const defaulted = estimateProductionCost({ script: SAMPLE_SCRIPT, videoMode: 'simple-story' });
+  assert.strictEqual(defaulted.breakdown.backgroundImage, 0);
+
+  const explicitFalse = estimateProductionCost({ script: SAMPLE_SCRIPT, videoMode: 'simple-story', generateBackgroundImage: false });
+  assert.strictEqual(explicitFalse.breakdown.backgroundImage, 0);
+});
+
+test('estimateProductionCost charges exactly $0.07 for backgroundImage, and only that, when generateBackgroundImage is true ("Generate with AI")', () => {
+  const withImage = estimateProductionCost({ script: SAMPLE_SCRIPT, videoMode: 'simple-story', generateBackgroundImage: true });
+  const withoutImage = estimateProductionCost({ script: SAMPLE_SCRIPT, videoMode: 'simple-story', generateBackgroundImage: false });
+
+  assert.strictEqual(withImage.breakdown.backgroundImage, 0.07);
+  assert.strictEqual(
+    Math.round((withImage.totalUsd - withoutImage.totalUsd) * 10000) / 10000,
+    0.07,
+    'the ONLY difference between the two totals must be the $0.07 backgroundImage line'
+  );
+  // Every other line item must be completely untouched by this flag.
+  assert.strictEqual(withImage.breakdown.voiceover, withoutImage.breakdown.voiceover);
+  assert.strictEqual(withImage.breakdown.subtitles, withoutImage.breakdown.subtitles);
+  assert.strictEqual(withImage.breakdown.thumbnail, withoutImage.breakdown.thumbnail);
+  assert.strictEqual(withImage.breakdown.youtubePackageText, withoutImage.breakdown.youtubePackageText);
 });
 
 test('estimateProductionCost uses a real, measured voice-over duration to sharpen the subtitles estimate, never the voiceover estimate', () => {

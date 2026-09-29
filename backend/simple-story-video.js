@@ -205,6 +205,14 @@ function normalizeVideoEditSettings(raw) {
   return {
     backgroundColor: HEX_COLOR_RE.test(input.backgroundColor || '') ? input.backgroundColor.toLowerCase() : null,
     backgroundPreset: VALID_BACKGROUND_PRESETS.includes(input.backgroundPreset) ? input.backgroundPreset : null,
+    // A single static illustration used as the background for EVERY
+    // section, instead of a solid color — a url/path in the same shapes
+    // fetchAudioToFile already accepts (data:, /generated/, http(s)://),
+    // set once via server.js's upload/generate-background-image paths.
+    // Takes priority over backgroundPreset/backgroundColor when set; null
+    // (the default) leaves every already-existing job's solid-color
+    // background byte-for-byte unchanged.
+    backgroundImage: typeof input.backgroundImage === 'string' && input.backgroundImage.trim() ? input.backgroundImage.trim() : null,
     storyPosition: VALID_STORY_POSITIONS.includes(input.storyPosition) ? input.storyPosition : null,
     fontWeight: VALID_FONT_WEIGHTS.includes(input.fontWeight) ? input.fontWeight : null,
     textSize: VALID_TEXT_SIZES.includes(input.textSize) ? input.textSize : null,
@@ -481,10 +489,15 @@ function groupCuesIntoSections(cues, sectionTargetSeconds, totalDuration) {
   }));
 }
 
-// Greedily wraps `text` to at most maxCharsPerLine per line. If the result
-// still exceeds maxLines, the overflow is merged onto the last line rather
-// than dropped — real narration text is never truncated to fit a layout.
-function wrapText(text, maxCharsPerLine, maxLines) {
+// Greedily wraps `text` so that NO line exceeds maxCharsPerLine — real
+// narration text is never truncated, and (just as important) never allowed
+// to overflow past the frame's safe text width either: buildAssScript's ASS
+// header sets WrapStyle: 2, which tells libass to perform NO wrapping of
+// its own, so whatever lines this function returns are rendered exactly as
+// given. An unusually long cue may occasionally need more than the usual 2
+// lines (see fitCueText) rather than risk a too-wide line running off the
+// edge of the video.
+function wrapText(text, maxCharsPerLine) {
   const words = String(text).split(/\s+/).filter(Boolean);
   const lines = [];
   let current = '';
@@ -502,27 +515,23 @@ function wrapText(text, maxCharsPerLine, maxLines) {
     lines.push(current);
   }
 
-  if (lines.length > maxLines) {
-    const head = lines.slice(0, maxLines - 1);
-    const tail = lines.slice(maxLines - 1).join(' ');
-    return [...head, tail];
-  }
-
   return lines;
 }
 
-// Wraps one cue's text to at most 2 short lines at the given (fixed,
-// user-chosen — see TEXT_SIZE_PX) font size — "show only the currently
-// spoken sentence or one to two short lines" is implemented literally: the
-// size is never shrunk to cram in more lines (that would make on-screen
-// text visibly change size cue to cue, which is worse for a fixed reading
-// size than the occasional long cue running a bit wide). An unusually long
-// single cue still never loses text — wrapText merges any overflow onto the
-// 2nd line rather than dropping it, same honesty-over-truncation rule as
-// wrapText itself always had.
+// Wraps one cue's text at the given (fixed, user-chosen — see TEXT_SIZE_PX)
+// font size — "show only the currently spoken sentence or one to two short
+// lines" is implemented literally for the common case: the size is never
+// shrunk to cram in more lines (that would make on-screen text visibly
+// change size cue to cue, which is worse for a fixed reading size than the
+// occasional long cue running a couple of lines taller). Unlike an earlier
+// version of this function, an unusually long cue that needs MORE than 2
+// lines now genuinely gets 3+ real lines from wrapText, each still within
+// maxCharsPerLine — never one oversized line merged from the overflow, which
+// used to run past the frame's safe margins (WrapStyle: 2 means libass never
+// auto-wraps a too-long line for us). Text is still never lost or truncated.
 function fitCueText(text, fontSize) {
   const maxCharsPerLine = Math.floor((SIMPLE_STORY_WIDTH * 0.82) / (fontSize * 0.56));
-  return { lines: wrapText(text, maxCharsPerLine, 2) };
+  return { lines: wrapText(text, maxCharsPerLine) };
 }
 
 function secondsToAssTimestamp(seconds) {
@@ -679,7 +688,17 @@ function cuesForSection(cues, section) {
 // normalizeVideoEditSettings) — backgroundColor overrides the default
 // rotating per-section palette with ONE fixed color for every section when
 // set; everything else is passed straight through to buildAssScript.
-async function renderSection(section, sectionIndex, workDir, sectionCues, effectiveDuration, editSettings = {}) {
+// backgroundImagePath: a local file path to editSettings.backgroundImage's
+// real bytes, already downloaded ONCE by the caller (continueSimpleStory-
+// VideoAssembly never re-downloads it per section) — null (the default)
+// keeps the original solid-color background exactly as before this
+// feature existed. When given, it replaces the solid-color lavfi source
+// with this SAME static image, looped for the section's own duration, for
+// every section — scaled/cropped to cover the frame (never stretched) so
+// it never distorts regardless of the uploaded/generated image's own
+// aspect ratio, then the same Ken Burns zoom/fade/text burn-in applies on
+// top exactly as it does for a solid-color background.
+async function renderSection(section, sectionIndex, workDir, sectionCues, effectiveDuration, editSettings = {}, backgroundImagePath = null) {
   const duration = Math.max(0.5, effectiveDuration);
   const outPath = path.join(workDir, `section-${sectionIndex}.mp4`);
   const color = resolveBackgroundColor(editSettings, sectionIndex);
@@ -690,18 +709,23 @@ async function renderSection(section, sectionIndex, workDir, sectionCues, effect
   const assPath = path.join(workDir, `section-${sectionIndex}.ass`);
   fs.writeFileSync(assPath, buildAssScript(sectionCues, duration, editSettings), 'utf8');
 
+  const coverScaleAndCrop = backgroundImagePath
+    ? `scale=${SIMPLE_STORY_WIDTH}:${SIMPLE_STORY_HEIGHT}:force_original_aspect_ratio=increase,crop=${SIMPLE_STORY_WIDTH}:${SIMPLE_STORY_HEIGHT},`
+    : '';
   const vf =
+    coverScaleAndCrop +
     `zoompan=z='${zoomExpr}':d=1:s=${SIMPLE_STORY_WIDTH}x${SIMPLE_STORY_HEIGHT}:fps=${SIMPLE_STORY_FPS},` +
     `fade=t=in:st=0:d=${fadeDuration.toFixed(3)},` +
     `fade=t=out:st=${Math.max(0, duration - fadeDuration).toFixed(3)}:d=${fadeDuration.toFixed(3)},` +
     `ass='${escapeFilterValue(assPath)}':fontsdir='${escapeFilterValue(FONTS_DIR)}'`;
 
+  const inputArgs = backgroundImagePath
+    ? ['-loop', '1', '-t', duration.toFixed(3), '-i', backgroundImagePath]
+    : ['-f', 'lavfi', '-i', `color=c=0x${color}:s=${SIMPLE_STORY_WIDTH}x${SIMPLE_STORY_HEIGHT}:r=${SIMPLE_STORY_FPS}:d=${duration.toFixed(3)}`];
+
   await runFfmpeg([
     '-y',
-    '-f',
-    'lavfi',
-    '-i',
-    `color=c=0x${color}:s=${SIMPLE_STORY_WIDTH}x${SIMPLE_STORY_HEIGHT}:r=${SIMPLE_STORY_FPS}:d=${duration.toFixed(3)}`,
+    ...inputArgs,
     '-vf',
     vf,
     '-t',
@@ -879,6 +903,19 @@ async function continueSimpleStoryVideoAssembly({
       throw new Error('Subtitle timing adjustments left no usable cues — check subtitleTimingOffsetMs.');
     }
 
+    // Downloaded ONCE per call (not per section) since every section uses
+    // the exact same static image — see renderSection's own comment. Reuses
+    // fetchAudioToFile as-is: it only ever copies/decodes bytes to a local
+    // path regardless of media type, so no separate "fetch an image" helper
+    // is needed. null (the default) means every section keeps its original
+    // solid-color background exactly as before this feature existed.
+    let backgroundImagePath = null;
+    if (editSettings.backgroundImage) {
+      backgroundImagePath = path.join(workDir, 'background-image');
+      await fetchAudioToFile(editSettings.backgroundImage, backgroundImagePath);
+      log('background image ready');
+    }
+
     const targetSectionSeconds = sectionTargetSeconds > 0 ? sectionTargetSeconds : DEFAULT_SECTION_TARGET_SECONDS;
     const sections = groupCuesIntoSections(adjustedCues, targetSectionSeconds, audioDuration);
     render.totalSections = sections.length;
@@ -922,7 +959,8 @@ async function continueSimpleStoryVideoAssembly({
           workDir,
           cuesForSection(adjustedCues, section),
           effectiveDuration,
-          editSettings
+          editSettings,
+          backgroundImagePath
         );
         const buffer = fs.readFileSync(outPath);
         const url = await videoStorage.storeSimpleStorySectionClip(buffer, jobId, sectionIndex);
