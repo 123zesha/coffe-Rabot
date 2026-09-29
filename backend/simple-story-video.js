@@ -489,10 +489,15 @@ function groupCuesIntoSections(cues, sectionTargetSeconds, totalDuration) {
   }));
 }
 
-// Greedily wraps `text` to at most maxCharsPerLine per line. If the result
-// still exceeds maxLines, the overflow is merged onto the last line rather
-// than dropped — real narration text is never truncated to fit a layout.
-function wrapText(text, maxCharsPerLine, maxLines) {
+// Greedily wraps `text` so that NO line exceeds maxCharsPerLine — real
+// narration text is never truncated, and (just as important) never allowed
+// to overflow past the frame's safe text width either: buildAssScript's ASS
+// header sets WrapStyle: 2, which tells libass to perform NO wrapping of
+// its own, so whatever lines this function returns are rendered exactly as
+// given. An unusually long cue may occasionally need more than the usual 2
+// lines (see fitCueText) rather than risk a too-wide line running off the
+// edge of the video.
+function wrapText(text, maxCharsPerLine) {
   const words = String(text).split(/\s+/).filter(Boolean);
   const lines = [];
   let current = '';
@@ -510,27 +515,23 @@ function wrapText(text, maxCharsPerLine, maxLines) {
     lines.push(current);
   }
 
-  if (lines.length > maxLines) {
-    const head = lines.slice(0, maxLines - 1);
-    const tail = lines.slice(maxLines - 1).join(' ');
-    return [...head, tail];
-  }
-
   return lines;
 }
 
-// Wraps one cue's text to at most 2 short lines at the given (fixed,
-// user-chosen — see TEXT_SIZE_PX) font size — "show only the currently
-// spoken sentence or one to two short lines" is implemented literally: the
-// size is never shrunk to cram in more lines (that would make on-screen
-// text visibly change size cue to cue, which is worse for a fixed reading
-// size than the occasional long cue running a bit wide). An unusually long
-// single cue still never loses text — wrapText merges any overflow onto the
-// 2nd line rather than dropping it, same honesty-over-truncation rule as
-// wrapText itself always had.
+// Wraps one cue's text at the given (fixed, user-chosen — see TEXT_SIZE_PX)
+// font size — "show only the currently spoken sentence or one to two short
+// lines" is implemented literally for the common case: the size is never
+// shrunk to cram in more lines (that would make on-screen text visibly
+// change size cue to cue, which is worse for a fixed reading size than the
+// occasional long cue running a couple of lines taller). Unlike an earlier
+// version of this function, an unusually long cue that needs MORE than 2
+// lines now genuinely gets 3+ real lines from wrapText, each still within
+// maxCharsPerLine — never one oversized line merged from the overflow, which
+// used to run past the frame's safe margins (WrapStyle: 2 means libass never
+// auto-wraps a too-long line for us). Text is still never lost or truncated.
 function fitCueText(text, fontSize) {
   const maxCharsPerLine = Math.floor((SIMPLE_STORY_WIDTH * 0.82) / (fontSize * 0.56));
-  return { lines: wrapText(text, maxCharsPerLine, 2) };
+  return { lines: wrapText(text, maxCharsPerLine) };
 }
 
 function secondsToAssTimestamp(seconds) {

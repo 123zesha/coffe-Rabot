@@ -318,30 +318,57 @@ async function main() {
     assert.strictEqual(sections[0].end, 9);
   });
 
-  await test('wrapText never drops real text, even when it must merge overflow onto the last line', () => {
+  await test('wrapText never drops real text, and never lets any line exceed the character budget (no more merging overflow into one oversized line)', () => {
     const longText = 'one two three four five six seven eight nine ten eleven twelve thirteen fourteen';
-    const lines = ssv.wrapText(longText, 20, 2);
-    assert.strictEqual(lines.length, 2);
+    const lines = ssv.wrapText(longText, 20);
+    assert.ok(lines.length > 2, `expected this long a text to need more than 2 real lines at budget 20, got ${lines.length}`);
+    for (const line of lines) {
+      assert.ok(line.length <= 20, `expected every line to stay within the 20-char budget, got "${line}" (${line.length} chars)`);
+    }
     const rejoined = lines.join(' ');
     for (const word of longText.split(' ')) {
       assert.ok(rejoined.includes(word), `expected "${word}" to survive wrapping`);
     }
   });
 
-  await test('wrapText respects the per-line character budget when it does not need to merge', () => {
-    const lines = ssv.wrapText('short story text here', 100, 3);
+  await test('wrapText respects the per-line character budget when it fits on one line', () => {
+    const lines = ssv.wrapText('short story text here', 100);
     assert.strictEqual(lines.length, 1, 'text well under the budget should not be wrapped at all');
   });
 
-  await test('fitCueText wraps a long cue to at most 2 lines at the given fixed font size, never truncating it', () => {
+  await test('fitCueText wraps a long cue to as many lines as needed, never letting any single line exceed the safe character budget, and never truncating it', () => {
     const longCue =
       'This is a much longer sentence than the others, written to force the layout to wrap across ' +
       'more than one line while still keeping every single word of the real narration.';
-    const { lines } = ssv.fitCueText(longCue, 70);
-    assert.ok(lines.length <= 2, `expected at most 2 lines, got ${lines.length}`);
+    const fontSize = 70;
+    const maxCharsPerLine = Math.floor((ssv.SIMPLE_STORY_WIDTH * 0.82) / (fontSize * 0.56));
+    const { lines } = ssv.fitCueText(longCue, fontSize);
+    for (const line of lines) {
+      assert.ok(
+        line.length <= maxCharsPerLine,
+        `expected every line to stay within the ${maxCharsPerLine}-char safe budget (never run off the frame — WrapStyle: 2 means libass won't wrap it for us), got "${line}" (${line.length} chars)`
+      );
+    }
     const rejoined = lines.join(' ');
     for (const word of longCue.split(' ')) {
       assert.ok(rejoined.includes(word.replace(/[.,]$/, '')), `expected "${word}" to survive fitCueText`);
+    }
+  });
+
+  await test('fitCueText reproduces the real reported overflow case: a long narration sentence at the default 70px size never produces an over-width line', () => {
+    // The exact shape of sentence a real user reported running past the
+    // frame's edges before this fix (a single long clause with no early
+    // natural break) — this is a regression test for that real bug, not
+    // just a synthetic one.
+    const realSentence = 'Before the sun was up, Mr. Anderson showed him how to mix flour, knead the dough, and shape the loaves just right.';
+    const fontSize = 70;
+    const maxCharsPerLine = Math.floor((ssv.SIMPLE_STORY_WIDTH * 0.82) / (fontSize * 0.56));
+    const { lines } = ssv.fitCueText(realSentence, fontSize);
+    for (const line of lines) {
+      assert.ok(
+        line.length <= maxCharsPerLine,
+        `this exact real-world sentence must never produce a line wider than the safe budget — got "${line}" (${line.length} chars, budget ${maxCharsPerLine})`
+      );
     }
   });
 
