@@ -1519,7 +1519,12 @@ const TOOLS = [
       'Record that the user has given explicit, unambiguous confirmation of the final video ' +
       'production summary. Only call this immediately after the user clearly confirms ' +
       '(e.g. "yes", "confirmed", "approved", "go ahead"). Never call this for ambiguous, ' +
-      'partial, or unclear replies.',
+      'partial, or unclear replies. For a simple-story job confirmed this way from plain chat ' +
+      '(the "Describe an Idea" one-shot flow — not a pasted script, not the chat-free Story-to-Video ' +
+      'form, both of which already run this way before confirmation) this ALSO turns on the same ' +
+      'automatic background pipeline the Chat-to-Video paste flow uses and always includes the ' +
+      'YouTube publishing package — see that flow\'s own section for exactly what to do (and not do) ' +
+      'next.',
     input_schema: {
       type: 'object',
       properties: {},
@@ -1958,6 +1963,24 @@ async function executeTool(name, jobId, input) {
   }
 
   if (name === 'confirmVideoJob') {
+    const currentJob = await jobStore.getJob(jobId);
+    if (!currentJob) {
+      return JSON.stringify({ error: 'job not found' });
+    }
+    // "Describe an Idea" (plain chat, no Paste Script toggle, and not the
+    // chat-free Story-to-Video REST flow) is the only case that can still
+    // reach here with chatToVideoAutoPipeline false for a simple-story job
+    // — Paste Script and Story-to-Video's own approve-and-start route both
+    // already set it true well before their own confirmation step, so this
+    // can never affect either of those. For that one remaining case, turn
+    // on the SAME resumable auto-pipeline Paste Script already uses, and
+    // always include the YouTube publishing package (titles/description/
+    // tags/thumbnail) as part of it — this flow's one, single confirmation
+    // is meant to cover everything through Final Review, never a separate
+    // ask for the package afterward.
+    if (!currentJob.chatToVideoAutoPipeline && currentJob.videoMode === 'simple-story') {
+      await jobStore.updateJob(jobId, { chatToVideoAutoPipeline: true, generateYoutubePackage: true });
+    }
     const job = await confirmJobForProduction(jobId);
     return JSON.stringify(job ? summarizeJobForAgent(job) : { error: 'job not found' });
   }

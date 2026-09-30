@@ -284,12 +284,13 @@ async function generateImagesForPrompts({ imagePrompts, characters, existingImag
 async function generateThumbnailImage({ thumbnailConcept, thumbnailText, jobId }) {
   const promptParts = [
     'Cinematic, eye-catching YouTube thumbnail image, bold composition, widescreen (16:9) framing, ' +
-      'high contrast, vibrant colors.',
+      'high contrast, vibrant colors. ONE clear focal subject/moment, simple uncluttered background — ' +
+      'never a collage of multiple scenes or unrelated imagery crammed into one frame.',
     `Concept: ${thumbnailConcept}`,
   ];
   if (thumbnailText) {
     promptParts.push(
-      `If including text, render exactly this short text prominently and legibly: "${thumbnailText}"`
+      `If including text, render exactly this short text prominently and legibly, and nothing more: "${thumbnailText}"`
     );
   }
   const prompt = promptParts.join('\n');
