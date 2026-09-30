@@ -125,9 +125,14 @@ async function generateYoutubeTextPackage({ topic, duration, language, storyStyl
     'describes THIS video only.\n' +
     '- tags: 8-15 relevant single/short-phrase keywords for this specific video.\n' +
     '- thumbnailConcept: a short description of an original 16:9 thumbnail image composition for this ' +
-    'video (subject, framing, mood, colors) — inspired only by this video\'s own content.\n' +
-    '- thumbnailText: a very short (2-5 word) text overlay suitable for the thumbnail, or an empty ' +
-    'string if none fits naturally.\n\n' +
+    'video — grounded in its ACTUAL content: the real topic, the story\'s main character (their real ' +
+    'described appearance, not a generic stand-in), and the single strongest/most visually compelling ' +
+    'scene from the script. Describe ONE clear, uncluttered focal image (one subject/moment, simple ' +
+    'background, no collage of multiple scenes crammed together) — never an unrelated stock-looking image ' +
+    'that could belong to any video.\n' +
+    '- thumbnailText: a very short (2-5 word), easily readable title-style text overlay that reinforces ' +
+    'the concept, or an empty string if the image alone is stronger without any text — never a caption ' +
+    'long enough to clutter the frame.\n\n' +
     'Everything must be entirely original to this specific video — never invent a connection to any ' +
     'other video, channel, or existing media.\n\n' +
     contextLines.join('\n');

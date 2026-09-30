@@ -233,6 +233,70 @@ async function main() {
     assert.ok(result.missingFields.includes('videoPrompts'));
   });
 
+  // --- confirmVideoJob and the "Describe an Idea" one-shot flow: a plain
+  // chat job (never pasted, never the chat-free Story-to-Video form) starts
+  // with chatToVideoAutoPipeline false — confirming it for a simple-story
+  // job is the ONE remaining case that should turn the full automatic
+  // pipeline (and the YouTube package) on, without affecting any job that
+  // already had it set some other way.
+
+  await test('confirmVideoJob turns on chatToVideoAutoPipeline and generateYoutubePackage for a plain-chat simple-story job ("Describe an Idea")', async () => {
+    const job = await jobStore.createJob();
+    await jobStore.updateJob(job.id, {
+      videoMode: 'simple-story',
+      script: LONG_ENOUGH_SCRIPT + ' '.repeat(200),
+    });
+    const before = await jobStore.getJob(job.id);
+    assert.strictEqual(before.chatToVideoAutoPipeline, false, 'a plain chat job never has this set yet');
+    assert.strictEqual(before.generateYoutubePackage, false);
+
+    const result = JSON.parse(await app.executeTool('confirmVideoJob', job.id, {}));
+    assert.strictEqual(result.error, undefined, JSON.stringify(result));
+
+    const persisted = await jobStore.getJob(job.id);
+    assert.strictEqual(persisted.confirmed, true);
+    assert.strictEqual(persisted.chatToVideoAutoPipeline, true, 'must now run the same automatic pipeline the paste flow uses');
+    assert.strictEqual(persisted.generateYoutubePackage, true, 'this flow always includes the YouTube package, never as a separate ask');
+    assert.ok(persisted.approvedCostEstimate, 'confirmVideoJob must still snapshot the approved estimate as usual');
+  });
+
+  await test('confirmVideoJob does NOT turn on chatToVideoAutoPipeline for a plain-chat CINEMATIC job (this one-shot flow is simple-story only)', async () => {
+    const job = await jobStore.createJob();
+    await jobStore.updateJob(job.id, {
+      videoMode: 'cinematic',
+      script: LONG_ENOUGH_SCRIPT + ' '.repeat(200),
+    });
+
+    const result = JSON.parse(await app.executeTool('confirmVideoJob', job.id, {}));
+    assert.strictEqual(result.error, undefined, JSON.stringify(result));
+
+    const persisted = await jobStore.getJob(job.id);
+    assert.strictEqual(persisted.confirmed, true, 'confirmation itself must still work exactly as before');
+    assert.strictEqual(persisted.chatToVideoAutoPipeline, false, "cinematic mode's own per-scene approval flow must be completely unaffected");
+    assert.strictEqual(persisted.generateYoutubePackage, false, 'never force the package on for a job this section does not apply to');
+  });
+
+  await test('confirmVideoJob leaves an already-auto-pipelined simple-story job (Paste Script / Story-to-Video) completely untouched', async () => {
+    const job = await jobStore.createJob();
+    await jobStore.updateJob(job.id, {
+      videoMode: 'simple-story',
+      script: LONG_ENOUGH_SCRIPT + ' '.repeat(200),
+      chatToVideoAutoPipeline: true,
+      generateYoutubePackage: false, // e.g. Story-to-Video's own default — must not be flipped on
+    });
+
+    const result = JSON.parse(await app.executeTool('confirmVideoJob', job.id, {}));
+    assert.strictEqual(result.error, undefined, JSON.stringify(result));
+
+    const persisted = await jobStore.getJob(job.id);
+    assert.strictEqual(persisted.chatToVideoAutoPipeline, true);
+    assert.strictEqual(
+      persisted.generateYoutubePackage,
+      false,
+      "a flow that already set chatToVideoAutoPipeline itself (Paste Script/Story-to-Video) must decide generateYoutubePackage on its own — this new logic must never touch it"
+    );
+  });
+
   await test('generateSceneImages tool refuses for a "simple-story" job with zero OpenAI calls', async () => {
     const job = await jobStore.createJob();
     await jobStore.updateJob(job.id, { videoMode: 'simple-story' });
