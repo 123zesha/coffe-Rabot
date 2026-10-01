@@ -32,6 +32,16 @@ const BACKGROUND_IMAGE_ESTIMATED_USD = 0.07;
 // One short Claude call producing titles/description/tags/thumbnail
 // concept from an already-finished script.
 const YOUTUBE_PACKAGE_TEXT_ESTIMATED_USD = 0.02;
+// "Upload & Compile" per-clip AI voice-over (see backend/clip-voiceover.js):
+// one short Claude vision call describing the clip's own frame, plus one
+// short TTS synthesis of the resulting narration line. The real narration
+// text doesn't exist yet at estimate time, so its length is assumed at
+// ASSUMED_CLIP_NARRATION_CHARACTERS — comfortably covers a natural, concise
+// one-to-two-sentence narration line, never a full script — and the TTS
+// portion reuses TTS_ESTIMATED_USD_PER_1K_CHARACTERS above so both stay
+// consistent with each other automatically.
+const CLIP_VISION_DESCRIPTION_ESTIMATED_USD = 0.01;
+const ASSUMED_CLIP_NARRATION_CHARACTERS = 150;
 
 function round4(value) {
   return Math.round(value * 10000) / 10000;
@@ -93,4 +103,25 @@ function estimateProductionCost({
   };
 }
 
-module.exports = { estimateProductionCost, estimateSpeechDurationSeconds };
+// Cost for generating AI voice-overs for `selectedClipCount` clips in the
+// "Upload & Compile" flow (see backend/clip-voiceover.js) — reducing real
+// spend to exactly the clips the user explicitly selects, never every
+// uploaded clip. Pure, deterministic, no network call, like
+// estimateProductionCost above.
+function estimateClipVoiceoverCost(selectedClipCount) {
+  const clipCount = Math.max(0, Math.round(Number(selectedClipCount) || 0));
+  const perClipUsd = round4(
+    CLIP_VISION_DESCRIPTION_ESTIMATED_USD + (ASSUMED_CLIP_NARRATION_CHARACTERS / 1000) * TTS_ESTIMATED_USD_PER_1K_CHARACTERS
+  );
+
+  return {
+    clipCount,
+    perClipUsd,
+    totalUsd: round4(perClipUsd * clipCount),
+    note:
+      'Estimate only — assumes a short, natural one-to-two-sentence narration line per clip; the actual ' +
+      'bill depends on the real generated narration length.',
+  };
+}
+
+module.exports = { estimateProductionCost, estimateSpeechDurationSeconds, estimateClipVoiceoverCost };

@@ -87,6 +87,29 @@
   const storyCancelReviewBtn = document.getElementById('story-cancel-review-btn');
   const storyCostStatus = document.getElementById('story-cost-status');
 
+  // --- Upload & Compile ---
+  const modeUploadBtn = document.getElementById('mode-upload-btn');
+  const uploadModePanel = document.getElementById('upload-mode-panel');
+  const uploadCompileForm = document.getElementById('upload-compile-form');
+  const uploadClipsInput = document.getElementById('upload-clips-input');
+  const uploadClipsStatus = document.getElementById('upload-clips-status');
+  const uploadClipsListPanel = document.getElementById('upload-clips-list-panel');
+  const uploadClipsList = document.getElementById('upload-clips-list');
+  const selectAllSilentBtn = document.getElementById('select-all-silent-btn');
+  const uploadClipVoiceSelect = document.getElementById('upload-clip-voice');
+  const uploadReviewCostBtn = document.getElementById('upload-review-cost-btn');
+  const uploadCostReview = document.getElementById('upload-cost-review');
+  const uploadCostClipCount = document.getElementById('upload-cost-clip-count');
+  const uploadCostTotal = document.getElementById('upload-cost-total');
+  const uploadCostWarning = document.getElementById('upload-cost-warning');
+  const uploadConfirmGenerateBtn = document.getElementById('upload-confirm-generate-btn');
+  const uploadCancelReviewBtn = document.getElementById('upload-cancel-review-btn');
+  const uploadCostStatus = document.getElementById('upload-cost-status');
+  const uploadMusicInput = document.getElementById('upload-music-input');
+  const uploadMusicStatus = document.getElementById('upload-music-status');
+  const uploadCompileFinalBtn = document.getElementById('upload-compile-final-btn');
+  const uploadCompileStatus = document.getElementById('upload-compile-status');
+
   const youtubeThumbnailPlaceholder = document.getElementById('youtube-thumbnail-placeholder');
   const youtubeThumbnailPanel = document.getElementById('youtube-thumbnail-panel');
   const youtubeThumbnailImage = document.getElementById('youtube-thumbnail-image');
@@ -642,17 +665,22 @@
   // resumable polling all work identically regardless of which flow
   // created the job.
 
-  function setStoryMode(showStory) {
-    modeIdeaBtn.classList.toggle('active', !showStory);
-    modeIdeaBtn.setAttribute('aria-selected', String(!showStory));
-    modeStoryBtn.classList.toggle('active', showStory);
-    modeStoryBtn.setAttribute('aria-selected', String(showStory));
-    ideaModePanel.hidden = showStory;
-    storyModePanel.hidden = !showStory;
+  // mode is one of 'idea' | 'story' | 'upload'.
+  function setCreateMode(mode) {
+    modeIdeaBtn.classList.toggle('active', mode === 'idea');
+    modeIdeaBtn.setAttribute('aria-selected', String(mode === 'idea'));
+    modeStoryBtn.classList.toggle('active', mode === 'story');
+    modeStoryBtn.setAttribute('aria-selected', String(mode === 'story'));
+    modeUploadBtn.classList.toggle('active', mode === 'upload');
+    modeUploadBtn.setAttribute('aria-selected', String(mode === 'upload'));
+    ideaModePanel.hidden = mode !== 'idea';
+    storyModePanel.hidden = mode !== 'story';
+    uploadModePanel.hidden = mode !== 'upload';
   }
 
-  modeIdeaBtn.addEventListener('click', () => setStoryMode(false));
-  modeStoryBtn.addEventListener('click', () => setStoryMode(true));
+  modeIdeaBtn.addEventListener('click', () => setCreateMode('idea'));
+  modeStoryBtn.addEventListener('click', () => setCreateMode('story'));
+  modeUploadBtn.addEventListener('click', () => setCreateMode('upload'));
 
   storyScriptInput.addEventListener('input', () => {
     const words = storyScriptInput.value.trim().split(/\s+/).filter(Boolean);
@@ -1025,6 +1053,278 @@
       setStoryCostStatus('Something went wrong starting production. Please try again.', 'error');
     } finally {
       storyApproveBtn.disabled = false;
+    }
+  });
+
+  // --- Upload & Compile ---
+  // A third, chat-free creation flow: the user uploads real scene clips they
+  // generated elsewhere (e.g. an external AI video tool) instead of the
+  // agent generating anything. The only production step here is an OPTIONAL,
+  // explicitly-selected per-clip AI voice-over (see server.js's
+  // POST /:id/upload-clip, POST /:id/select-clip-voiceovers, and
+  // POST /:id/generate-clip-voiceovers) — reducing real paid-API spend to
+  // exactly the clips the user checks, never every uploaded clip.
+
+  let uploadJobId = null;
+
+  function setUploadClipsStatus(text) {
+    uploadClipsStatus.textContent = text;
+  }
+
+  function setUploadCostStatus(text, type) {
+    uploadCostStatus.textContent = text;
+    uploadCostStatus.className = 'generate-status' + (type ? ' ' + type : '');
+    uploadCostStatus.hidden = false;
+  }
+
+  function formatClipDuration(seconds) {
+    if (typeof seconds !== 'number' || !Number.isFinite(seconds)) return '';
+    return `${seconds.toFixed(1)}s`;
+  }
+
+  function buildUploadClipListItem(clip) {
+    const li = document.createElement('li');
+    li.className = 'upload-clip-item';
+    li.dataset.clipId = clip.id;
+
+    const row = document.createElement('label');
+    row.className = 'checkbox-field';
+
+    const checkbox = document.createElement('input');
+    checkbox.type = 'checkbox';
+    checkbox.className = 'upload-clip-checkbox';
+    checkbox.checked = Boolean(clip.voiceoverSelected);
+    checkbox.dataset.hasAudio = String(Boolean(clip.hasAudio));
+    row.appendChild(checkbox);
+
+    const label = document.createElement('span');
+    const audioBadge = clip.hasAudio ? '🔊 has audio' : '🔇 silent';
+    label.textContent = `${clip.sourceFilename || 'clip'} — ${formatClipDuration(clip.durationSeconds)} — ${audioBadge}`;
+    row.appendChild(label);
+    li.appendChild(row);
+
+    if (clip.voiceoverStatus === 'processing') {
+      const status = document.createElement('p');
+      status.className = 'field-hint';
+      status.textContent = 'Generating voice-over…';
+      li.appendChild(status);
+    } else if (clip.voiceoverStatus === 'completed') {
+      const narration = document.createElement('p');
+      narration.className = 'field-hint';
+      narration.textContent = `Narration: "${clip.narrationText || ''}"`;
+      li.appendChild(narration);
+
+      if (clip.processedUrl) {
+        const video = document.createElement('video');
+        video.src = clip.processedUrl;
+        video.controls = true;
+        video.className = 'upload-clip-preview';
+        li.appendChild(video);
+      }
+    } else if (clip.voiceoverStatus === 'failed') {
+      const status = document.createElement('p');
+      status.className = 'field-hint';
+      status.textContent = `Voice-over failed: ${clip.voiceoverError || 'unknown error'}`;
+      li.appendChild(status);
+    }
+
+    return li;
+  }
+
+  function renderUploadClipsList(job) {
+    const clips = job && Array.isArray(job.uploadedClips) ? job.uploadedClips : [];
+    uploadClipsList.innerHTML = '';
+    uploadClipsListPanel.hidden = clips.length === 0;
+    clips.forEach((clip) => uploadClipsList.appendChild(buildUploadClipListItem(clip)));
+  }
+
+  uploadClipsInput.addEventListener('change', async () => {
+    const files = Array.from(uploadClipsInput.files || []);
+    if (files.length === 0) return;
+
+    uploadCompileForm.querySelector('input[type="file"]').disabled = true;
+
+    try {
+      if (!uploadJobId) {
+        const createRes = await fetch('/api/jobs/upload-compile', { method: 'POST' });
+        const createBody = await createRes.json();
+        if (!createRes.ok) {
+          setUploadClipsStatus(createBody.error || 'Could not start this Upload & Compile job.');
+          return;
+        }
+        uploadJobId = createBody.job.id;
+      }
+
+      let latestJob = null;
+      for (let i = 0; i < files.length; i++) {
+        const file = files[i];
+        setUploadClipsStatus(`Uploading ${file.name}… (${i + 1} of ${files.length})`);
+        const params = new URLSearchParams({ filename: file.name });
+        const res = await fetch(`/api/jobs/${uploadJobId}/upload-clip?${params.toString()}`, {
+          method: 'POST',
+          headers: { 'Content-Type': file.type || 'video/mp4' },
+          body: file,
+        });
+        const body = await res.json();
+        if (!res.ok) {
+          setUploadClipsStatus(body.error || `Could not upload ${file.name}.`);
+          return;
+        }
+        latestJob = body.job;
+      }
+
+      setUploadClipsStatus(`Uploaded ${files.length} clip${files.length === 1 ? '' : 's'}.`);
+      renderUploadClipsList(latestJob);
+    } catch (error) {
+      setUploadClipsStatus('Something went wrong uploading those clips. Please try again.');
+    } finally {
+      uploadCompileForm.querySelector('input[type="file"]').disabled = false;
+      uploadClipsInput.value = '';
+    }
+  });
+
+  selectAllSilentBtn.addEventListener('click', () => {
+    uploadClipsList.querySelectorAll('.upload-clip-checkbox').forEach((checkbox) => {
+      if (checkbox.dataset.hasAudio === 'false') {
+        checkbox.checked = true;
+      }
+    });
+  });
+
+  uploadReviewCostBtn.addEventListener('click', async () => {
+    if (!uploadJobId) return;
+    const selectedClipIds = Array.from(uploadClipsList.querySelectorAll('.upload-clip-checkbox'))
+      .filter((checkbox) => checkbox.checked)
+      .map((checkbox) => checkbox.closest('.upload-clip-item').dataset.clipId);
+
+    if (selectedClipIds.length === 0) {
+      uploadCostReview.hidden = false;
+      setUploadCostStatus('Select at least one clip to generate a voice-over for.', 'error');
+      return;
+    }
+
+    uploadReviewCostBtn.disabled = true;
+    try {
+      const res = await fetch(`/api/jobs/${uploadJobId}/select-clip-voiceovers`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ selectedClipIds, voiceStyle: uploadClipVoiceSelect.value }),
+      });
+      const body = await res.json();
+      if (!res.ok) {
+        uploadCostReview.hidden = false;
+        setUploadCostStatus(body.error || 'Could not prepare a cost estimate.', 'error');
+        return;
+      }
+
+      uploadCostClipCount.textContent = `${body.costEstimate.clipCount} clip${body.costEstimate.clipCount === 1 ? '' : 's'} selected`;
+      uploadCostTotal.textContent = `Estimated total: $${body.costEstimate.totalUsd.toFixed(4)}`;
+      if (body.clipsWithExistingAudioSelected && body.clipsWithExistingAudioSelected.length > 0) {
+        uploadCostWarning.hidden = false;
+        uploadCostWarning.textContent =
+          `${body.clipsWithExistingAudioSelected.length} selected clip(s) already have their own audio — generating ` +
+          'will REPLACE that audio with the new AI voice-over, never mix both together.';
+      } else {
+        uploadCostWarning.hidden = true;
+      }
+      uploadCostStatus.hidden = true;
+      uploadCostReview.hidden = false;
+      uploadClipsListPanel.hidden = true;
+    } catch (error) {
+      uploadCostReview.hidden = false;
+      setUploadCostStatus('Something went wrong preparing this estimate. Please try again.', 'error');
+    } finally {
+      uploadReviewCostBtn.disabled = false;
+    }
+  });
+
+  uploadCancelReviewBtn.addEventListener('click', () => {
+    uploadCostReview.hidden = true;
+    uploadClipsListPanel.hidden = false;
+  });
+
+  uploadConfirmGenerateBtn.addEventListener('click', async () => {
+    if (!uploadJobId) return;
+    uploadConfirmGenerateBtn.disabled = true;
+    setUploadCostStatus('Generating voice-overs for your selected clips…', 'loading');
+
+    try {
+      const res = await fetch(`/api/jobs/${uploadJobId}/generate-clip-voiceovers`, { method: 'POST' });
+      const body = await res.json();
+      if (!res.ok) {
+        setUploadCostStatus(body.error || 'Could not generate these voice-overs.', 'error');
+        return;
+      }
+
+      setUploadCostStatus('Done — see each clip\'s result below.', 'success');
+      uploadCostReview.hidden = true;
+      renderUploadClipsList(body.job);
+    } catch (error) {
+      setUploadCostStatus('Something went wrong generating these voice-overs. Please try again.', 'error');
+    } finally {
+      uploadConfirmGenerateBtn.disabled = false;
+    }
+  });
+
+  uploadMusicInput.addEventListener('change', async () => {
+    const file = uploadMusicInput.files && uploadMusicInput.files[0];
+    if (!file || !uploadJobId) return;
+
+    uploadMusicStatus.textContent = `Uploading ${file.name}…`;
+    try {
+      const res = await fetch(`/api/jobs/${uploadJobId}/upload-music`, {
+        method: 'POST',
+        headers: { 'Content-Type': file.type || 'audio/mpeg' },
+        body: file,
+      });
+      const body = await res.json();
+      if (!res.ok) {
+        uploadMusicStatus.textContent = body.error || `Could not upload ${file.name}.`;
+        return;
+      }
+      uploadMusicStatus.textContent = `Background music set: ${file.name}`;
+    } catch (error) {
+      uploadMusicStatus.textContent = 'Something went wrong uploading that music file. Please try again.';
+    }
+  });
+
+  // Stitches every uploaded clip (not just the ones with an AI voice-over)
+  // into one final video, in upload order — see server.js's shared
+  // POST /:id/assemble-video route, now covering 'uploaded-clips' mode.
+  // Reuses the SAME job/Final Review machinery every other flow already
+  // uses, so the compiled video shows up there with no separate UI needed.
+  uploadCompileFinalBtn.addEventListener('click', async () => {
+    if (!uploadJobId) {
+      uploadCompileStatus.hidden = false;
+      uploadCompileStatus.className = 'generate-status error';
+      uploadCompileStatus.textContent = 'Upload at least one clip first.';
+      return;
+    }
+
+    uploadCompileFinalBtn.disabled = true;
+    uploadCompileStatus.hidden = false;
+    uploadCompileStatus.className = 'generate-status loading';
+    uploadCompileStatus.textContent = 'Compiling your final video…';
+
+    try {
+      const res = await fetch(`/api/jobs/${uploadJobId}/assemble-video`, { method: 'POST' });
+      const body = await res.json();
+      if (!res.ok) {
+        uploadCompileStatus.className = 'generate-status error';
+        uploadCompileStatus.textContent = body.error || 'Could not compile the final video.';
+        return;
+      }
+
+      jobId = uploadJobId;
+      storeJobId(jobId);
+      uploadCompileStatus.className = 'generate-status success';
+      uploadCompileStatus.textContent = 'Done — see the Final Review tab below.';
+      renderAllCards(body);
+    } catch (error) {
+      uploadCompileStatus.className = 'generate-status error';
+      uploadCompileStatus.textContent = 'Something went wrong compiling the final video. Please try again.';
+    } finally {
+      uploadCompileFinalBtn.disabled = false;
     }
   });
 
