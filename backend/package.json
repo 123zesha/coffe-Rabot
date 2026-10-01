@@ -38,7 +38,8 @@
     "test:chat-to-video": "node test-chat-to-video.js",
     "test:chat-to-video-pipeline": "node test-chat-to-video-pipeline.js",
     "test:cost-estimation": "node test-cost-estimation.js",
-    "test:story-to-video": "node test-story-to-video.js"
+    "test:story-to-video": "node test-story-to-video.js",
+    "test:upload-compile": "node test-upload-compile.js"
   },
   "keywords": [],
   "author": "",

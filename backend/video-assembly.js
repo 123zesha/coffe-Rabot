@@ -666,6 +666,170 @@ async function assembleFinalVideo({ clips, voiceover, burnInSubtitlesContent, ou
   }
 }
 
+// Assembles "Upload & Compile" mode's real, user-uploaded scene clips (see
+// job-store.js's VIDEO_MODES 'uploaded-clips' and its uploadedClips field)
+// into one final MP4, in the exact order they were uploaded — this mode has
+// no separate reordering step, so upload order IS the selected order.
+//
+// Unlike assembleFinalVideo above, there is no single whole-job voice-over
+// track here: EVERY clip keeps its own audio exactly as the user selected —
+// a clip with a completed processedUrl (see backend/clip-voiceover.js) uses
+// that real AI-narrated copy; any other clip uses its own ORIGINAL audio
+// untouched (real dialogue/sound it already had, or genuine silence if it
+// had none) — never a fabricated or borrowed track. This is why every
+// normalized segment below is given its own real or silent audio stream
+// (via ffmpeg's aevalsrc source filter for a clip with no audio stream at
+// all) before concatenation: ffmpeg's concat filter requires every joined
+// segment to carry the same stream layout (here, exactly one video + one
+// audio stream each), so a genuinely silent clip still needs a real,
+// locally-generated silent audio stream of its own exact duration to
+// concatenate cleanly — this never adds narration or borrows another
+// clip's audio, only true digital silence.
+//
+// musicUrl: optional, resolved by the caller (backend/music-library.js) —
+// same shapes/behavior as assembleFinalVideo's own musicUrl, ducked under
+// the COMBINED per-clip audio (whatever mix of narration/original audio/
+// silence each clip actually carries) via the same sidechaincompress-based
+// duckAndMixMusicWithVoiceover this module already uses for every other
+// mode, so there is exactly one real ducking implementation in this app.
+//
+// Returns { status: 'completed', buffer, error: null } or
+// { status: 'failed', buffer: null, error } — same contract as
+// assembleFinalVideo. Never fabricates a buffer.
+async function assembleUploadedClipsVideo({ uploadedClips, musicUrl, resolutionTier }) {
+  if (!Array.isArray(uploadedClips) || uploadedClips.length === 0) {
+    return { buffer: null, status: 'failed', error: 'No uploaded clips were provided to assemble.' };
+  }
+
+  const [outputWidth, outputHeight] = resolveOutputDimensions(DEFAULT_OUTPUT_FORMAT, resolutionTier);
+  const workDir = fs.mkdtempSync(path.join(os.tmpdir(), 'upload-compile-assembly-'));
+
+  try {
+    const clipPaths = [];
+    const clipDurations = [];
+    const clipHasAudio = [];
+
+    for (let i = 0; i < uploadedClips.length; i++) {
+      const clip = uploadedClips[i];
+      // A clip with a completed AI voice-over uses that narrated copy
+      // (video + the new narration audio, already muxed in by
+      // backend/clip-voiceover.js); every other clip uses its own original
+      // upload, untouched — its own audio (if any) stays exactly as
+      // uploaded.
+      const sourceUrl = clip.processedUrl || clip.url;
+      const clipPath = path.join(workDir, `clip-${i}.mp4`);
+      await fetchToFile(sourceUrl, clipPath);
+      clipPaths.push(clipPath);
+      clipDurations.push(await getMediaDuration(clipPath));
+      const { hasAudioStream } = await probeStreamTypes(clipPath);
+      clipHasAudio.push(hasAudioStream);
+    }
+
+    let musicSourcePath = null;
+    if (musicUrl) {
+      musicSourcePath = path.join(workDir, 'music-input');
+      await fetchToFile(musicUrl, musicSourcePath);
+    }
+
+    const inputArgs = clipPaths.flatMap((clipPath) => ['-i', clipPath]);
+
+    const videoFilters = clipPaths.map(
+      (_, i) =>
+        `[${i}:v]scale=${outputWidth}:${outputHeight}:force_original_aspect_ratio=decrease:flags=lanczos,` +
+        `pad=${outputWidth}:${outputHeight}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=${OUTPUT_FPS}[v${i}]`
+    );
+    // Every clip must contribute exactly one audio stream for concat's
+    // a=1 below to work, even a clip with none of its own — real silence
+    // of that EXACT clip's own duration (aevalsrc, a local ffmpeg source
+    // filter — no extra input file needed), mono at 44.1kHz to match every
+    // real audio stream's own format below, so concat never fails on a
+    // layout mismatch between a real track and a generated silent one.
+    const audioFilters = clipPaths.map((_, i) =>
+      clipHasAudio[i]
+        ? `[${i}:a]aformat=sample_rates=44100:channel_layouts=mono[a${i}]`
+        : `aevalsrc=0:d=${clipDurations[i].toFixed(3)}:s=44100[a${i}]`
+    );
+
+    const concatRefs = clipPaths.map((_, i) => `[v${i}][a${i}]`).join('');
+    const filterComplex =
+      `${videoFilters.join(';')};${audioFilters.join(';')};` +
+      `${concatRefs}concat=n=${clipPaths.length}:v=1:a=1[outv][outa]`;
+
+    const concatenatedPath = path.join(workDir, 'concatenated.mp4');
+    await runFfmpeg([
+      '-y',
+      ...inputArgs,
+      '-filter_complex',
+      filterComplex,
+      '-map',
+      '[outv]',
+      '-map',
+      '[outa]',
+      '-c:v',
+      'libx264',
+      '-pix_fmt',
+      'yuv420p',
+      '-c:a',
+      'aac',
+      concatenatedPath,
+    ]);
+
+    let finalPath = concatenatedPath;
+
+    if (musicSourcePath) {
+      const totalDuration = await getMediaDuration(concatenatedPath);
+
+      const combinedAudioPath = path.join(workDir, 'combined-audio.m4a');
+      await runFfmpeg(['-y', '-i', concatenatedPath, '-vn', '-c:a', 'aac', combinedAudioPath]);
+
+      const preparedMusicPath = path.join(workDir, 'music-prepared.m4a');
+      await prepareMusicTrack(musicSourcePath, totalDuration, MUSIC_VOLUME_WITH_VOICEOVER, preparedMusicPath);
+
+      const mixedAudioPath = path.join(workDir, 'audio-mixed.m4a');
+      await duckAndMixMusicWithVoiceover(preparedMusicPath, combinedAudioPath, mixedAudioPath);
+
+      finalPath = path.join(workDir, 'final.mp4');
+      await runFfmpeg([
+        '-y',
+        '-i',
+        concatenatedPath,
+        '-i',
+        mixedAudioPath,
+        '-map',
+        '0:v',
+        '-map',
+        '1:a',
+        '-c:v',
+        'copy',
+        '-c:a',
+        'aac',
+        '-shortest',
+        finalPath,
+      ]);
+    }
+
+    const buffer = fs.readFileSync(finalPath);
+    if (buffer.length === 0) {
+      throw new Error('ffmpeg produced an empty output file.');
+    }
+
+    const verification = await verifyAssembledVideoBuffer(buffer, { expectAudioStream: true });
+    if (!verification.ok) {
+      const message = `Assembly finished but failed verification: ${verification.reason}`;
+      console.error('Upload & Compile final video assembly error:', JSON.stringify({ message }, null, 2));
+      return { buffer: null, status: 'failed', error: message };
+    }
+
+    return { buffer, status: 'completed', error: null };
+  } catch (error) {
+    const message = (error && error.message) || 'Unknown error assembling the final video.';
+    console.error('Upload & Compile final video assembly error:', JSON.stringify({ message }, null, 2));
+    return { buffer: null, status: 'failed', error: message };
+  } finally {
+    fs.rmSync(workDir, { recursive: true, force: true });
+  }
+}
+
 // Extracts one real frame from an ALREADY-assembled final video as a PNG —
 // the only thumbnail source a 'simple-story' job is allowed to use (see
 // server.js's runGenerateYoutubePackage): that mode never calls Runway or
@@ -719,6 +883,7 @@ async function getUrlMediaDurationSeconds(url) {
 
 module.exports = {
   assembleFinalVideo,
+  assembleUploadedClipsVideo,
   getMediaDuration,
   getUrlMediaDurationSeconds,
   verifyAssembledVideoBuffer,
@@ -734,6 +899,12 @@ module.exports = {
   concatenateAudioBuffers,
   fetchToFile,
   ffmpegPath,
+  // Exported so backend/clip-voiceover.js's "Upload & Compile" pipeline can
+  // detect whether an uploaded clip already has its own audio stream, using
+  // the exact same real ffmpeg-decode-log check this module's own
+  // verifyAssembledVideoBuffer already relies on — never a second,
+  // possibly-inconsistent implementation of the same probe.
+  probeStreamTypes,
   OUTPUT_DIMENSIONS_BY_FORMAT,
   OUTPUT_DIMENSIONS_BY_FORMAT_AND_TIER,
 };

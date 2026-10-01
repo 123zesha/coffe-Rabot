@@ -156,6 +156,28 @@ async function storeImageFile(buffer, jobId, options) {
   return storeMediaFile(buffer, `image-${jobId}`, { ...options, extension: 'png', contentType: 'image/png' });
 }
 
+// Stores a real, user-UPLOADED scene clip's bytes for the "Upload & Compile"
+// flow (see server.js's POST /:id/upload-clip) — the same "extension/
+// contentType passed through, not hardcoded" reasoning as
+// storeUploadedVoiceoverFile/storeUploadedMusicFile above, since the real
+// uploaded video's container format varies (mp4/mov/webm). This is the
+// job's permanent reference to the clip exactly as the user uploaded it —
+// see job-store.js's uploadedClips[].url comment for why this is never
+// overwritten once a voice-over is later generated for the clip.
+async function storeUploadedClipFile(buffer, jobId, clipId, { extension, contentType }) {
+  return storeMediaFile(buffer, `uploaded-clip-${jobId}-${clipId}`, { extension, contentType });
+}
+
+// Stores one "Upload & Compile" clip's real bytes AFTER its own AI
+// voice-over has been muxed in (see backend/clip-voiceover.js) — always a
+// real .mp4/AAC output regardless of the original upload's own container
+// format, same reasoning as storeFinalVideo/storeSceneClip above.
+// uploadedClips[].processedUrl points here; uploadedClips[].url (the
+// original upload) is never touched.
+async function storeProcessedClipFile(buffer, jobId, clipId, options) {
+  return storeMediaFile(buffer, `processed-clip-${jobId}-${clipId}`, options);
+}
+
 module.exports = {
   storeFinalVideo,
   storeSceneClip,
@@ -164,6 +186,8 @@ module.exports = {
   storeUploadedVoiceoverFile,
   storeUploadedMusicFile,
   storeUploadedBackgroundImageFile,
+  storeUploadedClipFile,
+  storeProcessedClipFile,
   storeImageFile,
   hasBlobToken,
   GENERATED_DIR,

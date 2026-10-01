@@ -114,6 +114,9 @@ const JOB_FIELDS = [
   'approvedCostEstimate',
   'budgetGuard',
   'voiceSource',
+  'uploadedClips',
+  'clipVoiceoverVoice',
+  'clipVoiceoverBatch',
 ];
 
 // The only real, supported output-format values — 'horizontal' (16:9),
@@ -154,7 +157,14 @@ const DEFAULT_RESOLUTION_TIER = '720p';
 // that refuses generateSceneImages/generateSceneVideo (Runway/OpenAI image
 // calls) outright on a 'simple-story' job — never just relying on prompt
 // discipline for a "no paid Runway calls in this mode" guarantee.
-const VIDEO_MODES = ['cinematic', 'simple-story'];
+// 'uploaded-clips' is the "Upload & Compile" flow: the user generates scene
+// clips elsewhere (e.g. an external AI video tool) and uploads the real
+// files here (see server.js's POST /:id/upload-clip) instead of the agent
+// generating anything itself. No Runway/OpenAI image or video call is ever
+// made for this mode; the only optional paid step is per-clip AI voice-over
+// (see backend/clip-voiceover.js), and only for clips the user explicitly
+// selects — see uploadedClips/clipVoiceoverVoice/clipVoiceoverBatch below.
+const VIDEO_MODES = ['cinematic', 'simple-story', 'uploaded-clips'];
 const DEFAULT_VIDEO_MODE = 'cinematic';
 
 // Local (no-Redis) fallback only, from here down to saveJobs — the whole
@@ -688,6 +698,56 @@ function createDefaultJob(id) {
     // voice-over cost for this job no matter what. Backend-only, like
     // chatToVideoAutoPipeline above.
     voiceSource: 'ai',
+    // 'uploaded-clips' mode only (see VIDEO_MODES above): the real clips the
+    // user uploaded, in upload order — { id, url, sourceFilename,
+    // contentType, durationSeconds, hasAudio, voiceoverSelected,
+    // voiceoverStatus, voiceoverUrl, processedUrl, narrationText,
+    // voiceoverError }. Not writable by the conversational agent or the
+    // generic updateVideoJob field-setter — only the real upload route
+    // (POST /:id/upload-clip) appends an entry, and only the real
+    // per-clip generation route (POST /:id/generate-clip-voiceovers)
+    // changes an existing entry's voiceover*/processedUrl/narrationText
+    // fields.
+    // - hasAudio: real, measured (ffmpeg probeStreamTypes) at upload time —
+    //   whether the file already has an audio stream. Drives the "select
+    //   all silent clips" quick action and a client-side warning when a
+    //   clip WITH audio is selected anyway.
+    // - voiceoverSelected: the user's own explicit checkbox choice (see
+    //   POST /:id/select-clip-voiceovers) — false by default, so a clip's
+    //   own existing audio is left completely untouched unless the user
+    //   explicitly opts it in, even if it has no audio of its own.
+    // - voiceoverStatus: 'idle' | 'pending' | 'processing' | 'completed' |
+    //   'failed'. 'idle' means this clip was never selected/generated for.
+    // - voiceoverUrl: the generated narration audio alone, once completed.
+    // - processedUrl: this clip's own video muxed with voiceoverUrl (its
+    //   original audio, if any, fully REPLACED — never layered under a
+    //   second spoken track), once completed. `url` above is never
+    //   overwritten, so the original upload stays available even after a
+    //   voice-over is generated (or regenerated) for it.
+    uploadedClips: [],
+    // 'uploaded-clips' mode only: the ONE AI voice (see
+    // data/video-options.json -> voiceOverOptions) applied to every clip
+    // whose voice-over is generated in a batch — chosen once per batch (see
+    // POST /:id/select-clip-voiceovers), never per clip. Kept separate from
+    // voiceStyle (the other video modes' own single-narration-track voice)
+    // so switching modes never clobbers either.
+    clipVoiceoverVoice: '',
+    // 'uploaded-clips' mode only: durable state for the "select clips -> see
+    // cost -> confirm -> generate" flow. selectedClipIds/costEstimate are a
+    // SNAPSHOT of exactly what the user reviewed and approved — POST
+    // /:id/generate-clip-voiceovers only ever acts on this stored snapshot,
+    // never on a freshly-passed selection, so a stale confirmation can never
+    // cover a different, later-changed set of clips. status: 'idle' |
+    // 'processing' | 'completed' | 'failed' ('completed' only once every
+    // selected clip's own voiceoverStatus is 'completed'; 'failed' if at
+    // least one isn't — see server.js's generate-clip-voiceovers handler).
+    clipVoiceoverBatch: {
+      selectedClipIds: [],
+      costEstimate: null,
+      confirmed: false,
+      status: 'idle',
+      error: null,
+    },
   };
 }
 

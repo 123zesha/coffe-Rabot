@@ -1,6 +1,7 @@
 const path = require('path');
 const fs = require('fs');
 const os = require('os');
+const crypto = require('crypto');
 require('dotenv').config({ path: path.resolve(__dirname, '..', '.env'), quiet: true });
 
 const express = require('express');
@@ -17,6 +18,7 @@ const subtitlesGeneration = require('./subtitles-generation');
 const musicLibrary = require('./music-library');
 const simpleStoryVideo = require('./simple-story-video');
 const costEstimation = require('./cost-estimation');
+const clipVoiceover = require('./clip-voiceover');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -146,6 +148,25 @@ function findFinalVideoBlocker(job) {
         'Real subtitles are required for Simple Story Video mode — they drive the synchronized ' +
         'on-screen story text, not just captions. Use generateSubtitles first.'
       );
+    }
+    return null;
+  }
+
+  // "Upload & Compile" mode: no scenes/clips, no script, no voice-over of
+  // its own — just the user's own uploaded clips (job.uploadedClips), each
+  // keeping whatever audio it already has unless an explicit per-clip AI
+  // voice-over was generated for it (see backend/clip-voiceover.js). A clip
+  // whose voice-over is still mid-generation ('processing') is never
+  // assembled from mid-flight — wait for it to finish (or fail) first,
+  // exactly like findScenePromptMismatch blocks an in-progress scene.
+  if (job.videoMode === 'uploaded-clips') {
+    const uploadedClips = Array.isArray(job.uploadedClips) ? job.uploadedClips : [];
+    if (uploadedClips.length === 0) {
+      return 'No clips have been uploaded yet. Upload at least one scene clip before assembling the final video.';
+    }
+    const processingIndex = uploadedClips.findIndex((clip) => clip.voiceoverStatus === 'processing');
+    if (processingIndex !== -1) {
+      return `Clip ${processingIndex + 1}'s voice-over is still being generated — wait for it to finish before assembling.`;
     }
     return null;
   }
@@ -371,6 +392,89 @@ async function assembleAndStoreFinalVideo(
     }
   }
 
+  if (desiredVideoModeUsed === 'uploaded-clips') {
+    let musicUrl;
+    try {
+      musicUrl = musicLibrary.resolveJobMusicUrl(job);
+    } catch (error) {
+      return {
+        finalVideo: {
+          url: null,
+          status: 'failed',
+          subtitlesUsed: null,
+          musicUsed: null,
+          resolutionUsed: null,
+          videoModeUsed: null,
+          editSettingsUsed: null,
+          error: error.message,
+        },
+        simpleStoryRender: job.simpleStoryRender,
+      };
+    }
+
+    const assembly = await videoAssembly.assembleUploadedClipsVideo({
+      uploadedClips: job.uploadedClips,
+      musicUrl,
+      resolutionTier: job.resolutionTier,
+    });
+
+    if (assembly.status !== 'completed') {
+      return {
+        finalVideo: {
+          url: null,
+          status: 'failed',
+          subtitlesUsed: null,
+          musicUsed: null,
+          resolutionUsed: null,
+          videoModeUsed: null,
+          editSettingsUsed: null,
+          error: assembly.error || 'Upload & Compile final video assembly failed.',
+        },
+        simpleStoryRender: job.simpleStoryRender,
+      };
+    }
+
+    try {
+      const url = await videoStorage.storeFinalVideo(assembly.buffer, jobId);
+      return {
+        finalVideo: {
+          url,
+          status: 'completed',
+          subtitlesUsed: null,
+          musicUsed: desiredMusicUsed,
+          resolutionUsed: desiredResolutionUsed,
+          videoModeUsed: desiredVideoModeUsed,
+          // Reuses the generic editSettingsUsed slot (same "was this
+          // reassembled since a real change" staleness role Simple Story
+          // Video mode gives it) to snapshot exactly which clips/processed
+          // results this assembly reflects — see
+          // computeDesiredUploadedClipsSnapshot below.
+          editSettingsUsed: computeDesiredUploadedClipsSnapshot(job),
+          error: null,
+        },
+        simpleStoryRender: job.simpleStoryRender,
+      };
+    } catch (error) {
+      console.error(
+        'Upload & Compile final video storage error:',
+        JSON.stringify({ name: error?.name, message: error?.message }, null, 2)
+      );
+      return {
+        finalVideo: {
+          url: null,
+          status: 'failed',
+          subtitlesUsed: null,
+          musicUsed: null,
+          resolutionUsed: null,
+          videoModeUsed: null,
+          editSettingsUsed: null,
+          error: `The final video was assembled but could not be stored: ${error.message}`,
+        },
+        simpleStoryRender: job.simpleStoryRender,
+      };
+    }
+  }
+
   const originalClips = job.videoGeneration.clips;
   const healedClips = [];
   for (let i = 0; i < originalClips.length; i++) {
@@ -505,6 +609,20 @@ function computeDesiredResolutionUsed(job) {
   return job.resolutionTier || jobStore.DEFAULT_RESOLUTION_TIER;
 }
 
+// "Upload & Compile" mode only: a plain snapshot of exactly which clips (in
+// order), and which of each clip's own real/processed results, THIS
+// assembly reflects — used the same "was this reassembled since a real
+// change" staleness role as computeDesiredMusicUsed, stored in the generic
+// finalVideo.editSettingsUsed slot (see assembleAndStoreFinalVideo above)
+// and compared via JSON.stringify in isFinalVideoStillAccurate below. A
+// clip added/removed, or a clip's own voiceoverStatus/processedUrl changing
+// (a voice-over finishing, or being regenerated), must force a real
+// reassembly — nothing here is ever inferred from timestamps alone.
+function computeDesiredUploadedClipsSnapshot(job) {
+  const uploadedClips = Array.isArray(job.uploadedClips) ? job.uploadedClips : [];
+  return uploadedClips.map((clip) => ({ id: clip.id, url: clip.url, processedUrl: clip.processedUrl || null }));
+}
+
 // The videoMode THIS job's settings would produce if assembled right now —
 // job.videoMode itself (defaults to 'cinematic'), same role as
 // computeDesiredResolutionUsed for finalVideo.videoModeUsed.
@@ -552,6 +670,18 @@ function isFinalVideoStillAccurate(job) {
     // change does, even though nothing else here changed.
     const desiredEditSettings = simpleStoryVideo.normalizeVideoEditSettings(job.videoEditSettings);
     return JSON.stringify(job.finalVideo.editSettingsUsed || null) === JSON.stringify(desiredEditSettings);
+  }
+
+  if (desiredVideoModeUsed === 'uploaded-clips') {
+    // No subtitles/resolutionTier concept for this mode — only music and the
+    // clips snapshot (which clip/processed-result combination, in order)
+    // can make an existing assembly stale.
+    const desiredMusicUsed = computeDesiredMusicUsed(job);
+    if (JSON.stringify(job.finalVideo.musicUsed || null) !== JSON.stringify(desiredMusicUsed)) {
+      return false;
+    }
+    const desiredClipsSnapshot = computeDesiredUploadedClipsSnapshot(job);
+    return JSON.stringify(job.finalVideo.editSettingsUsed || null) === JSON.stringify(desiredClipsSnapshot);
   }
 
   const desiredSubtitlesContent =
@@ -2908,6 +3038,23 @@ const IMAGE_UPLOAD_CONTENT_TYPES = {
   'image/webp': 'webp',
 };
 
+// "Upload & Compile" (POST /:id/upload-clip further down) accepts a real
+// scene-clip video file as a raw request body, the same "raw body, not
+// base64/JSON" reasoning as AUDIO_UPLOAD_CONTENT_TYPES/
+// IMAGE_UPLOAD_CONTENT_TYPES above. NOTE: this proxies the whole file
+// through this one Express route in a single request, exactly like
+// upload-music/upload-background-image already do — on a serverless
+// deployment (Vercel) with a low platform request-body ceiling, a real,
+// large clip may need a smaller limit here (or a direct-to-storage upload
+// path) than this generous local-dev-oriented ceiling allows; this has not
+// been verified against Vercel's current limit.
+const VIDEO_UPLOAD_MAX_BYTES = 200 * 1024 * 1024; // comfortably covers a real, several-minute 1080p scene clip
+const VIDEO_UPLOAD_CONTENT_TYPES = {
+  'video/mp4': 'mp4',
+  'video/quicktime': 'mov',
+  'video/webm': 'webm',
+};
+
 function formatSecondsAsDuration(seconds) {
   const totalSeconds = Math.max(0, Math.round(seconds));
   const minutes = Math.floor(totalSeconds / 60);
@@ -3252,6 +3399,265 @@ app.post('/api/jobs/:id/generate-background-image', async (req, res) => {
     generateBackgroundImage: updatedJob.generateBackgroundImage,
   });
   res.json({ job: updatedJob, costEstimate });
+});
+
+// --- "Upload & Compile" -----------------------------------------------
+// The user uploads real scene clips generated elsewhere (e.g. an external
+// AI video tool) and the agent's own script/scene-generation is never
+// involved — see job-store.js's VIDEO_MODES 'uploaded-clips' and its
+// uploadedClips/clipVoiceoverVoice/clipVoiceoverBatch fields for the full
+// schema. Creating the job, uploading clips, and generating per-clip
+// voice-overs are all plain REST calls (no chat/agent tool involved), the
+// same as the Story-to-Video form above.
+
+// Creates a fresh job already set to 'uploaded-clips' mode — the one thing
+// POST /api/jobs (a blank default job) doesn't do on its own, since every
+// other mode is chosen later via chat/the Create Video form. No script, no
+// paid call — exactly like a blank job.
+app.post('/api/jobs/upload-compile', async (req, res) => {
+  const job = await jobStore.createJob();
+  const updatedJob = await jobStore.updateJob(job.id, { videoMode: 'uploaded-clips' });
+  res.json({ job: updatedJob });
+});
+
+// Uploads ONE real scene clip and appends it to job.uploadedClips. Accepts
+// the raw video file as the request body (never base64/JSON), the same
+// "raw body validated by its real Content-Type" pattern as
+// upload-voiceover/upload-music/upload-background-image above. Probes the
+// real, measured duration and whether the clip already has its own audio
+// stream (backend/clip-voiceover.js's probeUploadedClip) so the "select all
+// silent clips" UI action and the per-clip voice-over flow below both have
+// honest, real facts to work from rather than guessing from the filename.
+app.post(
+  '/api/jobs/:id/upload-clip',
+  express.raw({ type: Object.keys(VIDEO_UPLOAD_CONTENT_TYPES), limit: VIDEO_UPLOAD_MAX_BYTES }),
+  async (req, res) => {
+    const job = await jobStore.getJob(req.params.id);
+    if (!job) {
+      return res.status(404).json({ error: 'job not found' });
+    }
+    if ((job.videoMode || jobStore.DEFAULT_VIDEO_MODE) !== 'uploaded-clips') {
+      return res.status(400).json({
+        error: "Uploading a scene clip only applies to a job created via POST /api/jobs/upload-compile.",
+      });
+    }
+
+    const contentType = (req.headers['content-type'] || '').split(';')[0].trim().toLowerCase();
+    const extension = VIDEO_UPLOAD_CONTENT_TYPES[contentType];
+    if (!extension) {
+      return res.status(400).json({
+        error: `Unsupported video format "${contentType || 'unknown'}" — upload an MP4, MOV, or WEBM file.`,
+      });
+    }
+    if (!Buffer.isBuffer(req.body) || req.body.length === 0) {
+      return res.status(400).json({
+        error: 'No video data was received — make sure the file is sent as the raw request body.',
+      });
+    }
+
+    const clipId = crypto.randomBytes(6).toString('hex');
+    let url;
+    try {
+      url = await videoStorage.storeUploadedClipFile(req.body, job.id, clipId, { extension, contentType });
+    } catch (error) {
+      console.error(
+        'Uploaded clip could not be stored:',
+        JSON.stringify({ name: error?.name, message: error?.message }, null, 2)
+      );
+      return res.status(400).json({
+        error: 'That file could not be stored — make sure it is a valid, uncorrupted MP4, MOV, or WEBM video.',
+      });
+    }
+
+    let durationSeconds;
+    let hasAudio;
+    try {
+      const probed = await clipVoiceover.probeUploadedClip(url);
+      durationSeconds = probed.durationSeconds;
+      hasAudio = probed.hasAudio;
+    } catch (error) {
+      console.error(
+        'Uploaded clip could not be read:',
+        JSON.stringify({ name: error?.name, message: error?.message }, null, 2)
+      );
+      return res.status(400).json({
+        error: 'That file could not be read as a real video — make sure it is a valid, uncorrupted MP4, MOV, or WEBM file.',
+      });
+    }
+
+    const sourceFilename =
+      typeof req.query.filename === 'string' && req.query.filename.trim() ? req.query.filename.trim().slice(0, 200) : null;
+
+    const newClip = {
+      id: clipId,
+      url,
+      sourceFilename,
+      contentType,
+      durationSeconds,
+      hasAudio,
+      voiceoverSelected: false,
+      voiceoverStatus: 'idle',
+      voiceoverUrl: null,
+      processedUrl: null,
+      narrationText: null,
+      voiceoverError: null,
+    };
+
+    const uploadedClips = Array.isArray(job.uploadedClips) ? job.uploadedClips.concat(newClip) : [newClip];
+    const updatedJob = await jobStore.updateJob(job.id, { uploadedClips });
+    res.json({ job: updatedJob, clip: newClip });
+  }
+);
+
+// Records which uploaded clips should get an AI voice-over and the ONE
+// voice to use for all of them, and returns the real cost estimate for
+// exactly that selection — never every uploaded clip. This is a pure
+// selection+estimate step; no paid API call happens here. Persists the
+// selection as job.clipVoiceoverBatch — a SNAPSHOT that
+// POST /:id/generate-clip-voiceovers below acts on, so a later confirm can
+// never silently cover a different, since-changed selection.
+app.post('/api/jobs/:id/select-clip-voiceovers', async (req, res) => {
+  const job = await jobStore.getJob(req.params.id);
+  if (!job) {
+    return res.status(404).json({ error: 'job not found' });
+  }
+  if ((job.videoMode || jobStore.DEFAULT_VIDEO_MODE) !== 'uploaded-clips') {
+    return res.status(400).json({ error: 'This job has no uploaded clips (videoMode is not \'uploaded-clips\').' });
+  }
+
+  const selectedClipIds = Array.isArray(req.body?.selectedClipIds) ? req.body.selectedClipIds.map(String) : [];
+  const voiceStyle = typeof req.body?.voiceStyle === 'string' ? req.body.voiceStyle : '';
+
+  const uploadedClips = Array.isArray(job.uploadedClips) ? job.uploadedClips : [];
+  const knownIds = new Set(uploadedClips.map((clip) => clip.id));
+  const unknownIds = selectedClipIds.filter((id) => !knownIds.has(id));
+  if (unknownIds.length > 0) {
+    return res.status(400).json({ error: `Unknown clip id(s): ${unknownIds.join(', ')}` });
+  }
+
+  if (selectedClipIds.length > 0 && !VOICE_STYLE_OPTIONS.includes(voiceStyle)) {
+    return res.status(400).json({
+      error: `voiceStyle must be one of: ${VOICE_STYLE_OPTIONS.join(', ')}`,
+    });
+  }
+
+  const selectedIdSet = new Set(selectedClipIds);
+  const updatedClips = uploadedClips.map((clip) => ({ ...clip, voiceoverSelected: selectedIdSet.has(clip.id) }));
+  const costEstimate = costEstimation.estimateClipVoiceoverCost(selectedClipIds.length);
+  const clipVoiceoverBatch = {
+    selectedClipIds,
+    costEstimate,
+    confirmed: false,
+    status: 'idle',
+    error: null,
+  };
+
+  const updatedJob = await jobStore.updateJob(job.id, {
+    uploadedClips: updatedClips,
+    clipVoiceoverVoice: voiceStyle,
+    clipVoiceoverBatch,
+  });
+
+  // Clips already carrying their own real audio, selected anyway — never
+  // blocked (the user explicitly opted in), but worth surfacing so the
+  // frontend can warn that generating will REPLACE that clip's existing
+  // audio, never mix a second voice underneath it.
+  const clipsWithExistingAudioSelected = uploadedClips
+    .filter((clip) => selectedIdSet.has(clip.id) && clip.hasAudio)
+    .map((clip) => clip.id);
+
+  res.json({ job: updatedJob, costEstimate, clipsWithExistingAudioSelected });
+});
+
+// Confirms and runs the AI voice-over generation for exactly the clips
+// recorded by POST /:id/select-clip-voiceovers above — never a freshly
+// passed selection, so this can only ever act on a selection/estimate the
+// user actually saw. Real, paid Claude vision + OpenAI TTS calls, one pair
+// per selected clip (backend/clip-voiceover.js) — processed concurrently,
+// the same "await Promise.all" reasoning voiceover-generation.js's own
+// chunk synthesis already uses, since the expected clip count per batch is
+// small. Every clip's own real outcome (completed or failed) is recorded
+// independently; one clip failing never discards another's real, already-
+// paid-for result.
+app.post('/api/jobs/:id/generate-clip-voiceovers', async (req, res) => {
+  const job = await jobStore.getJob(req.params.id);
+  if (!job) {
+    return res.status(404).json({ error: 'job not found' });
+  }
+  if ((job.videoMode || jobStore.DEFAULT_VIDEO_MODE) !== 'uploaded-clips') {
+    return res.status(400).json({ error: 'This job has no uploaded clips (videoMode is not \'uploaded-clips\').' });
+  }
+
+  const batch = job.clipVoiceoverBatch || {};
+  const selectedClipIds = Array.isArray(batch.selectedClipIds) ? batch.selectedClipIds : [];
+  if (selectedClipIds.length === 0) {
+    return res.status(400).json({
+      error: 'No clips are selected yet — call POST /:id/select-clip-voiceovers first to choose clips and a voice.',
+    });
+  }
+  if (!VOICE_STYLE_OPTIONS.includes(job.clipVoiceoverVoice)) {
+    return res.status(400).json({ error: 'No AI voice has been chosen yet — call POST /:id/select-clip-voiceovers first.' });
+  }
+  if (!process.env.ANTHROPIC_API_KEY) {
+    return res.status(500).json({ error: 'ANTHROPIC_API_KEY is not configured' });
+  }
+  if (!process.env.OPENAI_API_KEY) {
+    return res.status(500).json({ error: 'OPENAI_API_KEY is not configured' });
+  }
+
+  const uploadedClips = Array.isArray(job.uploadedClips) ? job.uploadedClips : [];
+  const selectedIdSet = new Set(selectedClipIds);
+
+  await jobStore.updateJob(job.id, {
+    uploadedClips: uploadedClips.map((clip) =>
+      selectedIdSet.has(clip.id) ? { ...clip, voiceoverStatus: 'processing', voiceoverError: null } : clip
+    ),
+    clipVoiceoverBatch: { ...batch, confirmed: true, status: 'processing', error: null },
+  });
+
+  const results = await Promise.all(
+    uploadedClips
+      .filter((clip) => selectedIdSet.has(clip.id))
+      .map(async (clip) => {
+        const result = await clipVoiceover.generateClipVoiceover({
+          clipUrl: clip.url,
+          voiceStyle: job.clipVoiceoverVoice,
+          jobId: job.id,
+          clipId: clip.id,
+          topic: job.topic,
+        });
+        return { clipId: clip.id, result };
+      })
+  );
+
+  const resultByClipId = new Map(results.map(({ clipId, result }) => [clipId, result]));
+  const finalClips = uploadedClips.map((clip) => {
+    const result = resultByClipId.get(clip.id);
+    if (!result) {
+      return clip;
+    }
+    return {
+      ...clip,
+      voiceoverStatus: result.status,
+      voiceoverUrl: result.voiceoverUrl,
+      processedUrl: result.processedUrl,
+      narrationText: result.narrationText,
+      voiceoverError: result.error,
+    };
+  });
+
+  const allSelectedCompleted = results.every(({ result }) => result.status === 'completed');
+  const updatedJob = await jobStore.updateJob(job.id, {
+    uploadedClips: finalClips,
+    clipVoiceoverBatch: {
+      ...batch,
+      confirmed: true,
+      status: allSelectedCompleted ? 'completed' : 'failed',
+      error: allSelectedCompleted ? null : 'One or more selected clips failed — see each clip\'s own voiceoverError.',
+    },
+  });
+
+  res.json({ job: updatedJob });
 });
 
 app.post('/api/jobs/:id/generate-youtube-package', async (req, res) => {

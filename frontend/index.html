@@ -81,6 +81,9 @@
           <button type="button" id="mode-story-btn" class="mode-toggle-btn" role="tab" aria-selected="false">
             📝 Story to Video
           </button>
+          <button type="button" id="mode-upload-btn" class="mode-toggle-btn" role="tab" aria-selected="false">
+            📤 Upload &amp; Compile
+          </button>
         </div>
 
         <div id="idea-mode-panel">
@@ -486,6 +489,79 @@
               <button type="button" id="story-cancel-review-btn" class="btn">Back to Edit</button>
             </div>
             <p id="story-cost-status" class="generate-status" hidden aria-live="polite"></p>
+          </div>
+        </div>
+
+        <div id="upload-mode-panel" hidden>
+          <div id="upload-compile-form" class="create-form">
+            <div class="form-field form-field-wide">
+              <label for="upload-clips-input">Upload scene clips (MP4, MOV, or WEBM — one or more)</label>
+              <input type="file" id="upload-clips-input" accept=".mp4,.mov,.webm,video/mp4,video/quicktime,video/webm" multiple>
+              <p id="upload-clips-status" class="field-hint"></p>
+            </div>
+            <p class="field-hint">
+              Upload clips you generated elsewhere (e.g. Google Flow/Veo). Each clip is checked automatically
+              for its real length and whether it already has its own audio.
+            </p>
+          </div>
+
+          <div id="upload-clips-list-panel" hidden>
+            <h3>Uploaded Clips</h3>
+            <div class="form-field form-field-wide">
+              <button type="button" id="select-all-silent-btn" class="btn">Select all silent clips</button>
+            </div>
+            <ul id="upload-clips-list" class="upload-clips-list"></ul>
+
+            <div class="form-field">
+              <label for="upload-clip-voice">AI voice for selected clips</label>
+              <select id="upload-clip-voice">
+                <option value="male-warm">Male – Warm</option>
+                <option value="male-energetic">Male – Energetic</option>
+                <option value="female-warm">Female – Warm</option>
+                <option value="female-professional" selected>Female – Professional</option>
+                <option value="neutral-narrator">Neutral – Narrator</option>
+              </select>
+              <p class="field-hint">
+                Applied to every clip you select below. Only selected clips get an AI voice-over generated —
+                everything else stays exactly as uploaded, including a clip's own existing audio.
+              </p>
+            </div>
+
+            <div class="form-field form-field-action">
+              <button type="button" id="upload-review-cost-btn" class="btn btn-primary btn-generate">Review Cost</button>
+            </div>
+
+            <div class="form-field form-field-wide">
+              <label for="upload-music-input">Background music (optional — MP3, WAV, or M4A)</label>
+              <input type="file" id="upload-music-input" accept=".mp3,.wav,.m4a,audio/mpeg,audio/wav,audio/x-wav,audio/wave,audio/mp4,audio/x-m4a">
+              <p id="upload-music-status" class="field-hint"></p>
+              <p class="field-hint">
+                Mixed in under every clip's own audio, automatically turned down (ducked) while that audio is
+                playing so it never competes with narration or dialogue.
+              </p>
+            </div>
+
+            <div class="form-field form-field-action">
+              <button type="button" id="upload-compile-final-btn" class="btn btn-primary btn-generate">Compile Final Video</button>
+              <p class="field-hint">
+                Stitches every uploaded clip together, in upload order, keeping each clip's own audio (AI
+                voice-over or original) exactly as set above. Production stops here for your own review — see
+                the Final Review tab below.
+              </p>
+              <p id="upload-compile-status" class="generate-status" hidden aria-live="polite"></p>
+            </div>
+          </div>
+
+          <div id="upload-cost-review" class="story-cost-review" hidden>
+            <h3>Voice-over Cost Estimate</h3>
+            <p id="upload-cost-clip-count" class="review-note"></p>
+            <p id="upload-cost-total" class="story-cost-total"></p>
+            <p id="upload-cost-warning" class="field-hint" hidden></p>
+            <div class="story-cost-actions">
+              <button type="button" id="upload-confirm-generate-btn" class="btn btn-primary btn-generate">Confirm &amp; Generate Voice-overs</button>
+              <button type="button" id="upload-cancel-review-btn" class="btn">Back to Edit</button>
+            </div>
+            <p id="upload-cost-status" class="generate-status" hidden aria-live="polite"></p>
           </div>
         </div>
       </div>
