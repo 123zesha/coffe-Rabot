@@ -1138,6 +1138,62 @@
     clips.forEach((clip) => uploadClipsList.appendChild(buildUploadClipListItem(clip)));
   }
 
+  // A real scene clip easily exceeds a serverless platform's own
+  // per-request body-size ceiling (Vercel's is a few MB — confirmed live by
+  // a real ~10MB clip failing to upload) — so any file larger than this is
+  // split into sequential parts (server.js's POST /:id/upload-clip
+  // partIndex/totalParts handling, the same pattern "Upload My Own Voice"
+  // already uses), each comfortably under that ceiling. A small clip (the
+  // common case) still uploads in one request, unchanged.
+  const CLIP_UPLOAD_CHUNK_BYTES = 4 * 1024 * 1024;
+
+  // Reads res's body as JSON, falling back to a short text snippet of the
+  // real response when it isn't valid JSON (e.g. a platform-level error
+  // page for a request the server itself never got to handle) — so a
+  // failure here always surfaces a real, specific reason instead of a
+  // generic "something went wrong" that hides what actually happened.
+  async function readJsonOrDescribe(res) {
+    const text = await res.text();
+    try {
+      return { body: JSON.parse(text), description: null };
+    } catch (error) {
+      const snippet = text.trim().slice(0, 200) || `HTTP ${res.status}`;
+      return { body: null, description: snippet };
+    }
+  }
+
+  async function uploadClipFile(jobId, file, onProgress) {
+    const totalParts = Math.max(1, Math.ceil(file.size / CLIP_UPLOAD_CHUNK_BYTES));
+    const clientKey = totalParts > 1 ? `clip-${Date.now()}-${Math.random().toString(36).slice(2)}` : '';
+    let latestJob = null;
+
+    for (let partIndex = 1; partIndex <= totalParts; partIndex++) {
+      onProgress(partIndex, totalParts);
+      const start = (partIndex - 1) * CLIP_UPLOAD_CHUNK_BYTES;
+      const chunk = totalParts > 1 ? file.slice(start, start + CLIP_UPLOAD_CHUNK_BYTES) : file;
+
+      const params = new URLSearchParams({
+        filename: file.name,
+        partIndex: String(partIndex),
+        totalParts: String(totalParts),
+      });
+      if (clientKey) params.set('clientKey', clientKey);
+
+      const res = await fetch(`/api/jobs/${jobId}/upload-clip?${params.toString()}`, {
+        method: 'POST',
+        headers: { 'Content-Type': file.type || 'video/mp4' },
+        body: chunk,
+      });
+      const { body, description } = await readJsonOrDescribe(res);
+      if (!res.ok || !body) {
+        throw new Error((body && body.error) || description || `Could not upload ${file.name}.`);
+      }
+      latestJob = body.job;
+    }
+
+    return latestJob;
+  }
+
   uploadClipsInput.addEventListener('change', async () => {
     const files = Array.from(uploadClipsInput.files || []);
     if (files.length === 0) return;
@@ -1158,25 +1214,19 @@
       let latestJob = null;
       for (let i = 0; i < files.length; i++) {
         const file = files[i];
-        setUploadClipsStatus(`Uploading ${file.name}… (${i + 1} of ${files.length})`);
-        const params = new URLSearchParams({ filename: file.name });
-        const res = await fetch(`/api/jobs/${uploadJobId}/upload-clip?${params.toString()}`, {
-          method: 'POST',
-          headers: { 'Content-Type': file.type || 'video/mp4' },
-          body: file,
+        latestJob = await uploadClipFile(uploadJobId, file, (partIndex, totalParts) => {
+          setUploadClipsStatus(
+            totalParts > 1
+              ? `Uploading ${file.name}… (clip ${i + 1} of ${files.length}, part ${partIndex} of ${totalParts})`
+              : `Uploading ${file.name}… (${i + 1} of ${files.length})`
+          );
         });
-        const body = await res.json();
-        if (!res.ok) {
-          setUploadClipsStatus(body.error || `Could not upload ${file.name}.`);
-          return;
-        }
-        latestJob = body.job;
       }
 
       setUploadClipsStatus(`Uploaded ${files.length} clip${files.length === 1 ? '' : 's'}.`);
       renderUploadClipsList(latestJob);
     } catch (error) {
-      setUploadClipsStatus('Something went wrong uploading those clips. Please try again.');
+      setUploadClipsStatus(error.message || 'Something went wrong uploading those clips. Please try again.');
     } finally {
       uploadCompileForm.querySelector('input[type="file"]').disabled = false;
       uploadClipsInput.value = '';

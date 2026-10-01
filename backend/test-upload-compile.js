@@ -417,6 +417,72 @@ async function main() {
     assert.strictEqual(body2.job.uploadedClips.length, 2);
   });
 
+  // ---------------------------------------------------------------------
+  // POST /:id/upload-clip — multi-part upload (a real clip exceeding a
+  // serverless platform's own per-request body-size ceiling, confirmed
+  // live by a real ~10MB clip failing to upload in one request).
+  // ---------------------------------------------------------------------
+
+  await test('POST /:id/upload-clip requires clientKey when totalParts > 1', async () => {
+    const createRes = await fetch(`${baseUrl}/api/jobs/upload-compile`, { method: 'POST' });
+    const jobId = (await createRes.json()).job.id;
+    const res = await fetch(`${baseUrl}/api/jobs/${jobId}/upload-clip?partIndex=1&totalParts=2`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'video/mp4' },
+      body: audioClipBuffer.subarray(0, 100),
+    });
+    assert.strictEqual(res.status, 400);
+  });
+
+  await test('POST /:id/upload-clip refuses a later part when the previous part was never uploaded', async () => {
+    const createRes = await fetch(`${baseUrl}/api/jobs/upload-compile`, { method: 'POST' });
+    const jobId = (await createRes.json()).job.id;
+    const res = await fetch(
+      `${baseUrl}/api/jobs/${jobId}/upload-clip?partIndex=2&totalParts=2&clientKey=missing-first-part`,
+      { method: 'POST', headers: { 'Content-Type': 'video/mp4' }, body: audioClipBuffer.subarray(0, 100) }
+    );
+    assert.strictEqual(res.status, 400);
+  });
+
+  await test('POST /:id/upload-clip reassembles a clip uploaded in several small parts, byte-for-byte correct', async () => {
+    const createRes = await fetch(`${baseUrl}/api/jobs/upload-compile`, { method: 'POST' });
+    const jobId = (await createRes.json()).job.id;
+
+    const CHUNK_SIZE = 12 * 1024; // artificially small, to force several real parts
+    const totalParts = Math.ceil(audioClipBuffer.length / CHUNK_SIZE);
+    assert.ok(totalParts >= 3, 'the fixture must be large enough to exercise at least 3 real parts');
+    const clientKey = 'test-client-key-1';
+
+    let finalBody;
+    for (let partIndex = 1; partIndex <= totalParts; partIndex++) {
+      const start = (partIndex - 1) * CHUNK_SIZE;
+      const chunk = audioClipBuffer.subarray(start, start + CHUNK_SIZE);
+      const res = await fetch(
+        `${baseUrl}/api/jobs/${jobId}/upload-clip?filename=big.mp4&partIndex=${partIndex}&totalParts=${totalParts}&clientKey=${clientKey}`,
+        { method: 'POST', headers: { 'Content-Type': 'video/mp4' }, body: chunk }
+      );
+      assert.strictEqual(res.status, 200, `part ${partIndex} of ${totalParts} failed`);
+      finalBody = await res.json();
+      if (partIndex < totalParts) {
+        assert.strictEqual(finalBody.partIndex, partIndex);
+        assert.ok(!finalBody.clip, 'an intermediate part must not yet produce a finished clip');
+      }
+    }
+
+    assert.ok(finalBody.clip, 'the last part must produce a finished clip');
+    assert.strictEqual(finalBody.clip.hasAudio, true);
+    assert.deepStrictEqual(finalBody.job.pendingClipUploads, {}, 'pending bookkeeping must be cleared once the clip completes');
+
+    // Byte-for-byte reassembly check: the stored clip's real duration must
+    // match the original, unchunked file's own real duration exactly.
+    const expectedDuration = await videoAssembly.getMediaDuration(audioClipPath);
+    const localPath = finalBody.clip.url.startsWith('/generated/')
+      ? path.join(require('./video-storage').GENERATED_DIR, finalBody.clip.url.slice('/generated/'.length))
+      : finalBody.clip.url;
+    const actualDuration = await videoAssembly.getMediaDuration(localPath);
+    assert.ok(Math.abs(actualDuration - expectedDuration) < 0.05, `expected duration ${expectedDuration}, got ${actualDuration}`);
+  });
+
   await test('POST /:id/select-clip-voiceovers rejects an unknown clip id', async () => {
     const res = await fetch(`${baseUrl}/api/jobs/${compileJobId}/select-clip-voiceovers`, {
       method: 'POST',

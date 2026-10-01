@@ -117,6 +117,7 @@ const JOB_FIELDS = [
   'uploadedClips',
   'clipVoiceoverVoice',
   'clipVoiceoverBatch',
+  'pendingClipUploads',
 ];
 
 // The only real, supported output-format values — 'horizontal' (16:9),
@@ -748,6 +749,20 @@ function createDefaultJob(id) {
       status: 'idle',
       error: null,
     },
+    // 'uploaded-clips' mode only: bookkeeping for a clip still being
+    // uploaded in MULTIPLE PARTS (see server.js's POST /:id/upload-clip) —
+    // a real scene clip can easily exceed a serverless platform's own
+    // per-request body-size ceiling (Vercel's is a few MB) in one request,
+    // the same reason "Upload My Own Voice" already splits a long
+    // recording into parts. Keyed by the frontend's own per-file clientKey
+    // (a random id generated once per file, sent on every part of that
+    // file), value is the real, already-stored url of everything received
+    // for that file SO FAR — never a finished clip; an entry here is
+    // deleted the moment its final part arrives and the real clip is
+    // appended to uploadedClips above. Not writable by the conversational
+    // agent or the generic updateVideoJob field-setter — purely internal,
+    // transient upload-route bookkeeping.
+    pendingClipUploads: {},
   };
 }
 

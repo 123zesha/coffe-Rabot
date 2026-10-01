@@ -3041,14 +3041,15 @@ const IMAGE_UPLOAD_CONTENT_TYPES = {
 // "Upload & Compile" (POST /:id/upload-clip further down) accepts a real
 // scene-clip video file as a raw request body, the same "raw body, not
 // base64/JSON" reasoning as AUDIO_UPLOAD_CONTENT_TYPES/
-// IMAGE_UPLOAD_CONTENT_TYPES above. NOTE: this proxies the whole file
-// through this one Express route in a single request, exactly like
-// upload-music/upload-background-image already do — on a serverless
-// deployment (Vercel) with a low platform request-body ceiling, a real,
-// large clip may need a smaller limit here (or a direct-to-storage upload
-// path) than this generous local-dev-oriented ceiling allows; this has not
-// been verified against Vercel's current limit.
-const VIDEO_UPLOAD_MAX_BYTES = 200 * 1024 * 1024; // comfortably covers a real, several-minute 1080p scene clip
+// IMAGE_UPLOAD_CONTENT_TYPES above. A real clip easily exceeds a serverless
+// platform's own per-request body-size ceiling (Vercel's is a few MB —
+// confirmed live by a real ~10MB clip failing), so — exactly like
+// upload-voiceover's own partIndex/totalParts handling — the frontend
+// splits a large clip into sequential parts, each comfortably under that
+// ceiling; this constant is a per-PART (per-request) safety ceiling, not a
+// whole-clip limit, so it stays small regardless of how long the final
+// clip is.
+const VIDEO_UPLOAD_MAX_BYTES = 8 * 1024 * 1024; // comfortably covers one upload part (frontend chunks at ~4MB)
 const VIDEO_UPLOAD_CONTENT_TYPES = {
   'video/mp4': 'mp4',
   'video/quicktime': 'mov',
@@ -3428,6 +3429,24 @@ app.post('/api/jobs/upload-compile', async (req, res) => {
 // stream (backend/clip-voiceover.js's probeUploadedClip) so the "select all
 // silent clips" UI action and the per-clip voice-over flow below both have
 // honest, real facts to work from rather than guessing from the filename.
+// A real scene clip can easily exceed a serverless platform's own
+// per-request body-size ceiling (Vercel's is a few MB) in a single request
+// — confirmed live by a real ~10MB clip failing to upload. So, exactly like
+// "Upload My Own Voice" (POST /:id/upload-voiceover) already does for a
+// long recording, the frontend uploads a large clip in SEQUENTIAL PARTS
+// (partIndex/totalParts query params), each comfortably under that ceiling,
+// tagged with a client-generated clientKey so this route can tell which
+// clip a later part belongs to. A small clip (the common case) is sent as
+// a single part (totalParts=1, no clientKey needed) — byte-for-byte the
+// same request shape as before this existed.
+//
+// Unlike upload-voiceover's audio parts (independently-encoded files that
+// need a real decode+rejoin to avoid seam artifacts — see
+// concatenateAudioBuffers), each part here is a PLAIN BYTE RANGE of the
+// same original file (the frontend uses File.slice(), never re-encoding
+// anything), so a raw Buffer.concat of the parts IN ORDER reconstructs the
+// exact original file bytes — no ffmpeg/decode step needed for the join
+// itself.
 app.post(
   '/api/jobs/:id/upload-clip',
   express.raw({ type: Object.keys(VIDEO_UPLOAD_CONTENT_TYPES), limit: VIDEO_UPLOAD_MAX_BYTES }),
@@ -3455,10 +3474,50 @@ app.post(
       });
     }
 
-    const clipId = crypto.randomBytes(6).toString('hex');
+    const totalParts = Math.max(1, Number(req.query.totalParts) || 1);
+    const partIndex = Math.max(1, Number(req.query.partIndex) || 1);
+    if (partIndex > totalParts) {
+      return res.status(400).json({ error: 'partIndex cannot be greater than totalParts.' });
+    }
+    const clientKey = typeof req.query.clientKey === 'string' ? req.query.clientKey.trim() : '';
+    if (totalParts > 1 && !clientKey) {
+      return res.status(400).json({ error: 'clientKey is required when uploading a clip in multiple parts.' });
+    }
+
+    const pendingClipUploads = job.pendingClipUploads || {};
+    let combinedBuffer = req.body;
+
+    if (partIndex > 1) {
+      const previousUrl = pendingClipUploads[clientKey];
+      if (!previousUrl) {
+        return res.status(400).json({
+          error: `Expected part ${partIndex - 1} of ${totalParts} to have been uploaded first.`,
+        });
+      }
+      const workDir = fs.mkdtempSync(path.join(os.tmpdir(), 'clip-upload-part-'));
+      try {
+        const previousPath = path.join(workDir, 'previous');
+        await videoAssembly.fetchToFile(previousUrl, previousPath);
+        combinedBuffer = Buffer.concat([fs.readFileSync(previousPath), req.body]);
+      } catch (error) {
+        console.error(
+          'Could not join the next uploaded clip part:',
+          JSON.stringify({ name: error?.name, message: error?.message }, null, 2)
+        );
+        return res.status(400).json({
+          error: 'Could not combine this part with the previously uploaded part(s) of this clip.',
+        });
+      } finally {
+        fs.rmSync(workDir, { recursive: true, force: true });
+      }
+    }
+
+    const isLastPart = partIndex === totalParts;
+    const clipId = clientKey || crypto.randomBytes(6).toString('hex');
+
     let url;
     try {
-      url = await videoStorage.storeUploadedClipFile(req.body, job.id, clipId, { extension, contentType });
+      url = await videoStorage.storeUploadedClipFile(combinedBuffer, job.id, clipId, { extension, contentType });
     } catch (error) {
       console.error(
         'Uploaded clip could not be stored:',
@@ -3467,6 +3526,13 @@ app.post(
       return res.status(400).json({
         error: 'That file could not be stored — make sure it is a valid, uncorrupted MP4, MOV, or WEBM video.',
       });
+    }
+
+    if (!isLastPart) {
+      const updatedJob = await jobStore.updateJob(job.id, {
+        pendingClipUploads: { ...pendingClipUploads, [clientKey]: url },
+      });
+      return res.json({ job: updatedJob, partIndex, totalParts });
     }
 
     let durationSeconds;
@@ -3503,8 +3569,11 @@ app.post(
       voiceoverError: null,
     };
 
+    const remainingPending = { ...pendingClipUploads };
+    delete remainingPending[clientKey];
+
     const uploadedClips = Array.isArray(job.uploadedClips) ? job.uploadedClips.concat(newClip) : [newClip];
-    const updatedJob = await jobStore.updateJob(job.id, { uploadedClips });
+    const updatedJob = await jobStore.updateJob(job.id, { uploadedClips, pendingClipUploads: remainingPending });
     res.json({ job: updatedJob, clip: newClip });
   }
 );
