@@ -3464,15 +3464,24 @@ app.post('/api/jobs/upload-compile', async (req, res) => {
 });
 
 // Extracts a scene number from a clip's filename, e.g. "scene_01.mp4" -> 1,
-// "Scene-2.mov" -> 2, "myscene10.webm" -> 10. Returns null when the
-// filename has no "scene" + digits pattern at all (e.g. "IMG_0012.mp4"),
-// which computeAutoClipOrder below treats as "can't auto-order this clip".
+// "Scene-2.mov" -> 2, "myscene10.webm" -> 10, or a filename that is ENTIRELY
+// a number (e.g. "1.mp4", "07.mp4", "20.mp4") — just as clear an ordering
+// signal, and a common convention for clips numbered in sequence,
+// confirmed live by a real job where exactly "1.mp4".."20.mp4" were
+// uploaded and fell back to plain (non-numeric) upload order instead of
+// being auto-sorted. Returns null when neither pattern matches (e.g.
+// "IMG_0012.mp4"), which computeAutoClipOrder below treats as "can't
+// auto-order this clip".
 function parseSceneNumberFromFilename(filename) {
   if (typeof filename !== 'string') {
     return null;
   }
-  const match = filename.match(/scene[\s_-]*0*(\d+)/i);
-  return match ? Number(match[1]) : null;
+  const sceneMatch = filename.match(/scene[\s_-]*0*(\d+)/i);
+  if (sceneMatch) {
+    return Number(sceneMatch[1]);
+  }
+  const bareNumberMatch = filename.match(/^0*(\d+)\.[^.]+$/);
+  return bareNumberMatch ? Number(bareNumberMatch[1]) : null;
 }
 
 // Returns `clips` re-sorted by ascending scene number (see
