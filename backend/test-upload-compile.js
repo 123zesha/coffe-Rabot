@@ -617,6 +617,19 @@ async function main() {
     assert.strictEqual(server.parseSceneNumberFromFilename(null), null);
   });
 
+  // Regression for a real production job: 20 clips named plainly "1.mp4"
+  // through "20.mp4" (no "scene" keyword) came back in the wrong order
+  // because the browser's own file-picker order wasn't numeric, and the
+  // old parser only recognized "scene_XX" filenames, so it fell back to
+  // that wrong upload order instead of auto-sorting.
+  await test('parseSceneNumberFromFilename also reads a filename that is ENTIRELY a number', () => {
+    assert.strictEqual(server.parseSceneNumberFromFilename('1.mp4'), 1);
+    assert.strictEqual(server.parseSceneNumberFromFilename('07.mp4'), 7);
+    assert.strictEqual(server.parseSceneNumberFromFilename('20.mp4'), 20);
+    assert.strictEqual(server.parseSceneNumberFromFilename('clip 5.mp4'), null, 'must not match when anything besides the number is present');
+    assert.strictEqual(server.parseSceneNumberFromFilename('my.video.20.mp4'), null, 'must not match when the number is not the whole basename');
+  });
+
   await test('computeAutoClipOrder sorts by scene number when every clip has one, and is null when ambiguous', () => {
     const sorted = server.computeAutoClipOrder([
       { id: 'a', sourceFilename: 'scene_03.mp4' },
@@ -651,6 +664,22 @@ async function main() {
     assert.deepStrictEqual(
       job.uploadedClips.map((clip) => clip.sourceFilename),
       ['scene_01.mp4', 'scene_02.mp4', 'scene_03.mp4']
+    );
+    assert.strictEqual(job.clipsManuallyOrdered, false);
+  });
+
+  await test('POST /:id/upload-clip auto-sorts bare-numeric filenames uploaded in descending (wrong) order', async () => {
+    const createRes = await fetch(`${baseUrl}/api/jobs/upload-compile`, { method: 'POST' });
+    const jobId = (await createRes.json()).job.id;
+
+    await uploadClip(jobId, '20.mp4');
+    await uploadClip(jobId, '19.mp4');
+    await uploadClip(jobId, '18.mp4');
+    const { job } = await uploadClip(jobId, '17.mp4');
+
+    assert.deepStrictEqual(
+      job.uploadedClips.map((clip) => clip.sourceFilename),
+      ['17.mp4', '18.mp4', '19.mp4', '20.mp4']
     );
     assert.strictEqual(job.clipsManuallyOrdered, false);
   });
