@@ -253,12 +253,15 @@ function findFinalVideoBlocker(job) {
 // desiredVideoModeUsed is job.videoMode itself (see computeDesiredVideoModeUsed
 // below) — which of the two pipelines below actually runs.
 //
-// Returns { finalVideo, simpleStoryRender } — BOTH must be persisted by the
-// caller (jobStore.updateJob(jobId, { finalVideo, simpleStoryRender })).
+// Returns { finalVideo, simpleStoryRender, uploadedClipsRender } — ALL
+// THREE must be persisted by the caller (jobStore.updateJob(jobId,
+// { finalVideo, simpleStoryRender, uploadedClipsRender })).
 // simpleStoryRender only ever actually changes for the simple-story
-// pipeline below; the cinematic pipeline passes job.simpleStoryRender
-// through unchanged (a harmless no-op write), so both callers can always
-// persist both fields the same way regardless of which pipeline ran.
+// pipeline below, and uploadedClipsRender only for the uploaded-clips
+// pipeline below; every other pipeline passes the other two through
+// job.simpleStoryRender/job.uploadedClipsRender unchanged (a harmless no-op
+// write), so every caller can always persist all three fields the same way
+// regardless of which pipeline ran.
 async function assembleAndStoreFinalVideo(
   job,
   jobId,
@@ -312,6 +315,7 @@ async function assembleAndStoreFinalVideo(
           error: error.message,
         },
         simpleStoryRender: job.simpleStoryRender,
+        uploadedClipsRender: job.uploadedClipsRender,
       };
     }
 
@@ -337,6 +341,7 @@ async function assembleAndStoreFinalVideo(
           error: null,
         },
         simpleStoryRender: assembly.render,
+        uploadedClipsRender: job.uploadedClipsRender,
       };
     }
 
@@ -353,6 +358,7 @@ async function assembleAndStoreFinalVideo(
           error: assembly.error || 'Simple Story Video assembly failed.',
         },
         simpleStoryRender: assembly.render,
+        uploadedClipsRender: job.uploadedClipsRender,
       };
     }
 
@@ -370,6 +376,7 @@ async function assembleAndStoreFinalVideo(
           error: null,
         },
         simpleStoryRender: assembly.render,
+        uploadedClipsRender: job.uploadedClipsRender,
       };
     } catch (error) {
       console.error(
@@ -388,6 +395,7 @@ async function assembleAndStoreFinalVideo(
           error: `The final video was assembled but could not be stored: ${error.message}`,
         },
         simpleStoryRender: assembly.render,
+        uploadedClipsRender: job.uploadedClipsRender,
       };
     }
   }
@@ -409,14 +417,40 @@ async function assembleAndStoreFinalVideo(
           error: error.message,
         },
         simpleStoryRender: job.simpleStoryRender,
+        uploadedClipsRender: job.uploadedClipsRender,
       };
     }
 
-    const assembly = await videoAssembly.assembleUploadedClipsVideo({
+    // RESUMABLE, like Simple Story Video's own assembly just above: a real
+    // job with several clips, each needing its own full ffmpeg re-encode,
+    // can take longer than one serverless invocation safely allows — a real
+    // production failure this guards against (a Vercel deployment killed a
+    // single-call assembly after its own 300-second limit). See
+    // video-assembly.js's continueUploadedClipsAssembly.
+    const assembly = await videoAssembly.continueUploadedClipsAssembly({
       uploadedClips: job.uploadedClips,
       musicUrl,
       resolutionTier: job.resolutionTier,
+      existingRender: job.uploadedClipsRender,
+      jobId,
     });
+
+    if (assembly.status === 'in_progress') {
+      return {
+        finalVideo: {
+          url: null,
+          status: 'processing',
+          subtitlesUsed: null,
+          musicUsed: null,
+          resolutionUsed: null,
+          videoModeUsed: null,
+          editSettingsUsed: null,
+          error: null,
+        },
+        simpleStoryRender: job.simpleStoryRender,
+        uploadedClipsRender: assembly.render,
+      };
+    }
 
     if (assembly.status !== 'completed') {
       return {
@@ -431,6 +465,7 @@ async function assembleAndStoreFinalVideo(
           error: assembly.error || 'Upload & Compile final video assembly failed.',
         },
         simpleStoryRender: job.simpleStoryRender,
+        uploadedClipsRender: assembly.render,
       };
     }
 
@@ -453,6 +488,7 @@ async function assembleAndStoreFinalVideo(
           error: null,
         },
         simpleStoryRender: job.simpleStoryRender,
+        uploadedClipsRender: assembly.render,
       };
     } catch (error) {
       console.error(
@@ -471,6 +507,7 @@ async function assembleAndStoreFinalVideo(
           error: `The final video was assembled but could not be stored: ${error.message}`,
         },
         simpleStoryRender: job.simpleStoryRender,
+        uploadedClipsRender: assembly.render,
       };
     }
   }
@@ -501,6 +538,7 @@ async function assembleAndStoreFinalVideo(
           `(${healedClips[brokenIndex].error || 'unknown error'}) — regenerate it with generateSceneVideo.`,
       },
       simpleStoryRender: job.simpleStoryRender,
+      uploadedClipsRender: job.uploadedClipsRender,
     };
   }
 
@@ -524,6 +562,7 @@ async function assembleAndStoreFinalVideo(
         error: error.message,
       },
       simpleStoryRender: job.simpleStoryRender,
+      uploadedClipsRender: job.uploadedClipsRender,
     };
   }
 
@@ -549,6 +588,7 @@ async function assembleAndStoreFinalVideo(
         error: assembly.error || 'Final video assembly failed.',
       },
       simpleStoryRender: job.simpleStoryRender,
+      uploadedClipsRender: job.uploadedClipsRender,
     };
   }
 
@@ -566,6 +606,7 @@ async function assembleAndStoreFinalVideo(
         error: null,
       },
       simpleStoryRender: job.simpleStoryRender,
+      uploadedClipsRender: job.uploadedClipsRender,
     };
   } catch (error) {
     console.error(
@@ -584,6 +625,7 @@ async function assembleAndStoreFinalVideo(
         error: `The final video was assembled but could not be stored: ${error.message}`,
       },
       simpleStoryRender: job.simpleStoryRender,
+      uploadedClipsRender: job.uploadedClipsRender,
     };
   }
 }
@@ -711,7 +753,7 @@ async function runAssembleFinalVideo(job, jobId) {
   const desiredMusicUsed = computeDesiredMusicUsed(job);
   const desiredResolutionUsed = computeDesiredResolutionUsed(job);
   const desiredVideoModeUsed = computeDesiredVideoModeUsed(job);
-  const { finalVideo, simpleStoryRender } = await assembleAndStoreFinalVideo(
+  const { finalVideo, simpleStoryRender, uploadedClipsRender } = await assembleAndStoreFinalVideo(
     job,
     jobId,
     desiredSubtitlesContent,
@@ -719,7 +761,7 @@ async function runAssembleFinalVideo(job, jobId) {
     desiredResolutionUsed,
     desiredVideoModeUsed
   );
-  return jobStore.updateJob(jobId, { finalVideo, simpleStoryRender });
+  return jobStore.updateJob(jobId, { finalVideo, simpleStoryRender, uploadedClipsRender });
 }
 
 // job.script must be a real, complete script and voiceStyle must not be
@@ -3421,6 +3463,39 @@ app.post('/api/jobs/upload-compile', async (req, res) => {
   res.json({ job: updatedJob });
 });
 
+// Extracts a scene number from a clip's filename, e.g. "scene_01.mp4" -> 1,
+// "Scene-2.mov" -> 2, "myscene10.webm" -> 10. Returns null when the
+// filename has no "scene" + digits pattern at all (e.g. "IMG_0012.mp4"),
+// which computeAutoClipOrder below treats as "can't auto-order this clip".
+function parseSceneNumberFromFilename(filename) {
+  if (typeof filename !== 'string') {
+    return null;
+  }
+  const match = filename.match(/scene[\s_-]*0*(\d+)/i);
+  return match ? Number(match[1]) : null;
+}
+
+// Returns `clips` re-sorted by ascending scene number (see
+// parseSceneNumberFromFilename above) when EVERY clip has its own clear,
+// distinct scene number — or null when the order is ambiguous (a clip with
+// no parseable number, or two clips sharing the same one), in which case
+// the caller keeps the clips in their current order and leaves it to the
+// user to fix by hand via POST /:id/reorder-uploaded-clips.
+function computeAutoClipOrder(clips) {
+  const sceneNumbers = clips.map((clip) => parseSceneNumberFromFilename(clip.sourceFilename));
+  const seen = new Set();
+  for (const sceneNumber of sceneNumbers) {
+    if (sceneNumber === null || seen.has(sceneNumber)) {
+      return null;
+    }
+    seen.add(sceneNumber);
+  }
+  return clips
+    .map((clip, index) => ({ clip, sceneNumber: sceneNumbers[index] }))
+    .sort((a, b) => a.sceneNumber - b.sceneNumber)
+    .map((entry) => entry.clip);
+}
+
 // Uploads ONE real scene clip and appends it to job.uploadedClips. Accepts
 // the raw video file as the request body (never base64/JSON), the same
 // "raw body validated by its real Content-Type" pattern as
@@ -3572,11 +3647,55 @@ app.post(
     const remainingPending = { ...pendingClipUploads };
     delete remainingPending[clientKey];
 
-    const uploadedClips = Array.isArray(job.uploadedClips) ? job.uploadedClips.concat(newClip) : [newClip];
+    const clipsInUploadOrder = Array.isArray(job.uploadedClips) ? job.uploadedClips.concat(newClip) : [newClip];
+    // Keep clips sorted by their filenames' scene numbers while that stays
+    // unambiguous — but never once the user has manually reordered them
+    // (see job.clipsManuallyOrdered's own comment in job-store.js).
+    const autoOrderedClips = job.clipsManuallyOrdered ? null : computeAutoClipOrder(clipsInUploadOrder);
+    const uploadedClips = autoOrderedClips || clipsInUploadOrder;
     const updatedJob = await jobStore.updateJob(job.id, { uploadedClips, pendingClipUploads: remainingPending });
     res.json({ job: updatedJob, clip: newClip });
   }
 );
+
+// Lets the user fix the clip order by hand — needed whenever
+// computeAutoClipOrder couldn't confidently sort by filename (a clip with
+// no scene number, or two clips sharing one), and available any time the
+// user simply wants to override the automatic order. Takes the EXACT set
+// of this job's current clip ids, each listed once, in the desired order;
+// anything else (a missing id, an unknown one, a duplicate) is rejected
+// rather than guessed at. From this point on, job.clipsManuallyOrdered is
+// permanently true for this job, so a later upload is appended instead of
+// re-sorted — the user's own ordering is never silently undone.
+app.post('/api/jobs/:id/reorder-uploaded-clips', async (req, res) => {
+  const job = await jobStore.getJob(req.params.id);
+  if (!job) {
+    return res.status(404).json({ error: 'job not found' });
+  }
+  if ((job.videoMode || jobStore.DEFAULT_VIDEO_MODE) !== 'uploaded-clips') {
+    return res.status(400).json({ error: 'This job has no uploaded clips (videoMode is not \'uploaded-clips\').' });
+  }
+
+  const uploadedClips = Array.isArray(job.uploadedClips) ? job.uploadedClips : [];
+  const clipIds = Array.isArray(req.body?.clipIds) ? req.body.clipIds.map(String) : [];
+  const currentIds = new Set(uploadedClips.map((clip) => clip.id));
+  const isExactReordering =
+    clipIds.length === uploadedClips.length &&
+    new Set(clipIds).size === clipIds.length &&
+    clipIds.every((id) => currentIds.has(id));
+  if (!isExactReordering) {
+    return res.status(400).json({
+      error: "clipIds must list every one of this job's current clip ids exactly once, in the desired order.",
+    });
+  }
+
+  const clipById = new Map(uploadedClips.map((clip) => [clip.id, clip]));
+  const updatedJob = await jobStore.updateJob(job.id, {
+    uploadedClips: clipIds.map((id) => clipById.get(id)),
+    clipsManuallyOrdered: true,
+  });
+  res.json({ job: updatedJob });
+});
 
 // Records which uploaded clips should get an AI voice-over and the ONE
 // voice to use for all of them, and returns the real cost estimate for
@@ -4179,3 +4298,5 @@ module.exports.isScriptPasteRequest = isScriptPasteRequest;
 module.exports.PAID_OR_CONFIRM_TOOLS = PAID_OR_CONFIRM_TOOLS;
 module.exports.continueChatToVideoPipeline = continueChatToVideoPipeline;
 module.exports.sanitizeScriptPasteSettings = sanitizeScriptPasteSettings;
+module.exports.parseSceneNumberFromFilename = parseSceneNumberFromFilename;
+module.exports.computeAutoClipOrder = computeAutoClipOrder;

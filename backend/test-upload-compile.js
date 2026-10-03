@@ -1,10 +1,13 @@
 // Tests for the "Upload & Compile" flow: job-store.js's 'uploaded-clips'
 // VIDEO_MODES entry and its uploadedClips/clipVoiceoverVoice/
-// clipVoiceoverBatch fields, backend/clip-voiceover.js (probing + real
-// per-clip voice-over generation), video-assembly.js's
-// assembleUploadedClipsVideo (stitching uploaded clips in order, each
-// keeping its own real/processed audio, plus optional ducked background
-// music), cost-estimation.js's estimateClipVoiceoverCost, and server.js's
+// clipVoiceoverBatch/uploadedClipsRender fields, backend/clip-voiceover.js
+// (probing + real per-clip voice-over generation), video-assembly.js's
+// continueUploadedClipsAssembly (RESUMABLE stitching of uploaded clips in
+// order, each keeping its own real/processed audio, plus optional ducked
+// background music — resumable because a real multi-clip job can exceed a
+// serverless platform's own function-duration ceiling, confirmed live by a
+// Vercel deployment killing a single-call assembly after its own 300-second
+// limit), cost-estimation.js's estimateClipVoiceoverCost, and server.js's
 // POST /api/jobs/upload-compile, POST /:id/upload-clip,
 // POST /:id/select-clip-voiceovers, POST /:id/generate-clip-voiceovers, and
 // the shared POST /:id/assemble-video route for this mode.
@@ -268,8 +271,25 @@ async function main() {
     '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-c:a', 'aac', '-shortest', highToneClipPath,
   ]);
 
-  await test('assembleUploadedClipsVideo stitches clips in the given order, each keeping its own real/silent audio', async () => {
-    const result = await videoAssembly.assembleUploadedClipsVideo({
+  // continueUploadedClipsAssembly is RESUMABLE (see its own comment in
+  // video-assembly.js) — a real call may return 'in_progress' before every
+  // clip is normalized. This helper drives it to completion the same way
+  // server.js's own polling loop does, feeding each call's returned
+  // `render` into the next one.
+  async function runAssemblyToCompletion(args) {
+    let render = args.existingRender || null;
+    for (let i = 0; i < 50; i++) {
+      const result = await videoAssembly.continueUploadedClipsAssembly({ ...args, existingRender: render });
+      if (result.status !== 'in_progress') {
+        return result;
+      }
+      render = result.render;
+    }
+    throw new Error('continueUploadedClipsAssembly never completed after 50 calls');
+  }
+
+  await test('continueUploadedClipsAssembly stitches clips in the given order, each keeping its own real/silent audio', async () => {
+    const result = await runAssemblyToCompletion({
       uploadedClips: [
         { id: '1', url: toneClipPath, processedUrl: null },
         { id: '2', url: silentMiddleClipPath, processedUrl: null },
@@ -277,8 +297,11 @@ async function main() {
       ],
       musicUrl: null,
       resolutionTier: '720p',
+      jobId: 'test-job-order',
     });
     assert.strictEqual(result.status, 'completed', result.error || '');
+    assert.strictEqual(result.render.status, 'completed');
+    assert.strictEqual(result.render.normalizedClips.length, 3);
 
     const outPath = path.join(workDir, 'assembled-order-check.mp4');
     fs.writeFileSync(outPath, result.buffer);
@@ -304,18 +327,23 @@ async function main() {
   const musicTrackPath = path.join(workDir, 'music-track.mp3');
   await runFfmpeg(ffmpegPath, ['-y', '-f', 'lavfi', '-i', 'sine=frequency=150:duration=10', '-c:a', 'libmp3lame', musicTrackPath]);
 
-  await test('assembleUploadedClipsVideo mixes in background music, automatically ducked under non-silent clip audio', async () => {
+  await test('continueUploadedClipsAssembly mixes in background music, automatically ducked under non-silent clip audio', async () => {
     const twoClips = [
       { id: '1', url: toneClipPath, processedUrl: null },
       { id: '2', url: silentMiddleClipPath, processedUrl: null },
     ];
 
-    const baseline = await videoAssembly.assembleUploadedClipsVideo({ uploadedClips: twoClips, musicUrl: null, resolutionTier: '720p' });
+    const baseline = await runAssemblyToCompletion({ uploadedClips: twoClips, musicUrl: null, resolutionTier: '720p', jobId: 'test-job-music-a' });
     assert.strictEqual(baseline.status, 'completed', baseline.error || '');
     const baselinePath = path.join(workDir, 'assembled-no-music.mp4');
     fs.writeFileSync(baselinePath, baseline.buffer);
 
-    const withMusic = await videoAssembly.assembleUploadedClipsVideo({ uploadedClips: twoClips, musicUrl: musicTrackPath, resolutionTier: '720p' });
+    const withMusic = await runAssemblyToCompletion({
+      uploadedClips: twoClips,
+      musicUrl: musicTrackPath,
+      resolutionTier: '720p',
+      jobId: 'test-job-music-b',
+    });
     assert.strictEqual(withMusic.status, 'completed', withMusic.error || '');
     const withMusicPath = path.join(workDir, 'assembled-with-music.mp4');
     fs.writeFileSync(withMusicPath, withMusic.buffer);
@@ -341,6 +369,87 @@ async function main() {
       `expected music to be ducked down under clip 1's own audio (baseline ${toneBaseline}dB, with music ${toneWithMusic}dB) — ` +
         'automatic ducking does not appear to be working'
     );
+  });
+
+  // ---------------------------------------------------------------------
+  // continueUploadedClipsAssembly: RESUMABLE across calls (the real fix for
+  // the production bug — a real multi-clip job can exceed a serverless
+  // platform's own function-duration ceiling; confirmed live by a Vercel
+  // deployment killing a single-call assembly after its own 300-second
+  // limit) and staleness detection when the clip set changes mid-render.
+  // ---------------------------------------------------------------------
+
+  await test('continueUploadedClipsAssembly stops at the time budget and resumes on a later call without re-normalizing finished clips', async () => {
+    // More clips than CLIP_NORMALIZE_CONCURRENCY (4): mapWithConcurrencyUntilDeadline
+    // always starts one item per worker slot regardless of the deadline, so
+    // with only 3 clips every one of them would start immediately even with
+    // a near-zero budget. 5 clips guarantees at least the 5th must wait for
+    // a worker to free up — by which point the tiny budget has already
+    // passed — forcing a real, partial 'in_progress' result.
+    const clips = [
+      { id: '1', url: toneClipPath, processedUrl: null },
+      { id: '2', url: silentMiddleClipPath, processedUrl: null },
+      { id: '3', url: highToneClipPath, processedUrl: null },
+      { id: '4', url: toneClipPath, processedUrl: null },
+      { id: '5', url: silentMiddleClipPath, processedUrl: null },
+    ];
+
+    const first = await videoAssembly.continueUploadedClipsAssembly({
+      uploadedClips: clips,
+      musicUrl: null,
+      resolutionTier: '720p',
+      jobId: 'test-job-resume',
+      existingRender: null,
+      timeBudgetMs: 1,
+    });
+    assert.strictEqual(first.status, 'in_progress');
+    const completedAfterFirst = first.render.normalizedClips.filter((c) => c.status === 'completed').length;
+    assert.ok(completedAfterFirst >= 1 && completedAfterFirst < 5, `expected partial progress, got ${completedAfterFirst}/5`);
+    const urlsAfterFirst = first.render.normalizedClips.map((c) => c.url);
+
+    const final = await runAssemblyToCompletion({
+      uploadedClips: clips,
+      musicUrl: null,
+      resolutionTier: '720p',
+      jobId: 'test-job-resume',
+      existingRender: first.render,
+    });
+    assert.strictEqual(final.status, 'completed');
+
+    // Every clip that was already completed after the first call must keep
+    // the EXACT SAME stored url after resuming — proof it was never
+    // re-normalized, not just that the end result happens to look right.
+    first.render.normalizedClips.forEach((clip, i) => {
+      if (clip.status === 'completed') {
+        assert.strictEqual(final.render.normalizedClips[i].url, urlsAfterFirst[i], `clip ${i} must not be re-normalized on resume`);
+      }
+    });
+  });
+
+  await test('continueUploadedClipsAssembly discards stale progress and starts over when the clip set actually changes', async () => {
+    const originalClips = [{ id: '1', url: toneClipPath, processedUrl: null }];
+    const first = await runAssemblyToCompletion({
+      uploadedClips: originalClips,
+      musicUrl: null,
+      resolutionTier: '720p',
+      jobId: 'test-job-stale',
+    });
+    assert.strictEqual(first.status, 'completed');
+
+    const changedClips = [
+      { id: '1', url: toneClipPath, processedUrl: null },
+      { id: '2', url: silentMiddleClipPath, processedUrl: null },
+    ];
+    const second = await videoAssembly.continueUploadedClipsAssembly({
+      uploadedClips: changedClips,
+      musicUrl: null,
+      resolutionTier: '720p',
+      jobId: 'test-job-stale',
+      existingRender: first.render,
+    });
+    // A real, different clip set must never reuse the old 1-clip progress
+    // record — it must restart fresh, now sized for 2 clips.
+    assert.strictEqual(second.render.normalizedClips.length, 2);
   });
 
   // ---------------------------------------------------------------------
@@ -481,6 +590,142 @@ async function main() {
       : finalBody.clip.url;
     const actualDuration = await videoAssembly.getMediaDuration(localPath);
     assert.ok(Math.abs(actualDuration - expectedDuration) < 0.05, `expected duration ${expectedDuration}, got ${actualDuration}`);
+  });
+
+  // ---------------------------------------------------------------------
+  // Scene-number ordering: server.js's parseSceneNumberFromFilename /
+  // computeAutoClipOrder (auto-sort uploadedClips while unambiguous) and
+  // POST /:id/reorder-uploaded-clips (manual override, once and for all).
+  // ---------------------------------------------------------------------
+
+  async function uploadClip(jobId, filename) {
+    const res = await fetch(`${baseUrl}/api/jobs/${jobId}/upload-clip?filename=${encodeURIComponent(filename)}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'video/mp4' },
+      body: silentClipBuffer,
+    });
+    assert.strictEqual(res.status, 200, `upload of ${filename} failed`);
+    return res.json();
+  }
+
+  await test('parseSceneNumberFromFilename reads the scene number out of common filename shapes', () => {
+    assert.strictEqual(server.parseSceneNumberFromFilename('scene_01.mp4'), 1);
+    assert.strictEqual(server.parseSceneNumberFromFilename('Scene-2.mov'), 2);
+    assert.strictEqual(server.parseSceneNumberFromFilename('SCENE 03.webm'), 3);
+    assert.strictEqual(server.parseSceneNumberFromFilename('myscene10.mp4'), 10);
+    assert.strictEqual(server.parseSceneNumberFromFilename('intro.mp4'), null);
+    assert.strictEqual(server.parseSceneNumberFromFilename(null), null);
+  });
+
+  await test('computeAutoClipOrder sorts by scene number when every clip has one, and is null when ambiguous', () => {
+    const sorted = server.computeAutoClipOrder([
+      { id: 'a', sourceFilename: 'scene_03.mp4' },
+      { id: 'b', sourceFilename: 'scene_01.mp4' },
+      { id: 'c', sourceFilename: 'scene_02.mp4' },
+    ]);
+    assert.deepStrictEqual(sorted.map((clip) => clip.id), ['b', 'c', 'a']);
+
+    assert.strictEqual(
+      server.computeAutoClipOrder([{ id: 'a', sourceFilename: 'scene_01.mp4' }, { id: 'b', sourceFilename: 'clip.mp4' }]),
+      null,
+      'a clip with no parseable scene number must make the whole order ambiguous'
+    );
+    assert.strictEqual(
+      server.computeAutoClipOrder([
+        { id: 'a', sourceFilename: 'scene_01.mp4' },
+        { id: 'b', sourceFilename: 'scene_01.mp4' },
+      ]),
+      null,
+      'two clips sharing the same scene number must make the whole order ambiguous'
+    );
+  });
+
+  await test('POST /:id/upload-clip auto-sorts uploaded clips by scene number regardless of upload order', async () => {
+    const createRes = await fetch(`${baseUrl}/api/jobs/upload-compile`, { method: 'POST' });
+    const jobId = (await createRes.json()).job.id;
+
+    await uploadClip(jobId, 'scene_03.mp4');
+    await uploadClip(jobId, 'scene_01.mp4');
+    const { job } = await uploadClip(jobId, 'scene_02.mp4');
+
+    assert.deepStrictEqual(
+      job.uploadedClips.map((clip) => clip.sourceFilename),
+      ['scene_01.mp4', 'scene_02.mp4', 'scene_03.mp4']
+    );
+    assert.strictEqual(job.clipsManuallyOrdered, false);
+  });
+
+  await test('POST /:id/upload-clip leaves clips in upload order when filenames give no clear scene number', async () => {
+    const createRes = await fetch(`${baseUrl}/api/jobs/upload-compile`, { method: 'POST' });
+    const jobId = (await createRes.json()).job.id;
+
+    await uploadClip(jobId, 'beach-walk.mp4');
+    const { job } = await uploadClip(jobId, 'sunset.mp4');
+
+    assert.deepStrictEqual(job.uploadedClips.map((clip) => clip.sourceFilename), ['beach-walk.mp4', 'sunset.mp4']);
+  });
+
+  await test('POST /:id/upload-clip leaves clips in upload order when two filenames share the same scene number', async () => {
+    const createRes = await fetch(`${baseUrl}/api/jobs/upload-compile`, { method: 'POST' });
+    const jobId = (await createRes.json()).job.id;
+
+    await uploadClip(jobId, 'scene_01.mp4');
+    const { job } = await uploadClip(jobId, 'scene_01.mp4');
+
+    assert.deepStrictEqual(job.uploadedClips.map((clip) => clip.sourceFilename), ['scene_01.mp4', 'scene_01.mp4']);
+  });
+
+  await test('POST /:id/reorder-uploaded-clips rejects a set that does not exactly match the job\'s current clips', async () => {
+    const createRes = await fetch(`${baseUrl}/api/jobs/upload-compile`, { method: 'POST' });
+    const jobId = (await createRes.json()).job.id;
+    const { job } = await uploadClip(jobId, 'scene_01.mp4');
+    await uploadClip(jobId, 'scene_02.mp4');
+
+    const missingOne = await fetch(`${baseUrl}/api/jobs/${jobId}/reorder-uploaded-clips`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ clipIds: [job.uploadedClips[0].id] }),
+    });
+    assert.strictEqual(missingOne.status, 400);
+
+    const unknownId = await fetch(`${baseUrl}/api/jobs/${jobId}/reorder-uploaded-clips`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ clipIds: ['not-a-real-id', 'also-not-real'] }),
+    });
+    assert.strictEqual(unknownId.status, 400);
+  });
+
+  await test('POST /:id/reorder-uploaded-clips applies the manual order and disables further auto-sorting', async () => {
+    const createRes = await fetch(`${baseUrl}/api/jobs/upload-compile`, { method: 'POST' });
+    const jobId = (await createRes.json()).job.id;
+
+    // Ambiguous filenames, so these stay in upload order (A, B) until the
+    // user manually reorders them.
+    const uploadA = await uploadClip(jobId, 'intro.mp4');
+    const uploadB = await uploadClip(jobId, 'outro.mp4');
+    const clipAId = uploadA.clip.id;
+    const clipBId = uploadB.clip.id;
+    assert.deepStrictEqual(uploadB.job.uploadedClips.map((clip) => clip.id), [clipAId, clipBId]);
+
+    const reorderRes = await fetch(`${baseUrl}/api/jobs/${jobId}/reorder-uploaded-clips`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ clipIds: [clipBId, clipAId] }),
+    });
+    assert.strictEqual(reorderRes.status, 200);
+    const reorderedJob = (await reorderRes.json()).job;
+    assert.deepStrictEqual(reorderedJob.uploadedClips.map((clip) => clip.id), [clipBId, clipAId]);
+    assert.strictEqual(reorderedJob.clipsManuallyOrdered, true);
+
+    // A new clip whose filename WOULD sort first (scene_01) must still only
+    // be appended, not re-sorted in — the user's manual order is final.
+    const uploadC = await uploadClip(jobId, 'scene_01.mp4');
+    assert.deepStrictEqual(
+      uploadC.job.uploadedClips.map((clip) => clip.id),
+      [clipBId, clipAId, uploadC.clip.id]
+    );
+    assert.strictEqual(uploadC.job.clipsManuallyOrdered, true);
   });
 
   await test('POST /:id/select-clip-voiceovers rejects an unknown clip id', async () => {

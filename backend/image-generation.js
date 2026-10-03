@@ -283,14 +283,20 @@ async function generateImagesForPrompts({ imagePrompts, characters, existingImag
 // generateImagesForPrompts, and never fabricates a url on failure.
 async function generateThumbnailImage({ thumbnailConcept, thumbnailText, jobId }) {
   const promptParts = [
-    'Cinematic, eye-catching YouTube thumbnail image, bold composition, widescreen (16:9) framing, ' +
-      'high contrast, vibrant colors. ONE clear focal subject/moment, simple uncluttered background — ' +
-      'never a collage of multiple scenes or unrelated imagery crammed into one frame.',
+    'Realistic, cinematic, photo-like YouTube thumbnail — a genuine photograph-style scene with real ' +
+      'depth, texture, and detail, NOT an illustration, graphic, poster, or title card. Widescreen (16:9) ' +
+      'framing, high visual contrast, dramatic lighting. ONE strong focal subject filling the frame, ' +
+      'simple uncluttered background — never a collage of multiple scenes or unrelated imagery crammed ' +
+      'into one frame.',
     `Concept: ${thumbnailConcept}`,
   ];
   if (thumbnailText) {
     promptParts.push(
-      `If including text, render exactly this short text prominently and legibly, and nothing more: "${thumbnailText}"`
+      `Overlay this short caption naturally near the bottom of the photo-real scene, in bold legible ` +
+        `text layered on top of the photo — the way a real YouTube thumbnail captions a photo, never as ` +
+        `the main subject of the image: "${thumbnailText}". The scene behind it must stay a real, ` +
+        'detailed, photo-like environment — do NOT produce a plain text card, poster, title slide, or a ' +
+        'blank/plain-colored background with text on it.'
     );
   }
   const prompt = promptParts.join('\n');

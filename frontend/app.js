@@ -95,6 +95,7 @@
   const uploadClipsStatus = document.getElementById('upload-clips-status');
   const uploadClipsListPanel = document.getElementById('upload-clips-list-panel');
   const uploadClipsList = document.getElementById('upload-clips-list');
+  const uploadClipsOrderHint = document.getElementById('upload-clips-order-hint');
   const selectAllSilentBtn = document.getElementById('select-all-silent-btn');
   const uploadClipVoiceSelect = document.getElementById('upload-clip-voice');
   const uploadReviewCostBtn = document.getElementById('upload-review-cost-btn');
@@ -1082,10 +1083,33 @@
     return `${seconds.toFixed(1)}s`;
   }
 
-  function buildUploadClipListItem(clip) {
+  // Mirrors server.js's parseSceneNumberFromFilename/computeAutoClipOrder —
+  // purely so the UI can show an honest hint about why the clip order looks
+  // the way it does. The backend's own sort (applied on every upload) is
+  // what actually determines job.uploadedClips's order; this is cosmetic.
+  function parseSceneNumberFromFilename(filename) {
+    if (typeof filename !== 'string') return null;
+    const match = filename.match(/scene[\s_-]*0*(\d+)/i);
+    return match ? Number(match[1]) : null;
+  }
+
+  function clipOrderIsAmbiguous(clips) {
+    const seen = new Set();
+    for (const clip of clips) {
+      const sceneNumber = parseSceneNumberFromFilename(clip.sourceFilename);
+      if (sceneNumber === null || seen.has(sceneNumber)) return true;
+      seen.add(sceneNumber);
+    }
+    return false;
+  }
+
+  function buildUploadClipListItem(clip, index, total) {
     const li = document.createElement('li');
     li.className = 'upload-clip-item';
     li.dataset.clipId = clip.id;
+
+    const body = document.createElement('div');
+    body.className = 'upload-clip-item-body';
 
     const row = document.createElement('label');
     row.className = 'checkbox-field';
@@ -1099,34 +1123,59 @@
 
     const label = document.createElement('span');
     const audioBadge = clip.hasAudio ? '🔊 has audio' : '🔇 silent';
-    label.textContent = `${clip.sourceFilename || 'clip'} — ${formatClipDuration(clip.durationSeconds)} — ${audioBadge}`;
+    label.textContent = `${index + 1}. ${clip.sourceFilename || 'clip'} — ${formatClipDuration(clip.durationSeconds)} — ${audioBadge}`;
     row.appendChild(label);
-    li.appendChild(row);
+    body.appendChild(row);
 
     if (clip.voiceoverStatus === 'processing') {
       const status = document.createElement('p');
       status.className = 'field-hint';
       status.textContent = 'Generating voice-over…';
-      li.appendChild(status);
+      body.appendChild(status);
     } else if (clip.voiceoverStatus === 'completed') {
       const narration = document.createElement('p');
       narration.className = 'field-hint';
       narration.textContent = `Narration: "${clip.narrationText || ''}"`;
-      li.appendChild(narration);
+      body.appendChild(narration);
 
       if (clip.processedUrl) {
         const video = document.createElement('video');
         video.src = clip.processedUrl;
         video.controls = true;
         video.className = 'upload-clip-preview';
-        li.appendChild(video);
+        body.appendChild(video);
       }
     } else if (clip.voiceoverStatus === 'failed') {
       const status = document.createElement('p');
       status.className = 'field-hint';
       status.textContent = `Voice-over failed: ${clip.voiceoverError || 'unknown error'}`;
-      li.appendChild(status);
+      body.appendChild(status);
     }
+
+    li.appendChild(body);
+
+    const reorder = document.createElement('div');
+    reorder.className = 'upload-clip-reorder';
+
+    const upBtn = document.createElement('button');
+    upBtn.type = 'button';
+    upBtn.className = 'btn';
+    upBtn.textContent = '▲';
+    upBtn.disabled = index === 0;
+    upBtn.setAttribute('aria-label', `Move "${clip.sourceFilename || 'clip'}" earlier`);
+    upBtn.addEventListener('click', () => moveUploadedClip(clip.id, -1));
+    reorder.appendChild(upBtn);
+
+    const downBtn = document.createElement('button');
+    downBtn.type = 'button';
+    downBtn.className = 'btn';
+    downBtn.textContent = '▼';
+    downBtn.disabled = index === total - 1;
+    downBtn.setAttribute('aria-label', `Move "${clip.sourceFilename || 'clip'}" later`);
+    downBtn.addEventListener('click', () => moveUploadedClip(clip.id, 1));
+    reorder.appendChild(downBtn);
+
+    li.appendChild(reorder);
 
     return li;
   }
@@ -1135,7 +1184,50 @@
     const clips = job && Array.isArray(job.uploadedClips) ? job.uploadedClips : [];
     uploadClipsList.innerHTML = '';
     uploadClipsListPanel.hidden = clips.length === 0;
-    clips.forEach((clip) => uploadClipsList.appendChild(buildUploadClipListItem(clip)));
+    clips.forEach((clip, index) => uploadClipsList.appendChild(buildUploadClipListItem(clip, index, clips.length)));
+
+    if (clips.length === 0) {
+      uploadClipsOrderHint.hidden = true;
+    } else if (job.clipsManuallyOrdered) {
+      uploadClipsOrderHint.hidden = false;
+      uploadClipsOrderHint.textContent = 'Clip order set manually — use the ▲▼ buttons to adjust it further.';
+    } else if (clipOrderIsAmbiguous(clips)) {
+      uploadClipsOrderHint.hidden = false;
+      uploadClipsOrderHint.textContent =
+        'Couldn\'t tell these clips\' intended order from their filenames — name them like "scene_01.mp4", ' +
+        '"scene_02.mp4", or reorder them manually with the ▲▼ buttons below.';
+    } else {
+      uploadClipsOrderHint.hidden = false;
+      uploadClipsOrderHint.textContent = 'Clips sorted automatically by scene number — use the ▲▼ buttons to override.';
+    }
+  }
+
+  // Swaps clipId with its neighbor in `direction` (-1 earlier, +1 later) and
+  // persists the new order via POST /:id/reorder-uploaded-clips, which also
+  // permanently switches this job off automatic scene-number sorting.
+  async function moveUploadedClip(clipId, direction) {
+    if (!uploadJobId) return;
+    const clipIds = Array.from(uploadClipsList.querySelectorAll('.upload-clip-item')).map((li) => li.dataset.clipId);
+    const index = clipIds.indexOf(clipId);
+    const swapWith = index + direction;
+    if (index === -1 || swapWith < 0 || swapWith >= clipIds.length) return;
+    [clipIds[index], clipIds[swapWith]] = [clipIds[swapWith], clipIds[index]];
+
+    try {
+      const res = await fetch(`/api/jobs/${uploadJobId}/reorder-uploaded-clips`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ clipIds }),
+      });
+      const body = await res.json();
+      if (!res.ok) {
+        setUploadClipsStatus(body.error || 'Could not reorder these clips. Please try again.');
+        return;
+      }
+      renderUploadClipsList(body.job);
+    } catch (error) {
+      setUploadClipsStatus('Something went wrong reordering these clips. Please try again.');
+    }
   }
 
   // A real scene clip easily exceeds a serverless platform's own
@@ -1367,9 +1459,20 @@
 
       jobId = uploadJobId;
       storeJobId(jobId);
+      // A real multi-clip job can take longer to assemble than one request
+      // safely allows — the backend reports 'processing' and expects to be
+      // called again to continue (see video-assembly.js's
+      // continueUploadedClipsAssembly). pollSimpleStoryRenderProgress
+      // already drives exactly that polling loop to completion generically
+      // (it only looks at finalVideo.status, not which mode produced it),
+      // the same mechanism Simple Story Video's own long renders use.
       uploadCompileStatus.className = 'generate-status success';
-      uploadCompileStatus.textContent = 'Done — see the Final Review tab below.';
+      uploadCompileStatus.textContent =
+        body.finalVideo && body.finalVideo.status === 'processing'
+          ? 'Compiling… this can take a few minutes for several clips. Watch progress on the Final Review tab.'
+          : 'Done — see the Final Review tab below.';
       renderAllCards(body);
+      pollSimpleStoryRenderProgress(body);
     } catch (error) {
       uploadCompileStatus.className = 'generate-status error';
       uploadCompileStatus.textContent = 'Something went wrong compiling the final video. Please try again.';
@@ -1617,11 +1720,21 @@
       finalVideoPlayer.hidden = true;
       finalVideoPlayer.removeAttribute('src');
       finalVideoDownload.hidden = true;
-      const render = job.simpleStoryRender;
+      // Reads whichever mode's own resumable render progress is actually
+      // relevant for this job — Simple Story Video's per-section progress,
+      // or Upload & Compile's per-clip normalization progress — using the
+      // SAME completed/total display logic either way.
+      const uploadedClipsRender = job.uploadedClipsRender;
+      const hasUploadedClipsProgress =
+        uploadedClipsRender && Array.isArray(uploadedClipsRender.normalizedClips) && uploadedClipsRender.normalizedClips.length > 0;
+      const render = hasUploadedClipsProgress
+        ? { sections: uploadedClipsRender.normalizedClips, totalSections: uploadedClipsRender.normalizedClips.length }
+        : job.simpleStoryRender;
+      const unitLabel = hasUploadedClipsProgress ? 'clip' : 'section';
       const completed = render && Array.isArray(render.sections) ? render.sections.filter((s) => s && s.status === 'completed').length : 0;
       const total = render && typeof render.totalSections === 'number' ? render.totalSections : null;
       finalVideoStatus.textContent = total
-        ? `Rendering final video… ${completed}/${total} section(s) done so far. This can take a few minutes for a long story.`
+        ? `Rendering final video… ${completed}/${total} ${unitLabel}${total === 1 ? '' : 's'} done so far. This can take a few minutes.`
         : 'Rendering final video…';
       finalVideoStatus.className = 'generate-status loading';
       finalVideoStatus.hidden = false;

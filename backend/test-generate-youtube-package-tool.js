@@ -88,6 +88,7 @@ let anthropicResponder = (body, res) => {
 
 let openAiRequestCount = 0;
 let openAiShouldFail = false;
+let lastOpenAiPrompt = null;
 
 async function main() {
   const anthropicServer = await startMockServer((req, res) => {
@@ -114,8 +115,14 @@ async function main() {
 
   const openAiServer = await startMockServer((req, res) => {
     openAiRequestCount++;
-    req.on('data', () => {});
+    const chunks = [];
+    req.on('data', (chunk) => chunks.push(chunk));
     req.on('end', () => {
+      try {
+        lastOpenAiPrompt = JSON.parse(Buffer.concat(chunks).toString('utf8')).prompt || null;
+      } catch (error) {
+        lastOpenAiPrompt = null;
+      }
       if (openAiShouldFail) {
         res.writeHead(500, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ error: { message: 'simulated OpenAI image outage' } }));
@@ -193,6 +200,30 @@ async function main() {
     // same as scene images and voice-over audio.
     assert.ok(persisted.youtubePackage.thumbnailUrl && persisted.youtubePackage.thumbnailUrl.startsWith('/generated/image-'));
     assert.strictEqual(persisted.youtubePackage.generatedFromScript, REAL_SCRIPT);
+  });
+
+  // Regression for a real production thumbnail coming back as a plain
+  // cream text card ("Part One: The Islands") instead of an actual photo-
+  // like scene — see image-generation.js's generateThumbnailImage. Asserts
+  // on the REAL prompt text sent to OpenAI (captured by the mock server
+  // above), not just that a call happened.
+  await test('generateThumbnailImage\'s real prompt asks for a photo-like scene with the caption as an overlay, never a text card', async () => {
+    const job = await jobStore.createJob();
+    await jobStore.updateJob(job.id, { topic: 'The old lighthouse', script: REAL_SCRIPT });
+
+    await app.executeTool('generateYoutubePackage', job.id, {});
+
+    assert.ok(lastOpenAiPrompt, 'expected the thumbnail image call to have a captured prompt');
+    const promptLower = lastOpenAiPrompt.toLowerCase();
+    assert.ok(promptLower.includes('photo-like') || promptLower.includes('photograph'), 'must ask for a realistic, photo-like scene');
+    assert.ok(promptLower.includes('16:9'), 'must keep the 16:9 YouTube thumbnail framing');
+    assert.ok(promptLower.includes('focal subject'), 'must still ask for one strong focal subject');
+    assert.ok(lastOpenAiPrompt.includes('A CENTURY OF LIGHT'), 'the real thumbnailText must still reach the prompt');
+    assert.ok(promptLower.includes('overlay'), 'the caption must be requested as an overlay on the photo, not the whole image');
+    assert.ok(!promptLower.includes('nothing more'), 'must no longer tell the model to render the text and nothing else');
+    assert.ok(promptLower.includes('not produce a plain text card') || promptLower.includes('do not produce a plain text card'), 'must explicitly forbid a plain text card');
+    assert.ok(promptLower.includes('poster'), 'must explicitly forbid a poster-style result');
+    assert.ok(promptLower.includes('blank') || promptLower.includes('plain-colored background'), 'must explicitly forbid a blank/plain background');
   });
 
   await test('generateYoutubePackage is a free no-op on a second call with an unchanged script — never re-spends a real call', async () => {
