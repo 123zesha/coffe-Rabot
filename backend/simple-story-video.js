@@ -58,6 +58,7 @@ const {
   prepareMusicTrack,
   duckAndMixMusicWithVoiceover,
   MUSIC_VOLUME_WITH_VOICEOVER,
+  mapWithConcurrencyUntilDeadline,
 } = require('./video-assembly');
 const videoStorage = require('./video-storage');
 
@@ -363,40 +364,13 @@ const SECTION_RENDER_CONCURRENCY = 4;
 // predictable regardless of how many sections remain.
 const RENDER_TIME_BUDGET_MS = 200000;
 
-// Runs `mapper` over `items` with at most `limit` calls in flight at once,
-// resolving to results in the SAME ORDER as `items` regardless of which
-// call finishes first — required here because sectionPaths must stay in
-// story order for the concat step below. A rejection from any call rejects
-// the whole call, same as Promise.all.
-//
-// `deadlineAt` (a Date.now()-comparable timestamp, or null/undefined for no
-// deadline) stops STARTING new work once passed, letting anything already
-// in flight finish — always starts at least one item per worker slot
-// first, so a deadline that has already passed on entry still makes real
-// forward progress instead of doing nothing. `results[i]` stays undefined
-// for any item never started; the caller tells those apart from real
-// results by index, the same way it knows items[i] was never processed.
-async function mapWithConcurrencyUntilDeadline(items, limit, deadlineAt, mapper) {
-  const results = new Array(items.length);
-  let nextIndex = 0;
-  let startedCount = 0;
-
-  async function worker() {
-    while (nextIndex < items.length) {
-      if (startedCount > 0 && deadlineAt && Date.now() >= deadlineAt) {
-        return;
-      }
-      const currentIndex = nextIndex++;
-      startedCount++;
-      results[currentIndex] = await mapper(items[currentIndex], currentIndex);
-    }
-  }
-
-  const workerCount = Math.max(1, Math.min(limit, items.length));
-  await Promise.all(Array.from({ length: workerCount }, worker));
-
-  return results;
-}
+// mapWithConcurrencyUntilDeadline now lives in video-assembly.js (imported
+// above) — backend/upload-compile's own resumable assembly needed the exact
+// same "bounded concurrency, order-preserving, deadline-aware" scheduler,
+// and video-assembly.js has no dependency on this module, so moving it
+// there (rather than duplicating it) avoids a circular require between the
+// two. Re-exported below unchanged so existing callers/tests of this
+// module keep working exactly as before.
 
 function runFfmpeg(args) {
   return new Promise((resolve, reject) => {

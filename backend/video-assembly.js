@@ -220,6 +220,42 @@ async function concatenateAudioBuffers(buffers) {
   }
 }
 
+// Runs `mapper` over `items` with at most `limit` calls in flight at once,
+// resolving to results in the SAME ORDER as `items` regardless of which
+// call finishes first. A rejection from any call rejects the whole call,
+// same as Promise.all.
+//
+// `deadlineAt` (a Date.now()-comparable timestamp, or null/undefined for no
+// deadline) stops STARTING new work once passed, letting anything already
+// in flight finish — always starts at least one item per worker slot
+// first, so a deadline that has already passed on entry still makes real
+// forward progress instead of doing nothing. `results[i]` stays undefined
+// for any item never started; the caller tells those apart from real
+// results by index. Shared by simple-story-video.js's own resumable
+// section rendering and this module's own continueUploadedClipsAssembly —
+// one real scheduler, not a second copy.
+async function mapWithConcurrencyUntilDeadline(items, limit, deadlineAt, mapper) {
+  const results = new Array(items.length);
+  let nextIndex = 0;
+  let startedCount = 0;
+
+  async function worker() {
+    while (nextIndex < items.length) {
+      if (startedCount > 0 && deadlineAt && Date.now() >= deadlineAt) {
+        return;
+      }
+      const currentIndex = nextIndex++;
+      startedCount++;
+      results[currentIndex] = await mapper(items[currentIndex], currentIndex);
+    }
+  }
+
+  const workerCount = Math.max(1, Math.min(limit, items.length));
+  await Promise.all(Array.from({ length: workerCount }, worker));
+
+  return results;
+}
+
 function runFfmpeg(args) {
   return new Promise((resolve, reject) => {
     execFile(ffmpegPath, args, { maxBuffer: 1024 * 1024 * 64 }, (error, stdout, stderr) => {
@@ -666,6 +702,31 @@ async function assembleFinalVideo({ clips, voiceover, burnInSubtitlesContent, ou
   }
 }
 
+// How long one continueUploadedClipsAssembly call may spend STARTING new
+// per-clip normalization work before stopping and reporting 'in_progress'
+// for the caller to resume later — the same real production failure mode
+// simple-story-video.js's own RENDER_TIME_BUDGET_MS exists for: a real
+// multi-clip job's full encode (each clip re-encoded to a common canvas)
+// can exceed a serverless platform's own function-duration ceiling
+// (confirmed live: a Vercel deployment killed a single-call assembly after
+// its own 300s limit). 200s leaves real margin under that for the final
+// concat/music/verify/response work once every clip is already normalized.
+const CLIP_ASSEMBLY_TIME_BUDGET_MS = 200000;
+// How many clips are normalized in parallel per call — mirrors simple-story-
+// video.js's own SECTION_RENDER_CONCURRENCY reasoning: real wall-clock
+// speedup without saturating the function's own CPU/memory on a platform
+// where both are modest.
+const CLIP_NORMALIZE_CONCURRENCY = 4;
+
+function freshUploadedClipsRenderProgress(clipsSnapshot, clipCount) {
+  return {
+    status: 'in_progress',
+    clipsSnapshot,
+    normalizedClips: Array.from({ length: clipCount }, () => ({ status: 'pending', url: null })),
+    error: null,
+  };
+}
+
 // Assembles "Upload & Compile" mode's real, user-uploaded scene clips (see
 // job-store.js's VIDEO_MODES 'uploaded-clips' and its uploadedClips field)
 // into one final MP4, in the exact order they were uploaded — this mode has
@@ -676,108 +737,169 @@ async function assembleFinalVideo({ clips, voiceover, burnInSubtitlesContent, ou
 // a clip with a completed processedUrl (see backend/clip-voiceover.js) uses
 // that real AI-narrated copy; any other clip uses its own ORIGINAL audio
 // untouched (real dialogue/sound it already had, or genuine silence if it
-// had none) — never a fabricated or borrowed track. This is why every
-// normalized segment below is given its own real or silent audio stream
-// (via ffmpeg's aevalsrc source filter for a clip with no audio stream at
-// all) before concatenation: ffmpeg's concat filter requires every joined
-// segment to carry the same stream layout (here, exactly one video + one
-// audio stream each), so a genuinely silent clip still needs a real,
-// locally-generated silent audio stream of its own exact duration to
-// concatenate cleanly — this never adds narration or borrows another
-// clip's audio, only true digital silence.
+// had none) — never a fabricated or borrowed track.
+//
+// RESUMABLE, exactly like simple-story-video.js's own
+// continueSimpleStoryVideoAssembly, and for the identical real reason: a
+// real job with many clips, each needing its own full ffmpeg re-encode to a
+// common canvas, can take longer than a single serverless invocation safely
+// allows. Each clip is normalized (scaled/padded to the output canvas, its
+// own audio formatted or real silence generated via ffmpeg's aevalsrc
+// source filter if it has none) via its OWN ffmpeg call and durably stored
+// the moment it finishes — never redone on a later call — then, once every
+// clip is normalized, concatenated with a fast, lossless `-c copy` (safe
+// because every normalized clip now shares identical codec/resolution/fps)
+// and optionally mixed with music.
 //
 // musicUrl: optional, resolved by the caller (backend/music-library.js) —
 // same shapes/behavior as assembleFinalVideo's own musicUrl, ducked under
 // the COMBINED per-clip audio (whatever mix of narration/original audio/
 // silence each clip actually carries) via the same sidechaincompress-based
 // duckAndMixMusicWithVoiceover this module already uses for every other
-// mode, so there is exactly one real ducking implementation in this app.
+// mode, so there is exactly one real ducking implementation in this app —
+// mixed in only once, after every clip is normalized and concatenated,
+// never per clip (music has no effect on any one clip's own pixels).
 //
-// Returns { status: 'completed', buffer, error: null } or
-// { status: 'failed', buffer: null, error } — same contract as
-// assembleFinalVideo. Never fabricates a buffer.
-async function assembleUploadedClipsVideo({ uploadedClips, musicUrl, resolutionTier }) {
+// existingRender: the job's own persisted job.uploadedClipsRender, or null/
+// undefined for a fresh job. A real change to which clips exist or their
+// own url/processedUrl (a voice-over finishing, a new clip added) is
+// detected via clipsSnapshot and discards stale progress — cheap to redo
+// (each clip re-encodes in seconds), the same "never serve stale progress"
+// discipline simple-story-video.js's own isStale check uses.
+//
+// Returns one of:
+//   { status: 'completed', buffer, render } — buffer is the real assembled
+//     MP4's raw bytes (see assembleFinalVideo's own comment for why this is
+//     deliberately a buffer, not a url); render is the final, completed
+//     progress record to persist.
+//   { status: 'in_progress', render } — real progress may have been made,
+//     but clips remain; the caller persists `render` onto
+//     job.uploadedClipsRender and must call this again later to continue.
+//   { status: 'failed', error, render } — a real failure; render still
+//     reflects whatever clips completed before the failure, so a retry
+//     never re-normalizes them.
+// Never fabricates a buffer or a completed clip.
+async function continueUploadedClipsAssembly({ uploadedClips, musicUrl, resolutionTier, existingRender, jobId, timeBudgetMs }) {
   if (!Array.isArray(uploadedClips) || uploadedClips.length === 0) {
-    return { buffer: null, status: 'failed', error: 'No uploaded clips were provided to assemble.' };
+    return { status: 'failed', error: 'No uploaded clips were provided to assemble.', render: existingRender || null };
   }
+
+  const clipsSnapshot = JSON.stringify(
+    uploadedClips.map((clip) => ({ id: clip.id, url: clip.url, processedUrl: clip.processedUrl || null }))
+  );
+  const isStale = !existingRender || existingRender.clipsSnapshot !== clipsSnapshot;
+  const render = isStale
+    ? freshUploadedClipsRenderProgress(clipsSnapshot, uploadedClips.length)
+    : {
+        ...existingRender,
+        normalizedClips: existingRender.normalizedClips.map((clip) => ({ ...clip })),
+        status: 'in_progress',
+        error: null,
+      };
 
   const [outputWidth, outputHeight] = resolveOutputDimensions(DEFAULT_OUTPUT_FORMAT, resolutionTier);
   const workDir = fs.mkdtempSync(path.join(os.tmpdir(), 'upload-compile-assembly-'));
 
+  const assemblyStart = Date.now();
+  const elapsedSeconds = () => ((Date.now() - assemblyStart) / 1000).toFixed(1);
+  const log = (message) => console.log(`Upload & Compile assembly: ${message} (${elapsedSeconds()}s elapsed)`);
+
   try {
-    const clipPaths = [];
-    const clipDurations = [];
-    const clipHasAudio = [];
+    log(`starting, ${uploadedClips.length} clip(s), resuming existing progress: ${!isStale}`);
 
-    for (let i = 0; i < uploadedClips.length; i++) {
-      const clip = uploadedClips[i];
-      // A clip with a completed AI voice-over uses that narrated copy
-      // (video + the new narration audio, already muxed in by
-      // backend/clip-voiceover.js); every other clip uses its own original
-      // upload, untouched — its own audio (if any) stays exactly as
-      // uploaded.
-      const sourceUrl = clip.processedUrl || clip.url;
-      const clipPath = path.join(workDir, `clip-${i}.mp4`);
-      await fetchToFile(sourceUrl, clipPath);
-      clipPaths.push(clipPath);
-      clipDurations.push(await getMediaDuration(clipPath));
-      const { hasAudioStream } = await probeStreamTypes(clipPath);
-      clipHasAudio.push(hasAudioStream);
+    const pendingIndexes = uploadedClips.map((_, i) => i).filter((i) => render.normalizedClips[i].status !== 'completed');
+    log(`${uploadedClips.length - pendingIndexes.length} clip(s) already normalized from a previous call`);
+
+    if (pendingIndexes.length > 0) {
+      const deadlineAt = Date.now() + (timeBudgetMs > 0 ? timeBudgetMs : CLIP_ASSEMBLY_TIME_BUDGET_MS);
+      let normalizedThisCall = 0;
+
+      await mapWithConcurrencyUntilDeadline(pendingIndexes, CLIP_NORMALIZE_CONCURRENCY, deadlineAt, async (i) => {
+        const clip = uploadedClips[i];
+        // A clip with a completed AI voice-over uses that narrated copy
+        // (video + the new narration audio, already muxed in by
+        // backend/clip-voiceover.js); every other clip uses its own
+        // original upload, untouched.
+        const sourceUrl = clip.processedUrl || clip.url;
+        const inputPath = path.join(workDir, `input-${i}.mp4`);
+        await fetchToFile(sourceUrl, inputPath);
+        const duration = await getMediaDuration(inputPath);
+        const { hasAudioStream } = await probeStreamTypes(inputPath);
+
+        // Every normalized clip must come out with exactly one video +
+        // one audio stream, in the SAME format, so the later `-c copy`
+        // concat (safe only when every segment already matches) never
+        // needs a layout-mismatch re-encode. A clip with no audio stream
+        // of its own gets real, locally-generated silence of its own
+        // exact duration (aevalsrc) — never fabricated narration or
+        // another clip's audio.
+        const audioFilter = hasAudioStream
+          ? `[0:a]aformat=sample_rates=44100:channel_layouts=mono[a]`
+          : `aevalsrc=0:d=${duration.toFixed(3)}:s=44100[a]`;
+        const outPath = path.join(workDir, `normalized-${i}.mp4`);
+        await runFfmpeg([
+          '-y',
+          '-i',
+          inputPath,
+          '-filter_complex',
+          `[0:v]scale=${outputWidth}:${outputHeight}:force_original_aspect_ratio=decrease:flags=lanczos,` +
+            `pad=${outputWidth}:${outputHeight}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=${OUTPUT_FPS}[v];${audioFilter}`,
+          '-map',
+          '[v]',
+          '-map',
+          '[a]',
+          '-c:v',
+          'libx264',
+          '-preset',
+          'veryfast',
+          '-pix_fmt',
+          'yuv420p',
+          '-c:a',
+          'aac',
+          outPath,
+        ]);
+
+        const buffer = fs.readFileSync(outPath);
+        const url = await videoStorage.storeNormalizedUploadedClip(buffer, jobId, clip.id);
+        render.normalizedClips[i] = { status: 'completed', url };
+        normalizedThisCall++;
+        log(`normalized clip ${i + 1}/${uploadedClips.length} (${normalizedThisCall} this call)`);
+      });
     }
 
-    let musicSourcePath = null;
-    if (musicUrl) {
-      musicSourcePath = path.join(workDir, 'music-input');
-      await fetchToFile(musicUrl, musicSourcePath);
+    const stillPending = render.normalizedClips.some((clip) => clip.status !== 'completed');
+    if (stillPending) {
+      log('time budget reached with clips still pending — stopping for this call, will resume on the next one');
+      return { status: 'in_progress', render };
     }
+    log(`all ${uploadedClips.length} clip(s) normalized`);
 
-    const inputArgs = clipPaths.flatMap((clipPath) => ['-i', clipPath]);
+    // Every clip is normalized and durably stored — download each one's
+    // real bytes back (some may have been normalized in an EARLIER call,
+    // whose own /tmp is long gone by now) into this call's own workDir,
+    // then concatenate. `-c copy` is safe (and fast — no re-encode) exactly
+    // because every normalized clip now shares identical codec/resolution/
+    // fps/sample-rate from the per-clip encode above.
+    const normalizedPaths = [];
+    for (let i = 0; i < render.normalizedClips.length; i++) {
+      const normalizedPath = path.join(workDir, `concat-input-${i}.mp4`);
+      await fetchToFile(render.normalizedClips[i].url, normalizedPath);
+      normalizedPaths.push(normalizedPath);
+    }
+    log('all normalized clips fetched for concatenation');
 
-    const videoFilters = clipPaths.map(
-      (_, i) =>
-        `[${i}:v]scale=${outputWidth}:${outputHeight}:force_original_aspect_ratio=decrease:flags=lanczos,` +
-        `pad=${outputWidth}:${outputHeight}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=${OUTPUT_FPS}[v${i}]`
-    );
-    // Every clip must contribute exactly one audio stream for concat's
-    // a=1 below to work, even a clip with none of its own — real silence
-    // of that EXACT clip's own duration (aevalsrc, a local ffmpeg source
-    // filter — no extra input file needed), mono at 44.1kHz to match every
-    // real audio stream's own format below, so concat never fails on a
-    // layout mismatch between a real track and a generated silent one.
-    const audioFilters = clipPaths.map((_, i) =>
-      clipHasAudio[i]
-        ? `[${i}:a]aformat=sample_rates=44100:channel_layouts=mono[a${i}]`
-        : `aevalsrc=0:d=${clipDurations[i].toFixed(3)}:s=44100[a${i}]`
-    );
-
-    const concatRefs = clipPaths.map((_, i) => `[v${i}][a${i}]`).join('');
-    const filterComplex =
-      `${videoFilters.join(';')};${audioFilters.join(';')};` +
-      `${concatRefs}concat=n=${clipPaths.length}:v=1:a=1[outv][outa]`;
-
+    const listPath = path.join(workDir, 'clips.txt');
+    fs.writeFileSync(listPath, normalizedPaths.map((p) => `file '${p.replace(/'/g, "'\\''")}'`).join('\n'), 'utf8');
     const concatenatedPath = path.join(workDir, 'concatenated.mp4');
-    await runFfmpeg([
-      '-y',
-      ...inputArgs,
-      '-filter_complex',
-      filterComplex,
-      '-map',
-      '[outv]',
-      '-map',
-      '[outa]',
-      '-c:v',
-      'libx264',
-      '-pix_fmt',
-      'yuv420p',
-      '-c:a',
-      'aac',
-      concatenatedPath,
-    ]);
+    await runFfmpeg(['-y', '-f', 'concat', '-safe', '0', '-i', listPath, '-c', 'copy', concatenatedPath]);
+    log('clips concatenated');
 
     let finalPath = concatenatedPath;
 
-    if (musicSourcePath) {
+    if (musicUrl) {
       const totalDuration = await getMediaDuration(concatenatedPath);
+      const musicSourcePath = path.join(workDir, 'music-input');
+      await fetchToFile(musicUrl, musicSourcePath);
 
       const combinedAudioPath = path.join(workDir, 'combined-audio.m4a');
       await runFfmpeg(['-y', '-i', concatenatedPath, '-vn', '-c:a', 'aac', combinedAudioPath]);
@@ -806,6 +928,7 @@ async function assembleUploadedClipsVideo({ uploadedClips, musicUrl, resolutionT
         '-shortest',
         finalPath,
       ]);
+      log('background music mixed in');
     }
 
     const buffer = fs.readFileSync(finalPath);
@@ -817,14 +940,14 @@ async function assembleUploadedClipsVideo({ uploadedClips, musicUrl, resolutionT
     if (!verification.ok) {
       const message = `Assembly finished but failed verification: ${verification.reason}`;
       console.error('Upload & Compile final video assembly error:', JSON.stringify({ message }, null, 2));
-      return { buffer: null, status: 'failed', error: message };
+      return { status: 'failed', error: message, render: { ...render, status: 'failed', error: message } };
     }
 
-    return { buffer, status: 'completed', error: null };
+    return { status: 'completed', buffer, render: { ...render, status: 'completed' } };
   } catch (error) {
     const message = (error && error.message) || 'Unknown error assembling the final video.';
     console.error('Upload & Compile final video assembly error:', JSON.stringify({ message }, null, 2));
-    return { buffer: null, status: 'failed', error: message };
+    return { status: 'failed', error: message, render: { ...render, status: 'failed', error: message } };
   } finally {
     fs.rmSync(workDir, { recursive: true, force: true });
   }
@@ -883,7 +1006,12 @@ async function getUrlMediaDurationSeconds(url) {
 
 module.exports = {
   assembleFinalVideo,
-  assembleUploadedClipsVideo,
+  continueUploadedClipsAssembly,
+  // Exported so simple-story-video.js's own resumable section rendering can
+  // reuse the EXACT same bounded-concurrency, deadline-aware scheduler this
+  // module's own continueUploadedClipsAssembly uses — one real scheduler,
+  // never a second copy.
+  mapWithConcurrencyUntilDeadline,
   getMediaDuration,
   getUrlMediaDurationSeconds,
   verifyAssembledVideoBuffer,

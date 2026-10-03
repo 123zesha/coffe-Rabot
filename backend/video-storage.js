@@ -178,6 +178,20 @@ async function storeProcessedClipFile(buffer, jobId, clipId, options) {
   return storeMediaFile(buffer, `processed-clip-${jobId}-${clipId}`, options);
 }
 
+// Stores one "Upload & Compile" clip's real bytes AFTER it has been
+// normalized to the job's output canvas (see video-assembly.js's
+// continueUploadedClipsAssembly) — scaled/padded to a common resolution/fps
+// with its own real-or-silent audio formatted consistently, so every
+// normalized clip can later be concatenated with a fast, lossless `-c copy`
+// rather than a second re-encode. This is durable, resumable-render
+// storage, the same role storeSimpleStorySectionClip plays for Simple Story
+// Video's own per-section progress: a clip already normalized in an earlier
+// call is never re-encoded just because the job's overall video needed more
+// than one call to finish.
+async function storeNormalizedUploadedClip(buffer, jobId, clipId, options) {
+  return storeMediaFile(buffer, `normalized-clip-${jobId}-${clipId}`, options);
+}
+
 module.exports = {
   storeFinalVideo,
   storeSceneClip,
@@ -188,6 +202,7 @@ module.exports = {
   storeUploadedBackgroundImageFile,
   storeUploadedClipFile,
   storeProcessedClipFile,
+  storeNormalizedUploadedClip,
   storeImageFile,
   hasBlobToken,
   GENERATED_DIR,

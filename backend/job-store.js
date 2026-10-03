@@ -118,6 +118,8 @@ const JOB_FIELDS = [
   'clipVoiceoverVoice',
   'clipVoiceoverBatch',
   'pendingClipUploads',
+  'uploadedClipsRender',
+  'clipsManuallyOrdered',
 ];
 
 // The only real, supported output-format values — 'horizontal' (16:9),
@@ -700,7 +702,7 @@ function createDefaultJob(id) {
     // chatToVideoAutoPipeline above.
     voiceSource: 'ai',
     // 'uploaded-clips' mode only (see VIDEO_MODES above): the real clips the
-    // user uploaded, in upload order — { id, url, sourceFilename,
+    // user uploaded — { id, url, sourceFilename,
     // contentType, durationSeconds, hasAudio, voiceoverSelected,
     // voiceoverStatus, voiceoverUrl, processedUrl, narrationText,
     // voiceoverError }. Not writable by the conversational agent or the
@@ -709,6 +711,18 @@ function createDefaultJob(id) {
     // per-clip generation route (POST /:id/generate-clip-voiceovers)
     // changes an existing entry's voiceover*/processedUrl/narrationText
     // fields.
+    // The ARRAY ORDER here is exactly the order continueUploadedClipsAssembly
+    // (video-assembly.js) stitches clips in, and exactly what the frontend
+    // clip list displays — one single source of truth for clip order, never
+    // a separate "sort index" field. Each time a clip finishes uploading,
+    // POST /:id/upload-clip re-sorts this array by the scene number parsed
+    // from every clip's sourceFilename (see parseSceneNumberFromFilename in
+    // server.js) — but ONLY while clipsManuallyOrdered below is false, and
+    // ONLY when every clip in the job has its own clear, distinct scene
+    // number; a clip with no parseable number, or two clips sharing one, is
+    // ambiguous and leaves the whole array in plain upload order instead of
+    // guessing — POST /:id/reorder-uploaded-clips then lets the user fix it
+    // by hand.
     // - hasAudio: real, measured (ffmpeg probeStreamTypes) at upload time —
     //   whether the file already has an audio stream. Drives the "select
     //   all silent clips" quick action and a client-side warning when a
@@ -726,6 +740,14 @@ function createDefaultJob(id) {
     //   overwritten, so the original upload stays available even after a
     //   voice-over is generated (or regenerated) for it.
     uploadedClips: [],
+    // 'uploaded-clips' mode only: false until the user explicitly reorders
+    // their clips by hand (POST /:id/reorder-uploaded-clips), permanently
+    // true from then on for this job. While false, POST /:id/upload-clip
+    // keeps auto-sorting uploadedClips above by each filename's scene
+    // number; once true, a later upload is simply appended instead, so a
+    // manual reorder the user already made is never silently undone by the
+    // next file they add.
+    clipsManuallyOrdered: false,
     // 'uploaded-clips' mode only: the ONE AI voice (see
     // data/video-options.json -> voiceOverOptions) applied to every clip
     // whose voice-over is generated in a batch — chosen once per batch (see
@@ -763,6 +785,31 @@ function createDefaultJob(id) {
     // agent or the generic updateVideoJob field-setter — purely internal,
     // transient upload-route bookkeeping.
     pendingClipUploads: {},
+    // 'uploaded-clips' mode only: durable, RESUMABLE progress for the final
+    // assembly step (see video-assembly.js's continueUploadedClipsAssembly)
+    // — the same reason simpleStoryRender exists for Simple Story Video: a
+    // real job with several clips, each needing its own full ffmpeg
+    // re-encode, can take longer than one serverless invocation safely
+    // allows (confirmed live: a Vercel deployment killed a single-call
+    // assembly after its own 300-second limit). status: 'in_progress' |
+    // 'completed' | 'failed'. normalizedClips: one entry per uploadedClips
+    // entry, in the SAME order — { status: 'pending' | 'completed', url },
+    // url only ever set once that clip's real normalized copy was rendered
+    // AND durably stored, so completed work already paid for in compute
+    // time is never lost between invocations. clipsSnapshot records exactly
+    // which clips/processed-results (by id, url, processedUrl) this
+    // progress was built from — a real change (a new clip uploaded, a
+    // voice-over finishing) invalidates every previously-normalized clip,
+    // the same "never serve a stale cached result" discipline
+    // simpleStoryRender's own audioUrlSnapshot/subtitlesContentSnapshot
+    // already apply. Not writable by the conversational agent — only the
+    // real assembly step populates this, same as simpleStoryRender.
+    uploadedClipsRender: {
+      status: 'not_started',
+      normalizedClips: [],
+      clipsSnapshot: null,
+      error: null,
+    },
   };
 }
 
