@@ -270,6 +270,21 @@ async function main() {
     '-f', 'lavfi', '-i', 'sine=frequency=900:duration=2',
     '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-c:a', 'aac', '-shortest', highToneClipPath,
   ]);
+  // Two more distinctly-toned 2s clips, used alongside the three above so a
+  // 5-clip test can tell EVERY clip's real position apart in the final
+  // output (not just "some clips share a tone").
+  const midToneClipPath = path.join(workDir, 'mid-tone-clip.mp4');
+  await runFfmpeg(ffmpegPath, [
+    '-y', '-f', 'lavfi', '-i', 'testsrc=size=320x240:rate=24:duration=2',
+    '-f', 'lavfi', '-i', 'sine=frequency=500:duration=2',
+    '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-c:a', 'aac', '-shortest', midToneClipPath,
+  ]);
+  const highestToneClipPath = path.join(workDir, 'highest-tone-clip.mp4');
+  await runFfmpeg(ffmpegPath, [
+    '-y', '-f', 'lavfi', '-i', 'testsrc=size=320x240:rate=24:duration=2',
+    '-f', 'lavfi', '-i', 'sine=frequency=1200:duration=2',
+    '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-c:a', 'aac', '-shortest', highestToneClipPath,
+  ]);
 
   // continueUploadedClipsAssembly is RESUMABLE (see its own comment in
   // video-assembly.js) — a real call may return 'in_progress' before every
@@ -424,6 +439,53 @@ async function main() {
         assert.strictEqual(final.render.normalizedClips[i].url, urlsAfterFirst[i], `clip ${i} must not be re-normalized on resume`);
       }
     });
+  });
+
+  // The test above only confirms resuming never RE-normalizes an
+  // already-completed clip — it never checks that the real, final
+  // concatenated OUTPUT still plays back in the right order once several
+  // clips (more than CLIP_NORMALIZE_CONCURRENCY) had to be normalized
+  // across MULTIPLE resumable calls, which is exactly the shape a real
+  // production job with many real-sized clips takes (a real multi-clip
+  // job can't finish normalizing in one call — see
+  // CLIP_ASSEMBLY_TIME_BUDGET_MS's own comment). Five DISTINCT real
+  // signatures (never two clips sharing one) make every position in the
+  // real output individually verifiable.
+  await test('continueUploadedClipsAssembly keeps the given order correct in the real output, even after resuming across several calls', async () => {
+    const clips = [
+      { id: '1', url: toneClipPath, processedUrl: null }, // 300Hz
+      { id: '2', url: midToneClipPath, processedUrl: null }, // 500Hz
+      { id: '3', url: silentMiddleClipPath, processedUrl: null }, // silence
+      { id: '4', url: highToneClipPath, processedUrl: null }, // 900Hz
+      { id: '5', url: highestToneClipPath, processedUrl: null }, // 1200Hz
+    ];
+
+    const result = await runAssemblyToCompletion({
+      uploadedClips: clips,
+      musicUrl: null,
+      resolutionTier: '720p',
+      jobId: 'test-job-resume-order',
+      timeBudgetMs: 1,
+    });
+    assert.strictEqual(result.status, 'completed', result.error || '');
+
+    const outPath = path.join(workDir, 'assembled-resume-order-check.mp4');
+    fs.writeFileSync(outPath, result.buffer);
+
+    const windows = [
+      { label: '1 (300Hz)', start: 0.2, expectFreq: 300, otherFreq: 1200 },
+      { label: '2 (500Hz)', start: 2.2, expectFreq: 500, otherFreq: 1200 },
+      { label: '4 (900Hz)', start: 6.2, expectFreq: 900, otherFreq: 300 },
+      { label: '5 (1200Hz)', start: 8.2, expectFreq: 1200, otherFreq: 300 },
+    ];
+    for (const { label, start, expectFreq, otherFreq } of windows) {
+      const expectVol = await measureBandVolume(outPath, { freq: expectFreq, start, duration: 1.4 });
+      const otherVol = await measureBandVolume(outPath, { freq: otherFreq, start, duration: 1.4 });
+      assert.ok(
+        expectVol > otherVol + 10,
+        `segment for clip ${label} at ${start}s must carry its own real tone — got ${expectFreq}Hz=${expectVol}dB vs ${otherFreq}Hz=${otherVol}dB`
+      );
+    }
   });
 
   await test('continueUploadedClipsAssembly discards stale progress and starts over when the clip set actually changes', async () => {
@@ -924,6 +986,60 @@ async function main() {
     const body = await res.json();
     assert.strictEqual(body.finalVideo.status, 'completed', body.finalVideo.error || '');
     assert.deepStrictEqual(body.finalVideo.musicUsed, { enabled: true, track: null, customUrl: body.musicCustomUrl });
+  });
+
+  // End-to-end reproduction of a real production report: clips named
+  // plainly "1.mp4"/"2.mp4", uploaded in REVERSE order through the real
+  // HTTP routes (exactly what a browser's own file-picker order did in
+  // production) — confirms not just that job.uploadedClips LISTS the
+  // correct order (already covered above), but that the REAL assembled
+  // output file actually plays back in that same order, end to end
+  // through POST /:id/assemble-video.
+  await test('POST /:id/assemble-video produces output in the correct order for bare-numeric filenames uploaded in reverse', async () => {
+    const createRes = await fetch(`${baseUrl}/api/jobs/upload-compile`, { method: 'POST' });
+    const orderJobId = (await createRes.json()).job.id;
+
+    // "2.mp4" (the 900Hz clip) uploaded FIRST, "1.mp4" (the 300Hz clip)
+    // uploaded SECOND — reverse of the intended scene order, same as the
+    // real report.
+    await fetch(`${baseUrl}/api/jobs/${orderJobId}/upload-clip?filename=2.mp4`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'video/mp4' },
+      body: fs.readFileSync(highToneClipPath),
+    });
+    const uploadRes = await fetch(`${baseUrl}/api/jobs/${orderJobId}/upload-clip?filename=1.mp4`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'video/mp4' },
+      body: fs.readFileSync(toneClipPath),
+    });
+    const uploadedJob = (await uploadRes.json()).job;
+    assert.deepStrictEqual(
+      uploadedJob.uploadedClips.map((clip) => clip.sourceFilename),
+      ['1.mp4', '2.mp4'],
+      'the uploaded-clips list must already show the corrected ascending order'
+    );
+
+    const res = await fetch(`${baseUrl}/api/jobs/${orderJobId}/assemble-video`, { method: 'POST' });
+    const body = await res.json();
+    assert.strictEqual(body.finalVideo.status, 'completed', body.finalVideo.error || '');
+
+    const localPath = body.finalVideo.url.startsWith('/generated/')
+      ? path.join(require('./video-storage').GENERATED_DIR, body.finalVideo.url.slice('/generated/'.length))
+      : body.finalVideo.url;
+
+    const vol300AtStart = await measureBandVolume(localPath, { freq: 300, start: 0.2, duration: 1.4 });
+    const vol900AtStart = await measureBandVolume(localPath, { freq: 900, start: 0.2, duration: 1.4 });
+    assert.ok(
+      vol300AtStart > vol900AtStart + 10,
+      `expected clip "1.mp4"'s 300Hz tone first, but got 300Hz=${vol300AtStart}dB vs 900Hz=${vol900AtStart}dB — the real output file is in the wrong order`
+    );
+
+    const vol900AtEnd = await measureBandVolume(localPath, { freq: 900, start: 2.2, duration: 1.4 });
+    const vol300AtEnd = await measureBandVolume(localPath, { freq: 300, start: 2.2, duration: 1.4 });
+    assert.ok(
+      vol900AtEnd > vol300AtEnd + 10,
+      `expected clip "2.mp4"'s 900Hz tone second, but got 900Hz=${vol900AtEnd}dB vs 300Hz=${vol300AtEnd}dB — the real output file is in the wrong order`
+    );
   });
 
   httpServer.close();
