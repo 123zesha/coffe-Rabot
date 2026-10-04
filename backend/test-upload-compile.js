@@ -692,6 +692,19 @@ async function main() {
     assert.strictEqual(server.parseSceneNumberFromFilename('my.video.20.mp4'), null, 'must not match when the number is not the whole basename');
   });
 
+  // Regression for a second real production job: an export tool named the
+  // clips "1_20261004173834.mp4", "2_20261004173834.mp4", ... (scene number,
+  // then an underscore, then a generation timestamp) — not ENTIRELY a
+  // number, so the bare-numeric check above correctly didn't match it, and
+  // the job fell back to ambiguous upload order yet again.
+  await test('parseSceneNumberFromFilename reads the leading number when it is followed by "_" or "-" and more text', () => {
+    assert.strictEqual(server.parseSceneNumberFromFilename('1_20261004173834.mp4'), 1);
+    assert.strictEqual(server.parseSceneNumberFromFilename('2_20261004173834.mp4'), 2);
+    assert.strictEqual(server.parseSceneNumberFromFilename('20_20261004173835.mp4'), 20);
+    assert.strictEqual(server.parseSceneNumberFromFilename('07-final-export.mov'), 7);
+    assert.strictEqual(server.parseSceneNumberFromFilename('IMG_0012.mp4'), null, 'must not match when the leading text is not itself a number');
+  });
+
   await test('computeAutoClipOrder sorts by scene number when every clip has one, and is null when ambiguous', () => {
     const sorted = server.computeAutoClipOrder([
       { id: 'a', sourceFilename: 'scene_03.mp4' },
@@ -1040,6 +1053,74 @@ async function main() {
       vol900AtEnd > vol300AtEnd + 10,
       `expected clip "2.mp4"'s 900Hz tone second, but got 900Hz=${vol900AtEnd}dB vs 300Hz=${vol300AtEnd}dB — the real output file is in the wrong order`
     );
+  });
+
+  // End-to-end reproduction of the SECOND real production report: the same
+  // "list looks right, but try it and the video is still wrong" complaint
+  // persisted because the real clips were named "1_20261004173834.mp4",
+  // "2_20261004173834.mp4", ... (a scene number, then "_", then a
+  // generation timestamp) — a shape the first fix (bare-numeric-only
+  // filenames) didn't cover, so these fell back to ambiguous upload order
+  // yet again. Scrambles all 5 of this job's distinctly-toned clips (not
+  // just 2) across their real filename shape, uploaded via the real HTTP
+  // route, then verifies the real assembled output's actual audio — not
+  // just the uploaded-clips list — plays back in the corrected 1..5 order.
+  await test('POST /:id/assemble-video produces output in the correct order for "N_<timestamp>.mp4" filenames uploaded out of order', async () => {
+    const createRes = await fetch(`${baseUrl}/api/jobs/upload-compile`, { method: 'POST' });
+    const timestampJobId = (await createRes.json()).job.id;
+
+    const clipsInUploadOrder = [
+      { filename: '3_20261004173829.mp4', path: silentMiddleClipPath }, // scene 3: silence
+      { filename: '1_20261004173834.mp4', path: toneClipPath }, // scene 1: 300Hz
+      { filename: '5_20261004173832.mp4', path: highestToneClipPath }, // scene 5: 1200Hz
+      { filename: '2_20261004173834.mp4', path: midToneClipPath }, // scene 2: 500Hz
+      { filename: '4_20261004173835.mp4', path: highToneClipPath }, // scene 4: 900Hz
+    ];
+
+    let lastUploadedJob;
+    for (const { filename, path: clipPath } of clipsInUploadOrder) {
+      const res = await fetch(`${baseUrl}/api/jobs/${timestampJobId}/upload-clip?filename=${encodeURIComponent(filename)}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'video/mp4' },
+        body: fs.readFileSync(clipPath),
+      });
+      lastUploadedJob = (await res.json()).job;
+    }
+
+    assert.deepStrictEqual(
+      lastUploadedJob.uploadedClips.map((clip) => clip.sourceFilename),
+      [
+        '1_20261004173834.mp4',
+        '2_20261004173834.mp4',
+        '3_20261004173829.mp4',
+        '4_20261004173835.mp4',
+        '5_20261004173832.mp4',
+      ],
+      'the uploaded-clips list must show the corrected ascending order'
+    );
+
+    const res = await fetch(`${baseUrl}/api/jobs/${timestampJobId}/assemble-video`, { method: 'POST' });
+    const body = await res.json();
+    assert.strictEqual(body.finalVideo.status, 'completed', body.finalVideo.error || '');
+
+    const localPath = body.finalVideo.url.startsWith('/generated/')
+      ? path.join(require('./video-storage').GENERATED_DIR, body.finalVideo.url.slice('/generated/'.length))
+      : body.finalVideo.url;
+
+    const windows = [
+      { label: 'scene 1 (300Hz)', start: 0.2, expectFreq: 300, otherFreq: 1200 },
+      { label: 'scene 2 (500Hz)', start: 2.2, expectFreq: 500, otherFreq: 1200 },
+      { label: 'scene 4 (900Hz)', start: 6.2, expectFreq: 900, otherFreq: 300 },
+      { label: 'scene 5 (1200Hz)', start: 8.2, expectFreq: 1200, otherFreq: 300 },
+    ];
+    for (const { label, start, expectFreq, otherFreq } of windows) {
+      const expectVol = await measureBandVolume(localPath, { freq: expectFreq, start, duration: 1.4 });
+      const otherVol = await measureBandVolume(localPath, { freq: otherFreq, start, duration: 1.4 });
+      assert.ok(
+        expectVol > otherVol + 10,
+        `the real output's segment for ${label} at ${start}s must carry its own real tone — got ${expectFreq}Hz=${expectVol}dB vs ${otherFreq}Hz=${otherVol}dB`
+      );
+    }
   });
 
   httpServer.close();

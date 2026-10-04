@@ -1092,7 +1092,9 @@
     const sceneMatch = filename.match(/scene[\s_-]*0*(\d+)/i);
     if (sceneMatch) return Number(sceneMatch[1]);
     const bareNumberMatch = filename.match(/^0*(\d+)\.[^.]+$/);
-    return bareNumberMatch ? Number(bareNumberMatch[1]) : null;
+    if (bareNumberMatch) return Number(bareNumberMatch[1]);
+    const leadingNumberMatch = filename.match(/^0*(\d+)[_-].+\.[^.]+$/);
+    return leadingNumberMatch ? Number(leadingNumberMatch[1]) : null;
   }
 
   function clipOrderIsAmbiguous(clips) {
