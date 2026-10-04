@@ -3464,13 +3464,18 @@ app.post('/api/jobs/upload-compile', async (req, res) => {
 });
 
 // Extracts a scene number from a clip's filename, e.g. "scene_01.mp4" -> 1,
-// "Scene-2.mov" -> 2, "myscene10.webm" -> 10, or a filename that is ENTIRELY
-// a number (e.g. "1.mp4", "07.mp4", "20.mp4") — just as clear an ordering
-// signal, and a common convention for clips numbered in sequence,
-// confirmed live by a real job where exactly "1.mp4".."20.mp4" were
-// uploaded and fell back to plain (non-numeric) upload order instead of
-// being auto-sorted. Returns null when neither pattern matches (e.g.
-// "IMG_0012.mp4"), which computeAutoClipOrder below treats as "can't
+// "Scene-2.mov" -> 2, "myscene10.webm" -> 10, a filename that is ENTIRELY a
+// number (e.g. "1.mp4", "07.mp4", "20.mp4") — confirmed live by a real job
+// where exactly "1.mp4".."20.mp4" were uploaded and fell back to plain
+// upload order instead of being auto-sorted — or a filename that STARTS
+// with a number immediately followed by "_"/"-" and then anything else,
+// e.g. "1_20261004173834.mp4" -> 1, "2-final-export.mov" -> 2 — confirmed
+// live by a real job whose export tool appended a generation timestamp
+// after the scene number ("1_20261004173834.mp4", "2_20261004173834.mp4",
+// ...), which the plain-number-only check above does not match (the
+// filename isn't ENTIRELY a number). Returns null when none of these
+// patterns match (e.g. "IMG_0012.mp4", where the leading text isn't a
+// number at all), which computeAutoClipOrder below treats as "can't
 // auto-order this clip".
 function parseSceneNumberFromFilename(filename) {
   if (typeof filename !== 'string') {
@@ -3481,7 +3486,11 @@ function parseSceneNumberFromFilename(filename) {
     return Number(sceneMatch[1]);
   }
   const bareNumberMatch = filename.match(/^0*(\d+)\.[^.]+$/);
-  return bareNumberMatch ? Number(bareNumberMatch[1]) : null;
+  if (bareNumberMatch) {
+    return Number(bareNumberMatch[1]);
+  }
+  const leadingNumberMatch = filename.match(/^0*(\d+)[_-].+\.[^.]+$/);
+  return leadingNumberMatch ? Number(leadingNumberMatch[1]) : null;
 }
 
 // Returns `clips` re-sorted by ascending scene number (see
