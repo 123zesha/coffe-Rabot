@@ -970,6 +970,19 @@ async function continueSimpleStoryVideoAssembly({
     await runFfmpeg(['-y', '-f', 'concat', '-safe', '0', '-i', listPath, '-c', 'copy', concatenatedPath]);
     log('sections concatenated');
 
+    // Each section clip is now fully folded into concatenatedPath and is
+    // never read again — freeing them here (rather than only at the very
+    // end, via workDir's own cleanup) roughly halves this call's peak /tmp
+    // usage for the final mux step below, which otherwise has every
+    // section clip (together, the whole video's own size again) AND
+    // concatenatedPath AND the final output all on disk at once. A real
+    // long (30+ minute) job hit exactly this: a Vercel deployment's local
+    // disk ran out mid-mux ("No space left on device") despite every
+    // individual step being well within the platform's own time limit.
+    for (const sectionPath of sectionPaths) {
+      fs.rmSync(sectionPath, { force: true });
+    }
+
     // Optional background music (off by default — see musicUrl's own
     // comment above) is mixed in HERE, once, after every section is done —
     // never per section, since it has no effect on any section's own
