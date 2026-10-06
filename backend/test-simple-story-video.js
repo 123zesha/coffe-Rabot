@@ -889,6 +889,61 @@ async function main() {
     );
   });
 
+  // Regression for a real production failure: a long (30+ minute) job's
+  // final mux step died with ffmpeg's own "No space left on device" — the
+  // final call kept every section clip on disk (together, the whole
+  // video's own size again) AT THE SAME TIME as the concatenated output
+  // and the final muxed output, roughly tripling peak /tmp usage for no
+  // reason once concatenation has consumed them. Proves the fix directly:
+  // each section-N.mp4 is really deleted (a real fs.rmSync call, not just
+  // "the test still passes") right after concatenation, long before the
+  // module's own end-of-call workDir cleanup.
+  await test('continueSimpleStoryVideoAssembly frees each section clip right after concatenation, not just at the end', async () => {
+    // Cues spread evenly across the whole duration (unlike FIXTURE_SRT,
+    // whose own cues all sit in the first 8.9s) — groupCuesIntoSections
+    // only ever splits where a real cue boundary exists, so this is what
+    // actually yields several real sections (6, at a 3s target) rather
+    // than one giant trailing section covering the silent tail.
+    const { srt, totalSeconds } = buildLongSrt(6, 2, 1);
+    const audioPath = await makeToneAudio(workDir, totalSeconds, 'rmsync-check');
+    const realRmSync = fs.rmSync;
+    const rmSyncCalls = [];
+    fs.rmSync = (targetPath, options) => {
+      rmSyncCalls.push({ targetPath, options });
+      return realRmSync(targetPath, options);
+    };
+
+    let result;
+    try {
+      result = await ssv.continueSimpleStoryVideoAssembly({
+        voiceover: { status: 'completed', url: audioPath },
+        subtitlesContent: srt,
+        jobId: 'test-job-rmsync-check',
+        sectionTargetSeconds: 3,
+      });
+    } finally {
+      fs.rmSync = realRmSync;
+    }
+    assert.strictEqual(result.status, 'completed', result.error);
+    assert.ok(result.render.totalSections >= 3, 'test setup: need at least 3 sections for this to prove anything');
+
+    const sectionDeletionCalls = rmSyncCalls.filter(
+      (call) => /section-\d+\.mp4$/.test(call.targetPath) && !(call.options && call.options.recursive)
+    );
+    assert.strictEqual(
+      sectionDeletionCalls.length,
+      result.render.totalSections,
+      `expected one individual rmSync call per section clip (${result.render.totalSections}), got ${sectionDeletionCalls.length}`
+    );
+
+    const workDirCleanupIndex = rmSyncCalls.findIndex((call) => call.options && call.options.recursive);
+    assert.ok(workDirCleanupIndex > -1, 'test setup: the module must still clean up its whole workDir at the end');
+    assert.ok(
+      sectionDeletionCalls.length > 0 && rmSyncCalls.indexOf(sectionDeletionCalls[sectionDeletionCalls.length - 1]) < workDirCleanupIndex,
+      'every section clip must be freed DURING the call (right after concatenation), not only by the final whole-workDir cleanup'
+    );
+  });
+
   // --- Selective video editing (videoEditSettings) ---
 
   await test('normalizeVideoEditSettings returns the all-defaults shape for missing/empty input', () => {
