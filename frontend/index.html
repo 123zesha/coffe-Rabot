@@ -272,8 +272,13 @@
               <div class="form-field form-field-wide">
                 <label for="story-voice-upload">Upload narration audio (MP3, WAV, or M4A — up to about 40 minutes total)</label>
                 <input type="file" id="story-voice-upload" accept=".mp3,.wav,.m4a,audio/mpeg,audio/wav,audio/x-wav,audio/wave,audio/mp4,audio/x-m4a" multiple>
-                <p class="field-hint">Select more than one file to combine them, in the order selected, into one continuous voice-over.</p>
+                <p class="field-hint">
+                  Select one or more files; choosing files again adds them to the list below instead of
+                  replacing it. Files combine, in the order selected, into one continuous voice-over.
+                </p>
                 <p id="story-voice-upload-status" class="field-hint"></p>
+                <ul id="story-voice-upload-list" class="story-upload-file-list"></ul>
+                <button type="button" id="story-voice-upload-clear-btn" class="btn" hidden>Clear all</button>
               </div>
               <p class="field-hint">
                 Skips paid text-to-speech entirely — your narration's real duration is measured, and
