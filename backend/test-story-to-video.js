@@ -99,6 +99,16 @@ async function main() {
   ]);
   const partBHighToneBuffer = fs.readFileSync(partBHighTonePath);
 
+  // A third, distinctly-toned fixture — used below to prove the real join
+  // path for MORE than two parts (the route joins every part at once in a
+  // single ffmpeg call now, not pairwise, so two parts alone never exercise
+  // that N-way join).
+  const partCMidTonePath = path.join(workDir, 'part-c-mid.mp3');
+  await runFfmpeg(simpleStoryVideo.ffmpegPath, [
+    '-y', '-f', 'lavfi', '-i', 'sine=frequency=550:duration=2', '-c:a', 'libmp3lame', partCMidTonePath,
+  ]);
+  const partCMidToneBuffer = fs.readFileSync(partCMidTonePath);
+
   // How strongly filePath's real decoded audio energy falls within a narrow
   // band around freq during [start, start+duration) — used to tell which of
   // two distinctly-toned fixtures is actually playing at a given point in a
@@ -514,6 +524,61 @@ async function main() {
     const lateLow = await measureBandVolume(combinedPath, { freq: 300, start: 3.5, duration: 1 });
     const lateHigh = await measureBandVolume(combinedPath, { freq: 900, start: 3.5, duration: 1 });
     assert.ok(lateHigh > lateLow + 15, `expected part B's high tone to dominate the end (low=${lateLow}dB, high=${lateHigh}dB)`);
+  });
+
+  await test('POST /api/jobs/:id/upload-voiceover joins three or more parts in one real pass, preserving order and summed duration (not just pairwise)', async () => {
+    const createRes = await fetch(`${baseUrl}/api/jobs/story-to-video`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ script: SHORT_SCRIPT, voiceSource: 'upload' }),
+    });
+    const job = (await createRes.json()).job;
+
+    const part1Res = await fetch(`${baseUrl}/api/jobs/${job.id}/upload-voiceover?partIndex=1&totalParts=3`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'audio/mpeg' },
+      body: partALowToneBuffer,
+    });
+    const part1Body = await part1Res.json();
+    assert.strictEqual(part1Body.job.voiceover.status, 'pending');
+    assert.strictEqual(part1Body.job.voiceover.durationSeconds, null);
+
+    const part2Res = await fetch(`${baseUrl}/api/jobs/${job.id}/upload-voiceover?partIndex=2&totalParts=3`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'audio/mpeg' },
+      body: partCMidToneBuffer,
+    });
+    const part2Body = await part2Res.json();
+    assert.strictEqual(part2Body.job.voiceover.status, 'pending');
+    assert.strictEqual(part2Body.job.voiceover.durationSeconds, null);
+
+    const finalRes = await fetch(`${baseUrl}/api/jobs/${job.id}/upload-voiceover?partIndex=3&totalParts=3`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'audio/mpeg' },
+      body: partBHighToneBuffer,
+    });
+    assert.strictEqual(finalRes.status, 200, JSON.stringify(await finalRes.clone().json()));
+    const body = await finalRes.json();
+    assert.strictEqual(body.job.voiceover.status, 'completed');
+    // 3s + 2s + 2s = 7s, real measured duration — proves all three parts
+    // were really joined, not just the last one kept.
+    assert.ok(
+      body.job.voiceover.durationSeconds > 6.5 && body.job.voiceover.durationSeconds < 7.5,
+      `expected the combined duration to be about 7s, got ${body.job.voiceover.durationSeconds}`
+    );
+
+    const combinedPath = path.join(videoStorage.GENERATED_DIR, body.job.voiceover.url.slice('/generated/'.length));
+    const startLow = await measureBandVolume(combinedPath, { freq: 300, start: 0.3, duration: 2 });
+    const startMid = await measureBandVolume(combinedPath, { freq: 550, start: 0.3, duration: 2 });
+    assert.ok(startLow > startMid + 15, `expected part A's low tone to dominate the start (low=${startLow}dB, mid=${startMid}dB)`);
+
+    const midMid = await measureBandVolume(combinedPath, { freq: 550, start: 3.5, duration: 1 });
+    const midHigh = await measureBandVolume(combinedPath, { freq: 900, start: 3.5, duration: 1 });
+    assert.ok(midMid > midHigh + 15, `expected part C's mid tone to dominate the middle (mid=${midMid}dB, high=${midHigh}dB)`);
+
+    const endHigh = await measureBandVolume(combinedPath, { freq: 900, start: 5.5, duration: 1 });
+    const endMid = await measureBandVolume(combinedPath, { freq: 550, start: 5.5, duration: 1 });
+    assert.ok(endHigh > endMid + 15, `expected part B's high tone to dominate the end (high=${endHigh}dB, mid=${endMid}dB)`);
   });
 
   await test('POST /api/jobs/:id/upload-voiceover refuses a later part when an earlier one was never uploaded', async () => {

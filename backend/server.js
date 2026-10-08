@@ -3128,55 +3128,102 @@ app.post(
     }
 
     // "Upload My Own Voice" lets a user select more than one audio file at
-    // once (e.g. a narration recorded in separate takes) — the frontend
-    // uploads them ONE AT A TIME, in the order selected, tagging each
-    // request with its 1-based position (partIndex) and the total count
-    // (totalParts) so this route can join them into one continuous
-    // voice-over. Both omitted (or totalParts <= 1) is a plain single-file
-    // upload — byte-for-byte the same request/response shape as before
-    // this feature existed.
+    // once (e.g. a narration recorded in separate takes, or a long 30-40
+    // minute narration split across several files) — the frontend uploads
+    // them ONE AT A TIME, in the order selected, tagging each request with
+    // its 1-based position (partIndex) and the total count (totalParts).
+    // Every part's raw bytes are stored UNTOUCHED as they arrive; they're
+    // joined into one continuous track exactly ONCE, right here on the
+    // LAST part (below), with a SINGLE call to video-assembly.js's
+    // concatenateAudioBuffers covering every part at once. An earlier
+    // version joined pairwise on every part instead — re-decoding and re-
+    // encoding the whole growing track again each time a part arrived —
+    // which made upload time (and failure risk) grow with every part
+    // added; a real 30-40 minute narration split across 7 files hit
+    // exactly this in production. Both query params omitted (or
+    // totalParts <= 1) is a plain single-file upload — byte-for-byte the
+    // same request/response shape as before this feature existed.
     const totalParts = Math.max(1, Number(req.query.totalParts) || 1);
     const partIndex = Math.max(1, Number(req.query.partIndex) || 1);
     if (partIndex > totalParts) {
       return res.status(400).json({ error: 'partIndex cannot be greater than totalParts.' });
     }
+    const pendingPartUrls = (job.voiceover && job.voiceover.pendingPartUrls) || [];
+    if (partIndex > 1 && pendingPartUrls.length !== partIndex - 1) {
+      return res.status(400).json({
+        error: `Expected part ${partIndex - 1} of ${totalParts} to have been uploaded first.`,
+      });
+    }
 
-    let combinedBuffer = req.body;
-    if (partIndex > 1) {
-      // Every earlier part was already joined into job.voiceover.url (see
-      // the "more parts to come" branch below, which never advances past
-      // 'pending') — fetch that real, already-combined audio and join this
-      // new part onto the end of it, IN ORDER, at the sample level
-      // (video-assembly.js's concatenateAudioBuffers). A raw byte
-      // concatenation here would reintroduce the exact seam-glitch bug
-      // that function's own comment describes, now for user recordings
-      // instead of TTS chunks.
-      if (!job.voiceover || !job.voiceover.url) {
-        return res.status(400).json({
-          error: `Expected part ${partIndex - 1} of ${totalParts} to have been uploaded first.`,
-        });
-      }
-      const workDir = fs.mkdtempSync(path.join(os.tmpdir(), 'voiceover-upload-part-'));
+    const isLastPart = partIndex === totalParts;
+
+    if (!isLastPart) {
+      // Not the final part yet — store this part's raw bytes untouched (no
+      // ffmpeg involved) and remember its URL, in order, for the single
+      // real join below once the last part arrives. Status stays 'pending'
+      // so nothing downstream (subtitles, approve-and-start) treats this
+      // job as ready before every part has arrived.
+      let partUrl;
       try {
-        const previousPath = path.join(workDir, 'previous');
-        await videoAssembly.fetchToFile(job.voiceover.url, previousPath);
-        combinedBuffer = await videoAssembly.concatenateAudioBuffers([fs.readFileSync(previousPath), req.body]);
+        partUrl = await videoStorage.storeUploadedVoiceoverFile(req.body, job.id, { extension, contentType });
       } catch (error) {
         console.error(
-          'Could not join the next uploaded voice-over part:',
+          'Uploaded voice-over part could not be stored:',
+          JSON.stringify({ name: error?.name, message: error?.message }, null, 2)
+        );
+        return res.status(400).json({
+          error: 'That file could not be read as a real audio file — make sure it is a valid, uncorrupted MP3, WAV, or M4A.',
+        });
+      }
+      const updatedJob = await jobStore.updateJob(job.id, {
+        voiceover: {
+          url: partUrl,
+          status: 'pending',
+          voice: 'uploaded',
+          voiceStyle: '',
+          source: 'upload',
+          originalFilename: null,
+          durationSeconds: null,
+          syncWarning: null,
+          error: null,
+          pendingPartUrls: [...pendingPartUrls, partUrl],
+        },
+        ...downstreamResetsForNewVoiceover(),
+      });
+      return res.json({ job: updatedJob, partIndex, totalParts });
+    }
+
+    // Last part (or the common single-file case, where pendingPartUrls is
+    // empty and this buffer already IS the whole narration) — join every
+    // earlier part plus this one, IN ORDER, into one real continuous track
+    // at the sample level. A raw byte concatenation here would reintroduce
+    // the exact seam-glitch bug concatenateAudioBuffers's own comment
+    // describes, now for user recordings instead of TTS chunks.
+    let combinedBuffer = req.body;
+    if (pendingPartUrls.length > 0) {
+      const workDir = fs.mkdtempSync(path.join(os.tmpdir(), 'voiceover-upload-join-'));
+      try {
+        const earlierBuffers = [];
+        for (let i = 0; i < pendingPartUrls.length; i++) {
+          const partPath = path.join(workDir, `part-${i}`);
+          await videoAssembly.fetchToFile(pendingPartUrls[i], partPath);
+          earlierBuffers.push(fs.readFileSync(partPath));
+        }
+        combinedBuffer = await videoAssembly.concatenateAudioBuffers([...earlierBuffers, req.body]);
+      } catch (error) {
+        console.error(
+          'Could not join the uploaded voice-over parts:',
           JSON.stringify({ name: error?.name, message: error?.message }, null, 2)
         );
         return res.status(400).json({
           error:
-            'Could not combine this file with the previously uploaded part(s) — make sure every file is a valid, ' +
+            'Could not combine the uploaded parts into one track — make sure every file is a valid, ' +
             'uncorrupted MP3, WAV, or M4A.',
         });
       } finally {
         fs.rmSync(workDir, { recursive: true, force: true });
       }
     }
-
-    const isLastPart = partIndex === totalParts;
 
     let url;
     try {
@@ -3189,29 +3236,6 @@ app.post(
       return res.status(400).json({
         error: 'That file could not be read as a real audio file — make sure it is a valid, uncorrupted MP3, WAV, or M4A.',
       });
-    }
-
-    if (!isLastPart) {
-      // Not the final file yet — status stays 'pending' so nothing
-      // downstream (subtitles, approve-and-start) treats this job as ready
-      // before the whole narration has arrived. voiceover.url already
-      // points at the real, correctly-joined audio received SO FAR, so the
-      // next part's upload (above) has the right thing to join onto.
-      const updatedJob = await jobStore.updateJob(job.id, {
-        voiceover: {
-          url,
-          status: 'pending',
-          voice: 'uploaded',
-          voiceStyle: '',
-          source: 'upload',
-          originalFilename: null,
-          durationSeconds: null,
-          syncWarning: null,
-          error: null,
-        },
-        ...downstreamResetsForNewVoiceover(),
-      });
-      return res.json({ job: updatedJob, partIndex, totalParts });
     }
 
     let durationSeconds;
