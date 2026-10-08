@@ -1,4 +1,26 @@
-(function () {
+// Pure, DOM-free list helpers for "Upload My Own Voice" (see the
+// story-voice-upload 'change' handler below) — kept outside the page's
+// main IIFE, and exported for Node, purely so this exact logic is
+// directly unit-testable without a browser/DOM. The IIFE below calls them
+// like any other function in this file; the export guard is a no-op in
+// the browser, where `module` is undefined.
+function appendStoryUploadedFiles(existingFiles, newlyPickedFiles) {
+  return existingFiles.concat(newlyPickedFiles);
+}
+
+function removeStoryUploadedFileAt(existingFiles, indexToRemove) {
+  return existingFiles.filter((_, index) => index !== indexToRemove);
+}
+
+if (typeof module !== 'undefined' && module.exports) {
+  module.exports = { appendStoryUploadedFiles, removeStoryUploadedFileAt };
+}
+
+// Named (rather than directly invoked) and guarded below so this file can
+// be require()'d from Node — e.g. to unit-test the pure helpers above —
+// without the whole page's DOM-dependent setup running too; `document`
+// always exists when this script actually loads in a browser.
+function initPageBehavior() {
   const ERROR_REPLY = "Sorry, I couldn't reach the AI Agent. Please check your connection and try again.";
 
   const toggleBtn = document.getElementById('chat-toggle');
@@ -43,6 +65,8 @@
   const storyVoiceSpeedCustomInput = document.getElementById('story-voice-speed-custom');
   const storyVoiceUploadInput = document.getElementById('story-voice-upload');
   const storyVoiceUploadStatus = document.getElementById('story-voice-upload-status');
+  const storyVoiceUploadList = document.getElementById('story-voice-upload-list');
+  const storyVoiceUploadClearBtn = document.getElementById('story-voice-upload-clear-btn');
   const storyBackgroundSelect = document.getElementById('story-background');
   const storyBackgroundCustomInput = document.getElementById('story-background-custom');
   const bgImageSourceNoneRadio = document.getElementById('bg-image-source-none');
@@ -692,6 +716,9 @@
     const useUpload = voiceSourceUploadRadio.checked;
     aiVoiceOptions.hidden = useUpload;
     uploadVoiceOptions.hidden = !useUpload;
+    if (!useUpload) {
+      clearStoryUploadedFiles();
+    }
   }
   voiceSourceAiRadio.addEventListener('change', updateVoiceSourceVisibility);
   voiceSourceUploadRadio.addEventListener('change', updateVoiceSourceVisibility);
@@ -720,23 +747,69 @@
   storyTextSizeIncreaseBtn.addEventListener('click', () => stepStoryTextSize(1));
   storyTextSizeInput.addEventListener('change', () => stepStoryTextSize(0));
 
-  // Array, in the order the browser lists them in the FileList (the order
-  // files were selected/added in the OS file picker) — combined into one
-  // continuous voice-over on upload (see the upload loop below).
+  // Persists across multiple "Choose Files" picks — a browser file input
+  // always REPLACES its own .files on every pick, so this array (not
+  // storyVoiceUploadInput.files) is the real source of truth; the 'change'
+  // handler below appends to it rather than overwriting it. Order is the
+  // order files were added, across however many picks, one-by-one or
+  // several at once — combined into one continuous voice-over on upload
+  // (see the upload loop below) in that same order.
   let storyUploadedFiles = [];
-  storyVoiceUploadInput.addEventListener('change', () => {
-    storyUploadedFiles = storyVoiceUploadInput.files ? Array.from(storyVoiceUploadInput.files) : [];
+
+  function renderStoryUploadedFilesList() {
+    storyVoiceUploadList.innerHTML = '';
+    storyUploadedFiles.forEach((file, index) => {
+      const item = document.createElement('li');
+      item.className = 'story-upload-file-item';
+
+      const label = document.createElement('span');
+      label.className = 'story-upload-file-name';
+      label.textContent = `${index + 1}. ${file.name} (${(file.size / (1024 * 1024)).toFixed(1)}MB)`;
+      item.appendChild(label);
+
+      const removeBtn = document.createElement('button');
+      removeBtn.type = 'button';
+      removeBtn.className = 'story-upload-file-remove';
+      removeBtn.textContent = 'Remove';
+      removeBtn.addEventListener('click', () => {
+        storyUploadedFiles = removeStoryUploadedFileAt(storyUploadedFiles, index);
+        renderStoryUploadedFilesList();
+      });
+      item.appendChild(removeBtn);
+
+      storyVoiceUploadList.appendChild(item);
+    });
+
+    storyVoiceUploadClearBtn.hidden = storyUploadedFiles.length === 0;
+
     if (storyUploadedFiles.length === 0) {
       storyVoiceUploadStatus.textContent = '';
-    } else if (storyUploadedFiles.length === 1) {
-      const file = storyUploadedFiles[0];
-      storyVoiceUploadStatus.textContent = `Selected: ${file.name} (${(file.size / (1024 * 1024)).toFixed(1)}MB)`;
     } else {
       const totalMb = storyUploadedFiles.reduce((sum, file) => sum + file.size, 0) / (1024 * 1024);
-      const names = storyUploadedFiles.map((file) => file.name).join(', ');
-      storyVoiceUploadStatus.textContent = `Selected ${storyUploadedFiles.length} files (${totalMb.toFixed(1)}MB total): ${names}`;
+      storyVoiceUploadStatus.textContent =
+        storyUploadedFiles.length === 1
+          ? `Selected: ${storyUploadedFiles[0].name} (${totalMb.toFixed(1)}MB)`
+          : `Selected ${storyUploadedFiles.length} files (${totalMb.toFixed(1)}MB total)`;
     }
+  }
+
+  function clearStoryUploadedFiles() {
+    storyUploadedFiles = [];
+    storyVoiceUploadInput.value = '';
+    renderStoryUploadedFilesList();
+  }
+
+  storyVoiceUploadInput.addEventListener('change', () => {
+    const newlyPickedFiles = storyVoiceUploadInput.files ? Array.from(storyVoiceUploadInput.files) : [];
+    storyUploadedFiles = appendStoryUploadedFiles(storyUploadedFiles, newlyPickedFiles);
+    // Reset the native input so picking the SAME file again later (e.g.
+    // after removing it) always fires another 'change' event — a browser
+    // file input never re-fires 'change' for an unchanged selection.
+    storyVoiceUploadInput.value = '';
+    renderStoryUploadedFilesList();
   });
+
+  storyVoiceUploadClearBtn.addEventListener('click', clearStoryUploadedFiles);
 
   function resolveStoryVoiceSpeed() {
     if (storyVoiceSpeedSelect.value === 'custom') {
@@ -2233,4 +2306,8 @@
   refreshYoutubePackageCard();
   refreshSubtitlesCard();
   maybeStartChatToVideoPipeline();
-})();
+}
+
+if (typeof document !== 'undefined') {
+  initPageBehavior();
+}
