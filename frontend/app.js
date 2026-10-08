@@ -839,6 +839,15 @@
   let storyJobId = null;
 
   storyReviewCostBtn.addEventListener('click', async () => {
+    // Guard against the Approve button staying clickable from an earlier
+    // successful review while THIS attempt (a fresh job, a re-upload, or
+    // just a validation re-check) hasn't actually finished yet — without
+    // this, a failed/incomplete attempt still leaves the cost-review panel
+    // looking "ready", so a click on Approve hits a job whose voice-over
+    // upload never really completed. Only the real success path below
+    // re-enables it.
+    storyApproveBtn.disabled = true;
+
     const script = storyScriptInput.value.trim();
     if (!script) {
       setStoryCostStatus('Please paste your complete script first.', 'error');
@@ -1010,6 +1019,11 @@
       } else {
         storyCostStatus.hidden = true;
       }
+
+      // Everything this job needs (job created, voice-over/music/background
+      // image all uploaded or generated) genuinely succeeded — only now is
+      // it safe to let the user approve it.
+      storyApproveBtn.disabled = false;
 
       renderCostBreakdown(costEstimate);
       renderMusicSummary();
