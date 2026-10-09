@@ -1842,14 +1842,16 @@ const TOOLS = [
       'assembleFinalVideo to actually re-render the video with the new setting(s) — updating the setting ' +
       'alone does not touch the existing final video file. Refuses with a clear reason for a \'cinematic\' ' +
       'job (this only applies to Simple Story Video mode\'s own rendering — see assembleFinalVideo). Pass ' +
-      'the string "default" for backgroundColor/storyPosition/fontWeight/subtitleColor to reset that one ' +
+      'the string "default" for backgroundColor/storyPosition/storyTextAlign/fontWeight/subtitleColor to reset that one ' +
       'field back to its original built-in look; numeric fields reset the same way by passing their own ' +
       'default value (subtitleFontScale: 1, subtitleTimingOffsetMs: 0, voiceSpeed: 1, voiceVolumeDb: 0, ' +
       'musicVolumeDb: 0). ' +
       'backgroundColor: a single solid hex color (e.g. "1a2a4a" for navy — no "#") used for EVERY section, ' +
       'replacing the default rotating color palette. storyPosition: "top"/"center"(default)/"bottom" for ' +
       'the large on-screen story text only — the small caption line always stays at the bottom, standard ' +
-      'subtitle placement, and is unaffected. fontWeight: "bold" or "regular" for both the story and ' +
+      'subtitle placement, and is unaffected. storyTextAlign: "center"(default)/"left" — horizontal ' +
+      'alignment for the large story text only, independent of storyPosition; use "left" for a left-' +
+      'aligned paragraph look instead of centered lines. fontWeight: "bold" or "regular" for both the story and ' +
       'caption text — the only two weights this app\'s bundled font supports (never claim a different font ' +
       'FAMILY can be applied; that would require a new font file this app does not have). ' +
       'subtitleFontScale: a multiplier (0.5-2.0) on BOTH text elements\' built-in sizes — e.g. 1.3 for ' +
@@ -1892,6 +1894,7 @@ const TOOLS = [
         backgroundPreset: { type: 'string', enum: [...simpleStoryVideo.VALID_BACKGROUND_PRESETS, 'default'] },
         backgroundImage: { type: 'string' },
         storyPosition: { type: 'string', enum: ['top', 'center', 'bottom', 'default'] },
+        storyTextAlign: { type: 'string', enum: [...simpleStoryVideo.VALID_STORY_TEXT_ALIGNS, 'default'] },
         fontWeight: { type: 'string', enum: ['regular', 'bold', 'default'] },
         textSize: { type: 'string', enum: [...simpleStoryVideo.VALID_TEXT_SIZES, 'default'] },
         textSizePx: { type: 'number', minimum: simpleStoryVideo.TEXT_SIZE_PX_MIN, maximum: simpleStoryVideo.TEXT_SIZE_PX_MAX },
@@ -2385,11 +2388,12 @@ async function executeTool(name, jobId, input) {
     // for (normalizeVideoEditSettings itself is more lenient, since it also
     // has to tolerate a legacy/never-touched job record).
     const patch = {};
-    const stringFields = ['backgroundColor', 'backgroundPreset', 'backgroundImage', 'storyPosition', 'fontWeight', 'textSize', 'subtitleColor'];
+    const stringFields = ['backgroundColor', 'backgroundPreset', 'backgroundImage', 'storyPosition', 'storyTextAlign', 'fontWeight', 'textSize', 'subtitleColor'];
     const hexFields = ['backgroundColor', 'subtitleColor'];
     const enumFields = {
       backgroundPreset: simpleStoryVideo.VALID_BACKGROUND_PRESETS,
       storyPosition: simpleStoryVideo.VALID_STORY_POSITIONS,
+      storyTextAlign: simpleStoryVideo.VALID_STORY_TEXT_ALIGNS,
       fontWeight: simpleStoryVideo.VALID_FONT_WEIGHTS,
       textSize: simpleStoryVideo.VALID_TEXT_SIZES,
     };

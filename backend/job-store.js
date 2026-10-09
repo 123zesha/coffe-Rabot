@@ -466,6 +466,9 @@ function createDefaultJob(id) {
     // - storyPosition: 'top' | 'center' (default) | 'bottom' — the large
     //   on-screen story text only; the small caption line always stays at
     //   the bottom, standard subtitle placement.
+    // - storyTextAlign: 'center' (default) | 'left' — horizontal alignment
+    //   for the large story text only, independent of storyPosition's
+    //   vertical placement; the caption line is unaffected.
     // - fontWeight: 'bold' | 'regular', or null (default) to keep the
     //   existing look (story text bold, caption text regular) — the only
     //   two weights this app's bundled font actually ships (see
@@ -524,6 +527,7 @@ function createDefaultJob(id) {
       backgroundPreset: null,
       backgroundImage: null,
       storyPosition: null,
+      storyTextAlign: null,
       fontWeight: null,
       textSize: null,
       textSizePx: null,

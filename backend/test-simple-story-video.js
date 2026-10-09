@@ -953,6 +953,7 @@ async function main() {
         backgroundPreset: null,
         backgroundImage: null,
         storyPosition: null,
+        storyTextAlign: null,
         fontWeight: null,
         textSize: null,
         textSizePx: null,
@@ -973,6 +974,7 @@ async function main() {
       backgroundColor: '1A2B3C',
       backgroundPreset: 'warm',
       storyPosition: 'top',
+      storyTextAlign: 'left',
       fontWeight: 'bold',
       textSize: 'xl',
       showCaptions: false,
@@ -988,6 +990,7 @@ async function main() {
       backgroundPreset: 'warm',
       backgroundImage: null,
       storyPosition: 'top',
+      storyTextAlign: 'left',
       fontWeight: 'bold',
       textSize: 'xl',
       textSizePx: null,
@@ -1006,6 +1009,7 @@ async function main() {
     const normalized = ssv.normalizeVideoEditSettings({
       backgroundColor: 'not-a-color',
       storyPosition: 'sideways',
+      storyTextAlign: 'justify',
       fontWeight: 'italic',
       subtitleFontScale: 999,
       subtitleColor: '12345', // one digit short
@@ -1016,6 +1020,7 @@ async function main() {
     });
     assert.strictEqual(normalized.backgroundColor, null);
     assert.strictEqual(normalized.storyPosition, null);
+    assert.strictEqual(normalized.storyTextAlign, null);
     assert.strictEqual(normalized.fontWeight, null);
     assert.strictEqual(normalized.subtitleFontScale, ssv.SUBTITLE_FONT_SCALE_MAX);
     assert.strictEqual(normalized.subtitleColor, null);
@@ -1208,6 +1213,47 @@ async function main() {
     assert.strictEqual(captionFields[2], '60', 'caption fontsize must be 30 * subtitleFontScale(2)');
     assert.strictEqual(captionFields[3], ssv.assColorFromHex('ff0000'));
     assert.strictEqual(captionFields[18], '2', 'the caption line must always stay bottom-center (Alignment 2)');
+  });
+
+  await test('buildAssScript: storyTextAlign "left" combines with every storyPosition to the correct ASS Alignment code, independent of each other, and never affects the caption line', () => {
+    const cues = ssv.parseSrt(FIXTURE_SRT);
+
+    // ASS "numpad" alignment: row = vertical (top/center/bottom), column =
+    // horizontal (center/left).
+    const expectedAlignment = {
+      top: { center: '8', left: '7' },
+      center: { center: '5', left: '4' },
+      bottom: { center: '2', left: '1' },
+    };
+
+    for (const storyPosition of ['top', 'center', 'bottom']) {
+      for (const storyTextAlign of ['center', 'left']) {
+        const ass = ssv.buildAssScript(cues, 10, ssv.normalizeVideoEditSettings({ storyPosition, storyTextAlign }));
+        const storyFields = ass.split('\n').find((line) => line.startsWith('Style: Story,')).split(',');
+        const captionFields = ass.split('\n').find((line) => line.startsWith('Style: Caption,')).split(',');
+
+        assert.strictEqual(
+          storyFields[18],
+          expectedAlignment[storyPosition][storyTextAlign],
+          `storyPosition "${storyPosition}" + storyTextAlign "${storyTextAlign}" must set Story Alignment to ${expectedAlignment[storyPosition][storyTextAlign]}, got ${storyFields[18]}`
+        );
+        assert.strictEqual(
+          captionFields[18],
+          '2',
+          `the caption line must stay bottom-center (Alignment 2) regardless of storyTextAlign "${storyTextAlign}"`
+        );
+      }
+    }
+  });
+
+  await test('buildAssScript defaults storyTextAlign to "center" when omitted, matching the original always-centered look', () => {
+    const cues = ssv.parseSrt(FIXTURE_SRT);
+    const withDefaults = ssv.buildAssScript(cues, 10, ssv.normalizeVideoEditSettings({}));
+    const explicitCenter = ssv.buildAssScript(cues, 10, ssv.normalizeVideoEditSettings({ storyTextAlign: 'center' }));
+    assert.strictEqual(withDefaults, explicitCenter);
+
+    const storyFields = withDefaults.split('\n').find((line) => line.startsWith('Style: Story,')).split(',');
+    assert.strictEqual(storyFields[18], '5', 'default storyPosition "center" + default storyTextAlign "center" must be Alignment 5');
   });
 
   await test('buildAssScript: textBackground false removes the story text\'s box (plain outlined text instead), and never touches the Caption style', () => {

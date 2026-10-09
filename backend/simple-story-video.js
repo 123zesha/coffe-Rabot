@@ -170,6 +170,11 @@ const TEXT_SIZE_PX_MAX = 160;
 // normalizeVideoEditSettings produces, never raw/unvalidated agent input.
 const HEX_COLOR_RE = /^[0-9a-fA-F]{6}$/;
 const VALID_STORY_POSITIONS = ['top', 'center', 'bottom'];
+// Horizontal alignment for the large story text only — independent of
+// storyPosition (which only moves it vertically). 'center' (the original,
+// always-on look) or 'left', matching the common "reference video" caption
+// style of left-aligned paragraph text instead of centered lines.
+const VALID_STORY_TEXT_ALIGNS = ['center', 'left'];
 const VALID_FONT_WEIGHTS = ['regular', 'bold'];
 // ffmpeg's atempo filter only accepts a single-instance range of
 // [0.5, 2.0] — outside that it must be chained across multiple atempo
@@ -215,6 +220,7 @@ function normalizeVideoEditSettings(raw) {
     // background byte-for-byte unchanged.
     backgroundImage: typeof input.backgroundImage === 'string' && input.backgroundImage.trim() ? input.backgroundImage.trim() : null,
     storyPosition: VALID_STORY_POSITIONS.includes(input.storyPosition) ? input.storyPosition : null,
+    storyTextAlign: VALID_STORY_TEXT_ALIGNS.includes(input.storyTextAlign) ? input.storyTextAlign : null,
     fontWeight: VALID_FONT_WEIGHTS.includes(input.fontWeight) ? input.fontWeight : null,
     textSize: VALID_TEXT_SIZES.includes(input.textSize) ? input.textSize : null,
     // The large story text's real font size in px, set directly (the +/-
@@ -540,11 +546,14 @@ function escapeAssText(text) {
 // normalizeVideoEditSettings) — omitted/defaulted fields reproduce the
 // exact original hardcoded look byte-for-byte (large bold white centered
 // story text, small regular white bottom caption text), so a job that
-// never touches this feature renders exactly as before it existed. Only
-// storyPosition moves the on-screen story text (top/center/bottom); the
-// caption line always stays at the bottom, standard subtitle placement.
+// never touches this feature renders exactly as before it existed.
+// storyPosition moves the story text vertically (top/center/bottom) and
+// storyTextAlign sets its horizontal alignment (center/left) — both
+// independent of each other; the caption line always stays at the bottom,
+// standard subtitle placement, unaffected by either.
 function buildAssScript(cues, audioDuration, editSettings = {}) {
   const storyPosition = VALID_STORY_POSITIONS.includes(editSettings.storyPosition) ? editSettings.storyPosition : 'center';
+  const storyTextAlign = VALID_STORY_TEXT_ALIGNS.includes(editSettings.storyTextAlign) ? editSettings.storyTextAlign : 'center';
   const fontWeight = VALID_FONT_WEIGHTS.includes(editSettings.fontWeight) ? editSettings.fontWeight : null;
   const subtitleFontScale = editSettings.subtitleFontScale > 0 ? editSettings.subtitleFontScale : 1;
   const textColorAss = assColorFromHex(editSettings.subtitleColor);
@@ -552,7 +561,16 @@ function buildAssScript(cues, audioDuration, editSettings = {}) {
   const showCaptions = editSettings.showCaptions !== false;
   const storyBold = fontWeight === 'regular' ? 0 : 1;
   const captionBold = fontWeight === 'bold' ? 1 : 0;
-  const storyAlignment = storyPosition === 'top' ? 8 : storyPosition === 'bottom' ? 2 : 5;
+  // ASS "numpad" alignment codes: each row is a vertical position (top/
+  // center/bottom), each column is center vs. left horizontal alignment —
+  // storyPosition and storyTextAlign are independent controls, combined
+  // here into the one code ASS itself expects.
+  const STORY_ALIGNMENT_CODES = {
+    top: { center: 8, left: 7 },
+    center: { center: 5, left: 4 },
+    bottom: { center: 2, left: 1 },
+  };
+  const storyAlignment = STORY_ALIGNMENT_CODES[storyPosition][storyTextAlign];
   const storyMarginV = storyPosition === 'center' ? 0 : 60;
   // textSizePx (the numeric +/- stepper control) takes priority over the
   // legacy textSize tiers whenever it's a real number; falls back to the
@@ -1152,6 +1170,7 @@ module.exports = {
   SUBTITLE_TIMING_OFFSET_MS_MIN,
   SUBTITLE_TIMING_OFFSET_MS_MAX,
   VALID_STORY_POSITIONS,
+  VALID_STORY_TEXT_ALIGNS,
   VALID_FONT_WEIGHTS,
   HEX_COLOR_RE,
   BACKGROUND_PRESET_COLORS,
