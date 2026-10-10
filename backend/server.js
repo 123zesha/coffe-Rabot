@@ -2322,11 +2322,25 @@ async function executeTool(name, jobId, input) {
   }
 
   if (name === 'assembleFinalVideo') {
-    const job = await jobStore.getJob(jobId);
+    let job = await jobStore.getJob(jobId);
 
     if (!job) {
       return JSON.stringify({ error: 'job not found' });
     }
+
+    // For 'uploaded-clips' jobs, automatically generate a real AI voice-
+    // over for any clip that's still silent and was never explicitly
+    // covered by the user's own select-clip-voiceovers/generate-clip-
+    // voiceovers call — the user should never have to remember to add a
+    // voice-over themselves. A no-op for every other mode, and for a job
+    // whose clips already all have real audio or an already-completed/in-
+    // flight voice-over. See autoGenerateMissingClipVoiceovers's own
+    // comment.
+    const autoVoiceover = await autoGenerateMissingClipVoiceovers(job);
+    if (autoVoiceover.error) {
+      return JSON.stringify({ error: autoVoiceover.error });
+    }
+    job = autoVoiceover.job;
 
     // Already assembled AND still accurate (reflects the job's current
     // burnInSubtitles/subtitles state) — return the existing result
@@ -3894,6 +3908,93 @@ app.post('/api/jobs/:id/generate-clip-voiceovers', async (req, res) => {
   res.json({ job: updatedJob });
 });
 
+// The default voice used when an "Upload & Compile" clip gets its
+// voice-over generated automatically (see autoGenerateMissingClipVoiceovers
+// below) rather than through a user's own explicit
+// POST /:id/select-clip-voiceovers choice — matches the Story-to-Video
+// form's own default AI voice (see frontend/index.html's
+// #story-voice-style), so a job that never touches voice selection at all
+// still gets the same consistent default voice everywhere.
+const DEFAULT_CLIP_VOICEOVER_VOICE = 'female-professional';
+
+// Generates a real AI voice-over for every uploaded clip that still has
+// neither its own audio NOR an already-completed/in-flight voice-over —
+// called automatically right before assembling an 'uploaded-clips' job
+// (see POST /:id/assemble-video below), so the user never has to
+// explicitly select/generate a voice-over for a clip themselves; a clip
+// with real audio already, or one already covered by a prior
+// select-clip-voiceovers/generate-clip-voiceovers call (completed OR still
+// 'processing'), is left exactly as it is. Uses job.clipVoiceoverVoice if a
+// voice was already chosen at some point, else DEFAULT_CLIP_VOICEOVER_VOICE
+// above. Returns { job, error } — error is only set for a real
+// configuration problem (a missing API key), never for an individual
+// clip's own generation failure, which is instead recorded on that clip's
+// own voiceoverStatus/voiceoverError exactly like the manual flow already
+// does, and never blocks the OTHER clips or the assembly itself.
+async function autoGenerateMissingClipVoiceovers(job) {
+  if ((job.videoMode || jobStore.DEFAULT_VIDEO_MODE) !== 'uploaded-clips') {
+    return { job, error: null };
+  }
+
+  const uploadedClips = Array.isArray(job.uploadedClips) ? job.uploadedClips : [];
+  const clipsNeedingVoiceover = uploadedClips.filter(
+    (clip) => !clip.hasAudio && clip.voiceoverStatus !== 'completed' && clip.voiceoverStatus !== 'processing'
+  );
+  if (clipsNeedingVoiceover.length === 0) {
+    return { job, error: null };
+  }
+
+  if (!process.env.ANTHROPIC_API_KEY) {
+    return { job, error: 'ANTHROPIC_API_KEY is not configured — cannot automatically generate clip voice-overs.' };
+  }
+  if (!process.env.OPENAI_API_KEY) {
+    return { job, error: 'OPENAI_API_KEY is not configured — cannot automatically generate clip voice-overs.' };
+  }
+
+  const voiceStyle = VOICE_STYLE_OPTIONS.includes(job.clipVoiceoverVoice)
+    ? job.clipVoiceoverVoice
+    : DEFAULT_CLIP_VOICEOVER_VOICE;
+  const needsVoiceoverIdSet = new Set(clipsNeedingVoiceover.map((clip) => clip.id));
+
+  await jobStore.updateJob(job.id, {
+    uploadedClips: uploadedClips.map((clip) =>
+      needsVoiceoverIdSet.has(clip.id) ? { ...clip, voiceoverStatus: 'processing', voiceoverError: null } : clip
+    ),
+  });
+
+  const results = await Promise.all(
+    clipsNeedingVoiceover.map(async (clip) => {
+      const result = await clipVoiceover.generateClipVoiceover({
+        clipUrl: clip.url,
+        voiceStyle,
+        jobId: job.id,
+        clipId: clip.id,
+        topic: job.topic,
+      });
+      return { clipId: clip.id, result };
+    })
+  );
+
+  const resultByClipId = new Map(results.map(({ clipId, result }) => [clipId, result]));
+  const finalClips = uploadedClips.map((clip) => {
+    const result = resultByClipId.get(clip.id);
+    if (!result) {
+      return clip;
+    }
+    return {
+      ...clip,
+      voiceoverStatus: result.status,
+      voiceoverUrl: result.voiceoverUrl,
+      processedUrl: result.processedUrl,
+      narrationText: result.narrationText,
+      voiceoverError: result.error,
+    };
+  });
+
+  const updatedJob = await jobStore.updateJob(job.id, { uploadedClips: finalClips, clipVoiceoverVoice: voiceStyle });
+  return { job: updatedJob, error: null };
+}
+
 app.post('/api/jobs/:id/generate-youtube-package', async (req, res) => {
   const job = await jobStore.getJob(req.params.id);
 
@@ -4059,11 +4160,20 @@ app.post('/api/jobs/:id/generate-video', async (req, res) => {
 });
 
 app.post('/api/jobs/:id/assemble-video', async (req, res) => {
-  const job = await jobStore.getJob(req.params.id);
+  let job = await jobStore.getJob(req.params.id);
 
   if (!job) {
     return res.status(404).json({ error: 'job not found' });
   }
+
+  // See the assembleFinalVideo Agent tool's identical call for why this
+  // runs here, before anything else — this REST route is what the
+  // frontend's "Upload & Compile" page actually calls.
+  const autoVoiceover = await autoGenerateMissingClipVoiceovers(job);
+  if (autoVoiceover.error) {
+    return res.status(500).json({ error: autoVoiceover.error });
+  }
+  job = autoVoiceover.job;
 
   // Already assembled AND still accurate — return the existing result
   // unchanged rather than re-running ffmpeg on every call (mirrors the
