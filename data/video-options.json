@@ -5,6 +5,7 @@
     { "value": "fr", "label": "French" },
     { "value": "de", "label": "German" },
     { "value": "hi", "label": "Hindi" },
+    { "value": "ur", "label": "Urdu" },
     { "value": "ar", "label": "Arabic" },
     { "value": "zh", "label": "Chinese" },
     { "value": "ja", "label": "Japanese" }
