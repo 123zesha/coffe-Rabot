@@ -31,6 +31,7 @@
     "test:generate-subtitles-tool": "node test-generate-subtitles-tool.js",
     "test:output-format": "node test-output-format.js",
     "test:music-library": "node test-music-library.js",
+    "test:background-library": "node test-background-library.js",
     "test:prompt-caching": "node test-prompt-caching.js",
     "test:simple-story-video": "node test-simple-story-video.js",
     "test:simple-story-video-mode": "node test-simple-story-video-mode.js",

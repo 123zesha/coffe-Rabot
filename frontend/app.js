@@ -69,11 +69,14 @@ function initPageBehavior() {
   const storyVoiceUploadClearBtn = document.getElementById('story-voice-upload-clear-btn');
   const storyBackgroundSelect = document.getElementById('story-background');
   const storyBackgroundCustomInput = document.getElementById('story-background-custom');
+  const bgImageSourceLibraryRadio = document.getElementById('bg-image-source-library');
   const bgImageSourceNoneRadio = document.getElementById('bg-image-source-none');
   const bgImageSourceUploadRadio = document.getElementById('bg-image-source-upload');
   const bgImageSourceGenerateRadio = document.getElementById('bg-image-source-generate');
+  const bgImageLibraryOptions = document.getElementById('bg-image-library-options');
   const bgImageUploadOptions = document.getElementById('bg-image-upload-options');
   const bgImageGenerateOptions = document.getElementById('bg-image-generate-options');
+  const storyBackgroundImageTrackSelect = document.getElementById('story-background-image-track');
   const storyBackgroundImageUploadInput = document.getElementById('story-background-image-upload');
   const storyBackgroundImageUploadStatus = document.getElementById('story-background-image-upload-status');
   const storyBackgroundImagePromptInput = document.getElementById('story-background-image-prompt');
@@ -453,6 +456,19 @@ function initPageBehavior() {
         musicEnabledToggle.checked = false;
         musicSourceLibraryRadio.disabled = true;
       }
+
+      const backgroundImages = Array.isArray(options.backgroundImageOptions) ? options.backgroundImageOptions : [];
+      if (backgroundImages.length > 0) {
+        storyBackgroundImageTrackSelect.innerHTML = '';
+        for (const image of backgroundImages) {
+          const optionEl = document.createElement('option');
+          optionEl.value = image.value;
+          optionEl.textContent = image.label;
+          storyBackgroundImageTrackSelect.appendChild(optionEl);
+        }
+      } else {
+        bgImageSourceLibraryRadio.disabled = true;
+      }
     } catch (error) {
       // No local video-options available (offline dev, etc.) — leave the
       // music controls in their default off/disabled state.
@@ -485,9 +501,11 @@ function initPageBehavior() {
   });
 
   function updateBackgroundImageSourceVisibility() {
+    bgImageLibraryOptions.hidden = !bgImageSourceLibraryRadio.checked;
     bgImageUploadOptions.hidden = !bgImageSourceUploadRadio.checked;
     bgImageGenerateOptions.hidden = !bgImageSourceGenerateRadio.checked;
   }
+  bgImageSourceLibraryRadio.addEventListener('change', updateBackgroundImageSourceVisibility);
   bgImageSourceNoneRadio.addEventListener('change', updateBackgroundImageSourceVisibility);
   bgImageSourceUploadRadio.addEventListener('change', updateBackgroundImageSourceVisibility);
   bgImageSourceGenerateRadio.addEventListener('change', updateBackgroundImageSourceVisibility);
@@ -990,6 +1008,7 @@ function initPageBehavior() {
           voiceVolumeDb: Number(storyNarrationVolumeInput.value) || 0,
           musicVolumeDb: Number(storyMusicVolumeInput.value) || 0,
           generateBackgroundImage: useBgImageGenerate,
+          backgroundImageTrack: bgImageSourceLibraryRadio.checked ? storyBackgroundImageTrackSelect.value : 'none',
           musicEnabled,
           musicTrack: useMusicLibrary ? storyMusicTrackSelect.value : undefined,
           generateYoutubePackage: storyYoutubePackageToggle.checked,

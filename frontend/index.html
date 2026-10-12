@@ -301,7 +301,11 @@
               <label>Background image (optional)</label>
               <div class="radio-row">
                 <label class="radio-field">
-                  <input type="radio" name="story-background-image-source" id="bg-image-source-none" value="none" checked>
+                  <input type="radio" name="story-background-image-source" id="bg-image-source-library" value="library" checked>
+                  Choose From Library
+                </label>
+                <label class="radio-field">
+                  <input type="radio" name="story-background-image-source" id="bg-image-source-none" value="none">
                   None (use the solid color above)
                 </label>
                 <label class="radio-field">
@@ -313,6 +317,14 @@
                   Generate with AI
                 </label>
               </div>
+            </div>
+
+            <div id="bg-image-library-options" class="form-field-wide story-subgroup">
+              <div class="form-field">
+                <label for="story-background-image-track">Background image</label>
+                <select id="story-background-image-track"></select>
+              </div>
+              <p class="field-hint">Used as every section's background instead of a solid color — scaled to fill the frame without stretching.</p>
             </div>
 
             <div id="bg-image-upload-options" class="form-field-wide story-subgroup" hidden>

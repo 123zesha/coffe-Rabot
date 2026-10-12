@@ -16,6 +16,7 @@ const referenceVideo = require('./reference-video');
 const youtubePackage = require('./youtube-package');
 const subtitlesGeneration = require('./subtitles-generation');
 const musicLibrary = require('./music-library');
+const backgroundLibrary = require('./background-library');
 const simpleStoryVideo = require('./simple-story-video');
 const costEstimation = require('./cost-estimation');
 const clipVoiceover = require('./clip-voiceover');
@@ -1291,6 +1292,7 @@ const VIDEO_OPTIONS_DATA = JSON.parse(
   fs.readFileSync(path.resolve(__dirname, '..', 'data', 'video-options.json'), 'utf8')
 );
 VIDEO_OPTIONS_DATA.musicTrackOptions = musicLibrary.getMusicTrackOptions();
+VIDEO_OPTIONS_DATA.backgroundImageOptions = backgroundLibrary.getBackgroundImageOptions();
 const VIDEO_OPTIONS = JSON.stringify(VIDEO_OPTIONS_DATA, null, 2);
 // 'none' ("No Voice-Over") is a real choice for voiceStyle itself (set via
 // updateVideoJob), but not a valid input to the generateVoiceover tool —
@@ -1301,6 +1303,17 @@ const VOICE_STYLE_OPTIONS = VIDEO_OPTIONS_DATA.voiceOverOptions
 // Constrains updateVideoJob's musicTrack input the same way voiceStyle is
 // constrained above — never a separately hardcoded list.
 const MUSIC_TRACK_OPTIONS = VIDEO_OPTIONS_DATA.musicTrackOptions.map((option) => option.value);
+// Constrains updateVideoEditSettings's backgroundImageTrack input the same
+// way — never a separately hardcoded list. The library ships with one
+// bundled image by default (unlike MUSIC_TRACK_OPTIONS, which is normally
+// empty) — see data/backgrounds/manifest.json.
+const BACKGROUND_IMAGE_TRACK_OPTIONS = VIDEO_OPTIONS_DATA.backgroundImageOptions.map((option) => option.value);
+// A fresh Story-to-Video job defaults its background to the FIRST bundled
+// library image, so a user never has to remember to pick one themselves —
+// see POST /api/jobs/story-to-video below. null when the library is empty
+// (a non-default install with no bundled images), which leaves that job
+// exactly as it always rendered before this feature existed.
+const DEFAULT_BACKGROUND_IMAGE_TRACK = BACKGROUND_IMAGE_TRACK_OPTIONS[0] || null;
 
 const SYSTEM_PROMPT_BASE =
   fs.readFileSync(path.resolve(__dirname, '..', 'prompts', 'system-prompt.md'), 'utf8') +
@@ -1865,6 +1878,11 @@ const TOOLS = [
       'back to a solid-color background. This app cannot generate or upload an image on the user\'s behalf ' +
       'from chat alone — if they want to upload a file or have one AI-generated, point them to the ' +
       'Background Image controls in the Story-to-Video form instead of trying to do it here. ' +
+      (BACKGROUND_IMAGE_TRACK_OPTIONS.length > 0
+        ? `backgroundImageTrack: one of ${BACKGROUND_IMAGE_TRACK_OPTIONS.join(', ')} (a shared, bundled background ` +
+          'image — the only image choice actually available FROM CHAT, since generating/uploading one is not), ' +
+          'or "default" to remove it; backgroundImage (above) takes priority over this when both are somehow set. '
+        : '') +
       'textSizePx: a real px number (24-160) for the large on-screen story text\'s ' +
       'exact size (the small caption line is unaffected) — the current, actual size control; pass 70 to ' +
       'reset to the original default. textSize: "medium"/"large"/"xl", a LEGACY alternative kept only for ' +
@@ -1893,6 +1911,10 @@ const TOOLS = [
         backgroundColor: { type: 'string' },
         backgroundPreset: { type: 'string', enum: [...simpleStoryVideo.VALID_BACKGROUND_PRESETS, 'default'] },
         backgroundImage: { type: 'string' },
+        backgroundImageTrack:
+          BACKGROUND_IMAGE_TRACK_OPTIONS.length > 0
+            ? { type: 'string', enum: [...BACKGROUND_IMAGE_TRACK_OPTIONS, 'default'] }
+            : { type: 'string' },
         storyPosition: { type: 'string', enum: ['top', 'center', 'bottom', 'default'] },
         storyTextAlign: { type: 'string', enum: [...simpleStoryVideo.VALID_STORY_TEXT_ALIGNS, 'default'] },
         fontWeight: { type: 'string', enum: ['regular', 'bold', 'default'] },
@@ -2402,7 +2424,17 @@ async function executeTool(name, jobId, input) {
     // for (normalizeVideoEditSettings itself is more lenient, since it also
     // has to tolerate a legacy/never-touched job record).
     const patch = {};
-    const stringFields = ['backgroundColor', 'backgroundPreset', 'backgroundImage', 'storyPosition', 'storyTextAlign', 'fontWeight', 'textSize', 'subtitleColor'];
+    const stringFields = [
+      'backgroundColor',
+      'backgroundPreset',
+      'backgroundImage',
+      'backgroundImageTrack',
+      'storyPosition',
+      'storyTextAlign',
+      'fontWeight',
+      'textSize',
+      'subtitleColor',
+    ];
     const hexFields = ['backgroundColor', 'subtitleColor'];
     const enumFields = {
       backgroundPreset: simpleStoryVideo.VALID_BACKGROUND_PRESETS,
@@ -2411,6 +2443,9 @@ async function executeTool(name, jobId, input) {
       fontWeight: simpleStoryVideo.VALID_FONT_WEIGHTS,
       textSize: simpleStoryVideo.VALID_TEXT_SIZES,
     };
+    if (BACKGROUND_IMAGE_TRACK_OPTIONS.length > 0) {
+      enumFields.backgroundImageTrack = BACKGROUND_IMAGE_TRACK_OPTIONS;
+    }
     for (const field of stringFields) {
       if (typeof input?.[field] !== 'string') {
         continue;
@@ -3433,7 +3468,11 @@ app.post(
       });
     }
 
-    const normalized = simpleStoryVideo.normalizeVideoEditSettings({ ...job.videoEditSettings, backgroundImage: url });
+    const normalized = simpleStoryVideo.normalizeVideoEditSettings({
+      ...job.videoEditSettings,
+      backgroundImage: url,
+      backgroundImageTrack: null,
+    });
     const updatedJob = await jobStore.updateJob(job.id, { videoEditSettings: normalized });
     res.json({ job: updatedJob });
   }
@@ -3473,7 +3512,11 @@ app.post('/api/jobs/:id/generate-background-image', async (req, res) => {
     return res.status(502).json({ error: result.error || 'Background image generation failed unexpectedly.' });
   }
 
-  const normalized = simpleStoryVideo.normalizeVideoEditSettings({ ...job.videoEditSettings, backgroundImage: result.url });
+  const normalized = simpleStoryVideo.normalizeVideoEditSettings({
+    ...job.videoEditSettings,
+    backgroundImage: result.url,
+    backgroundImageTrack: null,
+  });
   const updatedJob = await jobStore.updateJob(job.id, { videoEditSettings: normalized, generateBackgroundImage: true });
   const costEstimate = costEstimation.estimateProductionCost({
     script: updatedJob.script,
@@ -4291,6 +4334,22 @@ app.post('/api/jobs/story-to-video', async (req, res) => {
     : simpleStoryVideo.HEX_COLOR_RE.test(body.backgroundColor || '')
       ? null
       : 'warm';
+  // backgroundImageTrack defaults to the first bundled library image for
+  // THIS flow specifically too — same reasoning as backgroundPreset above.
+  // The frontend always sends an explicit value: either the library image
+  // the user picked, or 'none' when they instead chose "None"/"Upload
+  // Image"/"Generate with AI" (those two set the REAL backgroundImage url
+  // afterward via their own dedicated routes, which also clear this field
+  // — see POST /:id/upload-background-image and
+  // POST /:id/generate-background-image). A caller that omits this field
+  // entirely (any other creation path, or a direct API call) still gets
+  // the same friendly default rather than silently missing out on it.
+  const backgroundImageTrack =
+    BACKGROUND_IMAGE_TRACK_OPTIONS.includes(body.backgroundImageTrack)
+      ? body.backgroundImageTrack
+      : body.backgroundImageTrack === 'none'
+        ? null
+        : DEFAULT_BACKGROUND_IMAGE_TRACK;
   // textSize still defaults to 'large' (70px) for THIS flow specifically,
   // exactly as before — kept for backward compatibility with any caller
   // still sending it. textSizePx (the frontend's current +/- stepper
@@ -4306,6 +4365,7 @@ app.post('/api/jobs/story-to-video', async (req, res) => {
   const videoEditSettings = simpleStoryVideo.normalizeVideoEditSettings({
     backgroundPreset,
     backgroundColor: body.backgroundColor,
+    backgroundImageTrack,
     textSize,
     textSizePx,
     fontWeight: body.fontWeight,

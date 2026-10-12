@@ -952,6 +952,7 @@ async function main() {
         backgroundColor: null,
         backgroundPreset: null,
         backgroundImage: null,
+        backgroundImageTrack: null,
         storyPosition: null,
         storyTextAlign: null,
         fontWeight: null,
@@ -989,6 +990,7 @@ async function main() {
       backgroundColor: '1a2b3c',
       backgroundPreset: 'warm',
       backgroundImage: null,
+      backgroundImageTrack: null,
       storyPosition: 'top',
       storyTextAlign: 'left',
       fontWeight: 'bold',
@@ -1054,6 +1056,16 @@ async function main() {
     );
     assert.strictEqual(ssv.normalizeVideoEditSettings({ backgroundImage: '  ' }).backgroundImage, null, 'whitespace-only must not count as set');
     assert.strictEqual(ssv.normalizeVideoEditSettings({ backgroundImage: 42 }).backgroundImage, null, 'a non-string must fall back to null');
+  });
+
+  await test('normalizeVideoEditSettings accepts a real backgroundImageTrack string and rejects/defaults invalid input', () => {
+    assert.strictEqual(ssv.normalizeVideoEditSettings({}).backgroundImageTrack, null, 'default is null, unchanged rendering for every existing job');
+    assert.strictEqual(
+      ssv.normalizeVideoEditSettings({ backgroundImageTrack: 'warm-paper' }).backgroundImageTrack,
+      'warm-paper'
+    );
+    assert.strictEqual(ssv.normalizeVideoEditSettings({ backgroundImageTrack: '  ' }).backgroundImageTrack, null, 'whitespace-only must not count as set');
+    assert.strictEqual(ssv.normalizeVideoEditSettings({ backgroundImageTrack: 42 }).backgroundImageTrack, null, 'a non-string must fall back to null');
   });
 
   await test('resolveBackgroundColor: a named preset takes priority over a raw backgroundColor; otherwise falls back to custom color or the rotating palette', () => {
