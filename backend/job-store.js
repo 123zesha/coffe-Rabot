@@ -469,6 +469,11 @@ function createDefaultJob(id) {
     // - storyTextAlign: 'center' (default) | 'left' — horizontal alignment
     //   for the large story text only, independent of storyPosition's
     //   vertical placement; the caption line is unaffected.
+    // - backgroundImageTrack: a value id from the shared background-image
+    //   library (data/backgrounds/manifest.json — see
+    //   backend/background-library.js), or null (default). A direct
+    //   backgroundImage (above) always takes priority over this when both
+    //   are somehow set.
     // - fontWeight: 'bold' | 'regular', or null (default) to keep the
     //   existing look (story text bold, caption text regular) — the only
     //   two weights this app's bundled font actually ships (see
@@ -526,6 +531,7 @@ function createDefaultJob(id) {
       backgroundColor: null,
       backgroundPreset: null,
       backgroundImage: null,
+      backgroundImageTrack: null,
       storyPosition: null,
       storyTextAlign: null,
       fontWeight: null,

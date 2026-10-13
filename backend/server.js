@@ -16,6 +16,7 @@ const referenceVideo = require('./reference-video');
 const youtubePackage = require('./youtube-package');
 const subtitlesGeneration = require('./subtitles-generation');
 const musicLibrary = require('./music-library');
+const backgroundLibrary = require('./background-library');
 const simpleStoryVideo = require('./simple-story-video');
 const costEstimation = require('./cost-estimation');
 const clipVoiceover = require('./clip-voiceover');
@@ -1291,6 +1292,7 @@ const VIDEO_OPTIONS_DATA = JSON.parse(
   fs.readFileSync(path.resolve(__dirname, '..', 'data', 'video-options.json'), 'utf8')
 );
 VIDEO_OPTIONS_DATA.musicTrackOptions = musicLibrary.getMusicTrackOptions();
+VIDEO_OPTIONS_DATA.backgroundImageOptions = backgroundLibrary.getBackgroundImageOptions();
 const VIDEO_OPTIONS = JSON.stringify(VIDEO_OPTIONS_DATA, null, 2);
 // 'none' ("No Voice-Over") is a real choice for voiceStyle itself (set via
 // updateVideoJob), but not a valid input to the generateVoiceover tool —
@@ -1301,6 +1303,17 @@ const VOICE_STYLE_OPTIONS = VIDEO_OPTIONS_DATA.voiceOverOptions
 // Constrains updateVideoJob's musicTrack input the same way voiceStyle is
 // constrained above — never a separately hardcoded list.
 const MUSIC_TRACK_OPTIONS = VIDEO_OPTIONS_DATA.musicTrackOptions.map((option) => option.value);
+// Constrains updateVideoEditSettings's backgroundImageTrack input the same
+// way — never a separately hardcoded list. The library ships with one
+// bundled image by default (unlike MUSIC_TRACK_OPTIONS, which is normally
+// empty) — see data/backgrounds/manifest.json.
+const BACKGROUND_IMAGE_TRACK_OPTIONS = VIDEO_OPTIONS_DATA.backgroundImageOptions.map((option) => option.value);
+// A fresh Story-to-Video job defaults its background to the FIRST bundled
+// library image, so a user never has to remember to pick one themselves —
+// see POST /api/jobs/story-to-video below. null when the library is empty
+// (a non-default install with no bundled images), which leaves that job
+// exactly as it always rendered before this feature existed.
+const DEFAULT_BACKGROUND_IMAGE_TRACK = BACKGROUND_IMAGE_TRACK_OPTIONS[0] || null;
 
 const SYSTEM_PROMPT_BASE =
   fs.readFileSync(path.resolve(__dirname, '..', 'prompts', 'system-prompt.md'), 'utf8') +
@@ -1865,6 +1878,11 @@ const TOOLS = [
       'back to a solid-color background. This app cannot generate or upload an image on the user\'s behalf ' +
       'from chat alone — if they want to upload a file or have one AI-generated, point them to the ' +
       'Background Image controls in the Story-to-Video form instead of trying to do it here. ' +
+      (BACKGROUND_IMAGE_TRACK_OPTIONS.length > 0
+        ? `backgroundImageTrack: one of ${BACKGROUND_IMAGE_TRACK_OPTIONS.join(', ')} (a shared, bundled background ` +
+          'image — the only image choice actually available FROM CHAT, since generating/uploading one is not), ' +
+          'or "default" to remove it; backgroundImage (above) takes priority over this when both are somehow set. '
+        : '') +
       'textSizePx: a real px number (24-160) for the large on-screen story text\'s ' +
       'exact size (the small caption line is unaffected) — the current, actual size control; pass 70 to ' +
       'reset to the original default. textSize: "medium"/"large"/"xl", a LEGACY alternative kept only for ' +
@@ -1893,6 +1911,10 @@ const TOOLS = [
         backgroundColor: { type: 'string' },
         backgroundPreset: { type: 'string', enum: [...simpleStoryVideo.VALID_BACKGROUND_PRESETS, 'default'] },
         backgroundImage: { type: 'string' },
+        backgroundImageTrack:
+          BACKGROUND_IMAGE_TRACK_OPTIONS.length > 0
+            ? { type: 'string', enum: [...BACKGROUND_IMAGE_TRACK_OPTIONS, 'default'] }
+            : { type: 'string' },
         storyPosition: { type: 'string', enum: ['top', 'center', 'bottom', 'default'] },
         storyTextAlign: { type: 'string', enum: [...simpleStoryVideo.VALID_STORY_TEXT_ALIGNS, 'default'] },
         fontWeight: { type: 'string', enum: ['regular', 'bold', 'default'] },
@@ -2322,11 +2344,25 @@ async function executeTool(name, jobId, input) {
   }
 
   if (name === 'assembleFinalVideo') {
-    const job = await jobStore.getJob(jobId);
+    let job = await jobStore.getJob(jobId);
 
     if (!job) {
       return JSON.stringify({ error: 'job not found' });
     }
+
+    // For 'uploaded-clips' jobs, automatically generate a real AI voice-
+    // over for any clip that's still silent and was never explicitly
+    // covered by the user's own select-clip-voiceovers/generate-clip-
+    // voiceovers call — the user should never have to remember to add a
+    // voice-over themselves. A no-op for every other mode, and for a job
+    // whose clips already all have real audio or an already-completed/in-
+    // flight voice-over. See autoGenerateMissingClipVoiceovers's own
+    // comment.
+    const autoVoiceover = await autoGenerateMissingClipVoiceovers(job);
+    if (autoVoiceover.error) {
+      return JSON.stringify({ error: autoVoiceover.error });
+    }
+    job = autoVoiceover.job;
 
     // Already assembled AND still accurate (reflects the job's current
     // burnInSubtitles/subtitles state) — return the existing result
@@ -2388,7 +2424,17 @@ async function executeTool(name, jobId, input) {
     // for (normalizeVideoEditSettings itself is more lenient, since it also
     // has to tolerate a legacy/never-touched job record).
     const patch = {};
-    const stringFields = ['backgroundColor', 'backgroundPreset', 'backgroundImage', 'storyPosition', 'storyTextAlign', 'fontWeight', 'textSize', 'subtitleColor'];
+    const stringFields = [
+      'backgroundColor',
+      'backgroundPreset',
+      'backgroundImage',
+      'backgroundImageTrack',
+      'storyPosition',
+      'storyTextAlign',
+      'fontWeight',
+      'textSize',
+      'subtitleColor',
+    ];
     const hexFields = ['backgroundColor', 'subtitleColor'];
     const enumFields = {
       backgroundPreset: simpleStoryVideo.VALID_BACKGROUND_PRESETS,
@@ -2397,6 +2443,9 @@ async function executeTool(name, jobId, input) {
       fontWeight: simpleStoryVideo.VALID_FONT_WEIGHTS,
       textSize: simpleStoryVideo.VALID_TEXT_SIZES,
     };
+    if (BACKGROUND_IMAGE_TRACK_OPTIONS.length > 0) {
+      enumFields.backgroundImageTrack = BACKGROUND_IMAGE_TRACK_OPTIONS;
+    }
     for (const field of stringFields) {
       if (typeof input?.[field] !== 'string') {
         continue;
@@ -3419,7 +3468,11 @@ app.post(
       });
     }
 
-    const normalized = simpleStoryVideo.normalizeVideoEditSettings({ ...job.videoEditSettings, backgroundImage: url });
+    const normalized = simpleStoryVideo.normalizeVideoEditSettings({
+      ...job.videoEditSettings,
+      backgroundImage: url,
+      backgroundImageTrack: null,
+    });
     const updatedJob = await jobStore.updateJob(job.id, { videoEditSettings: normalized });
     res.json({ job: updatedJob });
   }
@@ -3459,7 +3512,11 @@ app.post('/api/jobs/:id/generate-background-image', async (req, res) => {
     return res.status(502).json({ error: result.error || 'Background image generation failed unexpectedly.' });
   }
 
-  const normalized = simpleStoryVideo.normalizeVideoEditSettings({ ...job.videoEditSettings, backgroundImage: result.url });
+  const normalized = simpleStoryVideo.normalizeVideoEditSettings({
+    ...job.videoEditSettings,
+    backgroundImage: result.url,
+    backgroundImageTrack: null,
+  });
   const updatedJob = await jobStore.updateJob(job.id, { videoEditSettings: normalized, generateBackgroundImage: true });
   const costEstimate = costEstimation.estimateProductionCost({
     script: updatedJob.script,
@@ -3894,6 +3951,93 @@ app.post('/api/jobs/:id/generate-clip-voiceovers', async (req, res) => {
   res.json({ job: updatedJob });
 });
 
+// The default voice used when an "Upload & Compile" clip gets its
+// voice-over generated automatically (see autoGenerateMissingClipVoiceovers
+// below) rather than through a user's own explicit
+// POST /:id/select-clip-voiceovers choice — matches the Story-to-Video
+// form's own default AI voice (see frontend/index.html's
+// #story-voice-style), so a job that never touches voice selection at all
+// still gets the same consistent default voice everywhere.
+const DEFAULT_CLIP_VOICEOVER_VOICE = 'female-professional';
+
+// Generates a real AI voice-over for every uploaded clip that still has
+// neither its own audio NOR an already-completed/in-flight voice-over —
+// called automatically right before assembling an 'uploaded-clips' job
+// (see POST /:id/assemble-video below), so the user never has to
+// explicitly select/generate a voice-over for a clip themselves; a clip
+// with real audio already, or one already covered by a prior
+// select-clip-voiceovers/generate-clip-voiceovers call (completed OR still
+// 'processing'), is left exactly as it is. Uses job.clipVoiceoverVoice if a
+// voice was already chosen at some point, else DEFAULT_CLIP_VOICEOVER_VOICE
+// above. Returns { job, error } — error is only set for a real
+// configuration problem (a missing API key), never for an individual
+// clip's own generation failure, which is instead recorded on that clip's
+// own voiceoverStatus/voiceoverError exactly like the manual flow already
+// does, and never blocks the OTHER clips or the assembly itself.
+async function autoGenerateMissingClipVoiceovers(job) {
+  if ((job.videoMode || jobStore.DEFAULT_VIDEO_MODE) !== 'uploaded-clips') {
+    return { job, error: null };
+  }
+
+  const uploadedClips = Array.isArray(job.uploadedClips) ? job.uploadedClips : [];
+  const clipsNeedingVoiceover = uploadedClips.filter(
+    (clip) => !clip.hasAudio && clip.voiceoverStatus !== 'completed' && clip.voiceoverStatus !== 'processing'
+  );
+  if (clipsNeedingVoiceover.length === 0) {
+    return { job, error: null };
+  }
+
+  if (!process.env.ANTHROPIC_API_KEY) {
+    return { job, error: 'ANTHROPIC_API_KEY is not configured — cannot automatically generate clip voice-overs.' };
+  }
+  if (!process.env.OPENAI_API_KEY) {
+    return { job, error: 'OPENAI_API_KEY is not configured — cannot automatically generate clip voice-overs.' };
+  }
+
+  const voiceStyle = VOICE_STYLE_OPTIONS.includes(job.clipVoiceoverVoice)
+    ? job.clipVoiceoverVoice
+    : DEFAULT_CLIP_VOICEOVER_VOICE;
+  const needsVoiceoverIdSet = new Set(clipsNeedingVoiceover.map((clip) => clip.id));
+
+  await jobStore.updateJob(job.id, {
+    uploadedClips: uploadedClips.map((clip) =>
+      needsVoiceoverIdSet.has(clip.id) ? { ...clip, voiceoverStatus: 'processing', voiceoverError: null } : clip
+    ),
+  });
+
+  const results = await Promise.all(
+    clipsNeedingVoiceover.map(async (clip) => {
+      const result = await clipVoiceover.generateClipVoiceover({
+        clipUrl: clip.url,
+        voiceStyle,
+        jobId: job.id,
+        clipId: clip.id,
+        topic: job.topic,
+      });
+      return { clipId: clip.id, result };
+    })
+  );
+
+  const resultByClipId = new Map(results.map(({ clipId, result }) => [clipId, result]));
+  const finalClips = uploadedClips.map((clip) => {
+    const result = resultByClipId.get(clip.id);
+    if (!result) {
+      return clip;
+    }
+    return {
+      ...clip,
+      voiceoverStatus: result.status,
+      voiceoverUrl: result.voiceoverUrl,
+      processedUrl: result.processedUrl,
+      narrationText: result.narrationText,
+      voiceoverError: result.error,
+    };
+  });
+
+  const updatedJob = await jobStore.updateJob(job.id, { uploadedClips: finalClips, clipVoiceoverVoice: voiceStyle });
+  return { job: updatedJob, error: null };
+}
+
 app.post('/api/jobs/:id/generate-youtube-package', async (req, res) => {
   const job = await jobStore.getJob(req.params.id);
 
@@ -4059,11 +4203,20 @@ app.post('/api/jobs/:id/generate-video', async (req, res) => {
 });
 
 app.post('/api/jobs/:id/assemble-video', async (req, res) => {
-  const job = await jobStore.getJob(req.params.id);
+  let job = await jobStore.getJob(req.params.id);
 
   if (!job) {
     return res.status(404).json({ error: 'job not found' });
   }
+
+  // See the assembleFinalVideo Agent tool's identical call for why this
+  // runs here, before anything else — this REST route is what the
+  // frontend's "Upload & Compile" page actually calls.
+  const autoVoiceover = await autoGenerateMissingClipVoiceovers(job);
+  if (autoVoiceover.error) {
+    return res.status(500).json({ error: autoVoiceover.error });
+  }
+  job = autoVoiceover.job;
 
   // Already assembled AND still accurate — return the existing result
   // unchanged rather than re-running ffmpeg on every call (mirrors the
@@ -4181,6 +4334,22 @@ app.post('/api/jobs/story-to-video', async (req, res) => {
     : simpleStoryVideo.HEX_COLOR_RE.test(body.backgroundColor || '')
       ? null
       : 'warm';
+  // backgroundImageTrack defaults to the first bundled library image for
+  // THIS flow specifically too — same reasoning as backgroundPreset above.
+  // The frontend always sends an explicit value: either the library image
+  // the user picked, or 'none' when they instead chose "None"/"Upload
+  // Image"/"Generate with AI" (those two set the REAL backgroundImage url
+  // afterward via their own dedicated routes, which also clear this field
+  // — see POST /:id/upload-background-image and
+  // POST /:id/generate-background-image). A caller that omits this field
+  // entirely (any other creation path, or a direct API call) still gets
+  // the same friendly default rather than silently missing out on it.
+  const backgroundImageTrack =
+    BACKGROUND_IMAGE_TRACK_OPTIONS.includes(body.backgroundImageTrack)
+      ? body.backgroundImageTrack
+      : body.backgroundImageTrack === 'none'
+        ? null
+        : DEFAULT_BACKGROUND_IMAGE_TRACK;
   // textSize still defaults to 'large' (70px) for THIS flow specifically,
   // exactly as before — kept for backward compatibility with any caller
   // still sending it. textSizePx (the frontend's current +/- stepper
@@ -4196,6 +4365,7 @@ app.post('/api/jobs/story-to-video', async (req, res) => {
   const videoEditSettings = simpleStoryVideo.normalizeVideoEditSettings({
     backgroundPreset,
     backgroundColor: body.backgroundColor,
+    backgroundImageTrack,
     textSize,
     textSizePx,
     fontWeight: body.fontWeight,

@@ -978,6 +978,128 @@ async function main() {
     assert.strictEqual(res.status, 400);
   });
 
+  // ---------------------------------------------------------------------
+  // POST /:id/assemble-video — automatic per-clip voice-over for any clip
+  // the user never explicitly covered via select-clip-voiceovers/
+  // generate-clip-voiceovers themselves (server.js's
+  // autoGenerateMissingClipVoiceovers). The user should never have to
+  // remember to add a voice-over to a silent clip — assembling now does it
+  // for them, using the real (mocked) Claude vision + OpenAI TTS pipeline,
+  // same as the manual flow.
+  // ---------------------------------------------------------------------
+
+  await test('POST /:id/assemble-video automatically generates a real voice-over for a silent clip the user never explicitly selected', async () => {
+    const createRes = await fetch(`${baseUrl}/api/jobs/upload-compile`, { method: 'POST' });
+    const autoJobId = (await createRes.json()).job.id;
+    const uploadRes = await fetch(`${baseUrl}/api/jobs/${autoJobId}/upload-clip?filename=auto-silent.mp4`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'video/mp4' },
+      body: silentClipBuffer,
+    });
+    const uploadedClipId = (await uploadRes.json()).clip.id;
+
+    const res = await fetch(`${baseUrl}/api/jobs/${autoJobId}/assemble-video`, { method: 'POST' });
+    assert.strictEqual(res.status, 200);
+    const body = await res.json();
+    assert.strictEqual(body.finalVideo.status, 'completed', body.finalVideo.error || '');
+
+    const clip = body.uploadedClips.find((c) => c.id === uploadedClipId);
+    assert.strictEqual(clip.voiceoverStatus, 'completed', clip.voiceoverError || 'never ran at all');
+    assert.ok(clip.processedUrl, 'a real processed (voiced) clip must have been produced');
+    assert.ok(clip.narrationText, 'a real narration line must have been written');
+    assert.strictEqual(
+      body.clipVoiceoverVoice,
+      'female-professional',
+      'a job that never chose a voice must default to the same voice Story-to-Video itself defaults to'
+    );
+  });
+
+  await test('POST /:id/assemble-video never generates a voice-over for a clip that already has its own real audio', async () => {
+    const createRes = await fetch(`${baseUrl}/api/jobs/upload-compile`, { method: 'POST' });
+    const autoJobId = (await createRes.json()).job.id;
+    const uploadRes = await fetch(`${baseUrl}/api/jobs/${autoJobId}/upload-clip?filename=auto-audio.mp4`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'video/mp4' },
+      body: audioClipBuffer,
+    });
+    const uploadedClipId = (await uploadRes.json()).clip.id;
+
+    const res = await fetch(`${baseUrl}/api/jobs/${autoJobId}/assemble-video`, { method: 'POST' });
+    const body = await res.json();
+    assert.strictEqual(body.finalVideo.status, 'completed', body.finalVideo.error || '');
+
+    const clip = body.uploadedClips.find((c) => c.id === uploadedClipId);
+    assert.strictEqual(clip.voiceoverStatus, 'idle', 'a clip with its own real audio must never be auto-voiced');
+    assert.strictEqual(clip.processedUrl, null);
+  });
+
+  await test('POST /:id/assemble-video never re-generates a clip whose voice-over the user already completed manually', async () => {
+    const createRes = await fetch(`${baseUrl}/api/jobs/upload-compile`, { method: 'POST' });
+    const manualJobId = (await createRes.json()).job.id;
+    const uploadRes = await fetch(`${baseUrl}/api/jobs/${manualJobId}/upload-clip?filename=manual-silent.mp4`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'video/mp4' },
+      body: silentClipBuffer,
+    });
+    const manualClipId = (await uploadRes.json()).clip.id;
+
+    await fetch(`${baseUrl}/api/jobs/${manualJobId}/select-clip-voiceovers`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ selectedClipIds: [manualClipId], voiceStyle: 'male-energetic' }),
+    });
+    const manualGenRes = await fetch(`${baseUrl}/api/jobs/${manualJobId}/generate-clip-voiceovers`, { method: 'POST' });
+    const manualBody = await manualGenRes.json();
+    const manuallyVoicedClip = manualBody.job.uploadedClips.find((c) => c.id === manualClipId);
+    assert.strictEqual(manuallyVoicedClip.voiceoverStatus, 'completed', manuallyVoicedClip.voiceoverError || '');
+    const originalProcessedUrl = manuallyVoicedClip.processedUrl;
+    const originalNarrationText = manuallyVoicedClip.narrationText;
+
+    const res = await fetch(`${baseUrl}/api/jobs/${manualJobId}/assemble-video`, { method: 'POST' });
+    const body = await res.json();
+    assert.strictEqual(body.finalVideo.status, 'completed', body.finalVideo.error || '');
+
+    const clipAfterAssembly = body.uploadedClips.find((c) => c.id === manualClipId);
+    assert.strictEqual(
+      clipAfterAssembly.processedUrl,
+      originalProcessedUrl,
+      'a clip already voiced through the manual flow must never be silently regenerated by the automatic one'
+    );
+    assert.strictEqual(clipAfterAssembly.narrationText, originalNarrationText);
+    // The user's own manually-chosen voice must stick, never silently
+    // overridden by the automatic default.
+    assert.strictEqual(body.clipVoiceoverVoice, 'male-energetic');
+  });
+
+  await test('POST /:id/assemble-video refuses clearly (never silently assembles a still-silent video) when a key needed for automatic voice-over is missing', async () => {
+    const createRes = await fetch(`${baseUrl}/api/jobs/upload-compile`, { method: 'POST' });
+    const noKeyJobId = (await createRes.json()).job.id;
+    await fetch(`${baseUrl}/api/jobs/${noKeyJobId}/upload-clip?filename=no-key.mp4`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'video/mp4' },
+      body: silentClipBuffer,
+    });
+
+    const realKey = process.env.OPENAI_API_KEY;
+    delete process.env.OPENAI_API_KEY;
+    let res;
+    try {
+      res = await fetch(`${baseUrl}/api/jobs/${noKeyJobId}/assemble-video`, { method: 'POST' });
+    } finally {
+      process.env.OPENAI_API_KEY = realKey;
+    }
+    assert.strictEqual(res.status, 500);
+    const body = await res.json();
+    assert.ok(/OPENAI_API_KEY/.test(body.error));
+
+    const persisted = await jobStore.getJob(noKeyJobId);
+    assert.notStrictEqual(
+      persisted.finalVideo.status,
+      'completed',
+      'must never produce a final video that silently skipped the automatic voice-over it promised'
+    );
+  });
+
   await test('POST /:id/assemble-video mixes in uploaded background music for an uploaded-clips job', async () => {
     const createRes = await fetch(`${baseUrl}/api/jobs/upload-compile`, { method: 'POST' });
     const musicJobId = (await createRes.json()).job.id;

@@ -214,6 +214,39 @@ async function main() {
     assert.strictEqual(body.costEstimate.breakdown.voiceover, 0, 'an uploaded voice must show zero TTS cost up front');
   });
 
+  await test('POST /api/jobs/story-to-video defaults backgroundImageTrack to the first bundled library image when omitted', async () => {
+    const res = await fetch(`${baseUrl}/api/jobs/story-to-video`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ script: SHORT_SCRIPT }),
+    });
+    assert.strictEqual(res.status, 200);
+    const body = await res.json();
+    assert.strictEqual(body.job.videoEditSettings.backgroundImageTrack, 'warm-paper');
+  });
+
+  await test('POST /api/jobs/story-to-video sets backgroundImageTrack to null when the frontend explicitly sends "none"', async () => {
+    const res = await fetch(`${baseUrl}/api/jobs/story-to-video`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ script: SHORT_SCRIPT, backgroundImageTrack: 'none' }),
+    });
+    assert.strictEqual(res.status, 200);
+    const body = await res.json();
+    assert.strictEqual(body.job.videoEditSettings.backgroundImageTrack, null);
+  });
+
+  await test('POST /api/jobs/story-to-video honors a real backgroundImageTrack value when sent', async () => {
+    const res = await fetch(`${baseUrl}/api/jobs/story-to-video`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ script: SHORT_SCRIPT, backgroundImageTrack: 'warm-paper' }),
+    });
+    assert.strictEqual(res.status, 200);
+    const body = await res.json();
+    assert.strictEqual(body.job.videoEditSettings.backgroundImageTrack, 'warm-paper');
+  });
+
   await test('POST /api/jobs/story-to-video honors a valid custom backgroundColor over the warm-preset default', async () => {
     const res = await fetch(`${baseUrl}/api/jobs/story-to-video`, {
       method: 'POST',
@@ -854,6 +887,11 @@ async function main() {
     assert.ok(body.job.videoEditSettings.backgroundImage, 'expected a real stored url for the uploaded image');
     assert.strictEqual(body.job.videoEditSettings.backgroundPreset, 'warm', 'unrelated settings must be untouched');
     assert.strictEqual(body.job.generateBackgroundImage, false, 'an uploaded image must never be billed as AI-generated');
+    assert.strictEqual(
+      body.job.videoEditSettings.backgroundImageTrack,
+      null,
+      'an explicit upload must clear the library default so it never also applies'
+    );
   });
 
   await test('POST /api/jobs/:id/upload-background-image refuses a cinematic-mode job', async () => {
@@ -913,6 +951,11 @@ async function main() {
     assert.ok(body.job.videoEditSettings.backgroundImage, 'expected a real stored url for the generated image');
     assert.strictEqual(body.job.generateBackgroundImage, true);
     assert.strictEqual(body.costEstimate.breakdown.backgroundImage, 0.07);
+    assert.strictEqual(
+      body.job.videoEditSettings.backgroundImageTrack,
+      null,
+      'a generated image must clear the library default so it never also applies'
+    );
   });
 
   await test('POST /api/jobs/:id/generate-background-image refuses a cinematic-mode job before making any OpenAI call', async () => {

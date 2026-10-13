@@ -61,6 +61,7 @@ const {
   mapWithConcurrencyUntilDeadline,
 } = require('./video-assembly');
 const videoStorage = require('./video-storage');
+const backgroundLibrary = require('./background-library');
 
 const FONTS_DIR = path.resolve(__dirname, '..', 'assets', 'fonts');
 const FONT_BOLD_PATH = path.join(FONTS_DIR, 'DejaVuSans-Bold.ttf');
@@ -219,6 +220,18 @@ function normalizeVideoEditSettings(raw) {
     // (the default) leaves every already-existing job's solid-color
     // background byte-for-byte unchanged.
     backgroundImage: typeof input.backgroundImage === 'string' && input.backgroundImage.trim() ? input.backgroundImage.trim() : null,
+    // A shared library background (data/backgrounds/manifest.json — see
+    // background-library.js), selected by its value id rather than a raw
+    // url. Resolved to a real file path at render time, never here (this
+    // must stay a pure, dependency-free function) — see
+    // backgroundLibrary.resolveJobBackgroundImagePath, which also gives a
+    // direct backgroundImage above priority over this when both are
+    // somehow set. null (the default) leaves every already-existing job
+    // unchanged.
+    backgroundImageTrack:
+      typeof input.backgroundImageTrack === 'string' && input.backgroundImageTrack.trim()
+        ? input.backgroundImageTrack.trim()
+        : null,
     storyPosition: VALID_STORY_POSITIONS.includes(input.storyPosition) ? input.storyPosition : null,
     storyTextAlign: VALID_STORY_TEXT_ALIGNS.includes(input.storyTextAlign) ? input.storyTextAlign : null,
     fontWeight: VALID_FONT_WEIGHTS.includes(input.fontWeight) ? input.fontWeight : null,
@@ -902,9 +915,10 @@ async function continueSimpleStoryVideoAssembly({
     // is needed. null (the default) means every section keeps its original
     // solid-color background exactly as before this feature existed.
     let backgroundImagePath = null;
-    if (editSettings.backgroundImage) {
+    const resolvedBackgroundImageSource = backgroundLibrary.resolveJobBackgroundImagePath(editSettings);
+    if (resolvedBackgroundImageSource) {
       backgroundImagePath = path.join(workDir, 'background-image');
-      await fetchAudioToFile(editSettings.backgroundImage, backgroundImagePath);
+      await fetchAudioToFile(resolvedBackgroundImageSource, backgroundImagePath);
       log('background image ready');
     }
 
